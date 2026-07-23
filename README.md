@@ -76,10 +76,19 @@ chained targets and fetches them; `get()` walks the chain on read.
 - **TTL jitter** (deterministic, seeded by entry id) — avoids a thundering herd
   when many entries expire together.
 - **Per-citation error tolerance** — failures are reported, not fatal.
-- **Uniform I/O** — every source (including arXiv, eventually) goes through the
-  one `Fetcher`; rate-limit delays are actually awaited (the JS `sleep` no-op and
+- **Automatic retry/backoff** — a transparent `RetryingFetcher` retries
+  transport errors and retryable statuses (429/5xx), honors `Retry-After`, and
+  backs off with deterministic jitter — applied to every source, no source code
+  changed. Configurable via `RetryPolicy`.
+- **Uniform I/O** — every source, including arXiv, goes through the one
+  `Fetcher`; rate-limit delays are actually awaited (the JS `sleep` no-op and
   Python header-drop bugs are not reproduced).
 - **Incremental persistence** — no full-cache rewrite on every store.
+- **Careful arXiv version resolution** — groups returned entries by base id and
+  prefers a versionless entry, else the highest version; explicitly-versioned
+  requests stay concrete (fixes the Python reference, which silently drops them).
+- **arXiv DOI overrides** — inject/override a DOI per arXiv id, inline or from a
+  JSON file (`with_override_dois` / `with_override_dois_file`).
 
 ## Usage sketch (std)
 
