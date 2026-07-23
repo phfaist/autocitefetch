@@ -23,9 +23,55 @@
 //! `put`/`remove` mutate the in-memory map and append a single line to *this*
 //! writer's sidecar — no lock, no whole-file rewrite. [`flush`](FileCacheStore::flush)
 //! (called by the manager at the end of `retrieve`/`prune`) takes the
-//! exclusive lock, folds the main file and every sidecar into one map, writes
-//! it back atomically, and deletes the sidecars it folded. All real I/O is
-//! injected through the [`CacheFs`] trait so the core stays `no_std`.
+//! exclusive lock, folds the main file and every sidecar into one map, and
+//! writes it back atomically. All real I/O is injected through the [`CacheFs`]
+//! trait so the core stays `no_std`.
+//!
+//! # Which files compaction may delete
+//!
+//! Exactly one: `{base}.{writer_id}.log`, *this* store's own sidecar, and only
+//! when that compaction actually folded it in. Every other file in the
+//! directory — peers' sidecars, the main file, the lockfile, anything the user
+//! happens to keep there — is only ever **read**.
+//!
+//! This is not fussiness, it is the correctness argument. The lock serializes
+//! compaction against *compaction*; it does **not** serialize compaction
+//! against `append`, which takes no lock at all. A peer's `put` can therefore
+//! land after this writer's fold has read that peer's sidecar and before the
+//! rewrite completes — an acknowledged, on-disk write that the peer has been
+//! promised. Deleting the peer's sidecar at that point destroys it (and, since
+//! `flush` rebuilds `mem` purely from disk, the peer's own next flush would
+//! then erase its in-memory copy too). Re-folding somebody else's log instead
+//! is idempotent — entry dedup is max-`expires` and tombstones re-apply
+//! identically — and each peer reaps its own log on its next flush.
+//!
+//! Known trade-off: a sidecar whose owning writer **crashed** is now never
+//! reaped (its writer id is never reused, so nobody claims it). It accumulates
+//! in the directory, and its lines are re-folded on every compaction forever.
+//! For entry lines that is merely wasted work; for a *tombstone* it is worse —
+//! an orphaned `{"id":…,"del":true}` re-deletes that id on every compaction,
+//! so a subsequent re-fetch is committed and then dropped again on the next
+//! flush. Reaping such a log safely needs a way to prove the owner is gone — a
+//! `CacheFs::try_lock_exclusive`, which a live appender would hold and a dead
+//! one would not — and that is a trait change, left as follow-up work. Until
+//! then, deleting stray `{base}.*.log` files is a safe manual cleanup while no
+//! writer is running.
+//!
+//! Because a store deletes its own sidecar, `flush` must not be polled
+//! concurrently with a `put`/`remove` *on the same store*; the core is
+//! single-cooperative-task and the manager awaits `flush` on its own, so this
+//! holds today. Concurrency **between** stores is fully supported.
+//!
+//! # Corrupt or newer-schema main files
+//!
+//! Torn-line tolerance is right for a sidecar (a crash can leave a half-written
+//! append) and *wrong* for the main file, which only ever appears via an
+//! atomic temp-file + `fsync` + rename and so can never legitimately be torn.
+//! A main-file line this build cannot parse is therefore a hard error rather
+//! than a skip: skipping it would delete it on the next compaction. In
+//! particular a `{"schema":N}` header for an unknown `N` makes `open`/`flush`
+//! **fail loudly** instead of overwriting a newer build's cache. See
+//! [`parse_main_into`].
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -39,8 +85,15 @@ use serde::{Deserialize, Serialize};
 use crate::BoxFuture;
 use crate::store::{CacheRecord, CacheStore, StoreError};
 
-/// The main file's header line (line 0). Not an entry — always skipped when
-/// reading, always re-emitted when compacting.
+/// The on-disk format version of the main file. Written on line 0 and
+/// **validated** on read: an unknown version makes the load fail rather than
+/// silently truncate a cache written by a different build. Bump this only
+/// together with an actual format change.
+const SCHEMA_VERSION: u32 = 1;
+
+/// The main file's header line (line 0). Not an entry — ignored when reading,
+/// always re-emitted when compacting. Kept in sync with [`SCHEMA_VERSION`] by
+/// `tests::header_constant_matches_schema_version`.
 const HEADER: &str = r#"{"schema":1}"#;
 
 /// A filesystem operation failed. Mirrors [`StoreError`]'s shape; the file
@@ -88,6 +141,14 @@ pub trait CacheFs {
 }
 
 // --- on-disk line shapes ---------------------------------------------------
+
+/// The main file's header line as read back: `{"schema":N}`. Disjoint from
+/// [`EntryLine`] (neither shape parses as the other), so a line can be
+/// classified by trying both.
+#[derive(Deserialize)]
+struct HeaderLine {
+    schema: u32,
+}
 
 /// A main-file / sidecar entry line as read back: `{"id":…,"rec":…}`.
 #[derive(Deserialize)]
@@ -138,16 +199,29 @@ pub struct FileCacheStore<Fs: CacheFs> {
     fs: Fs,
     dir: String,
     base: String,
-    #[allow(dead_code)]
     writer_id: String,
     /// `{dir}/{base}.jsonl`.
     main: String,
-    /// `{dir}/{base}.{writer_id}.log` — this writer's append log.
+    /// `{base}.{writer_id}.log` — the bare *name* of this writer's append log,
+    /// as it appears in a [`CacheFs::list`] listing. Compared against the
+    /// folded set before compaction unlinks it.
+    sidecar_name: String,
+    /// `{dir}/{base}.{writer_id}.log` — the same file, as a path.
     sidecar: String,
     /// `{dir}/{base}.lock`.
     lockfile: String,
     /// The authoritative in-memory view; reads clone out of it.
     mem: RefCell<BTreeMap<String, CacheRecord>>,
+}
+
+impl<Fs: CacheFs> fmt::Debug for FileCacheStore<Fs> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileCacheStore")
+            .field("main", &self.main)
+            .field("writer_id", &self.writer_id)
+            .field("entries", &self.mem.borrow().len())
+            .finish()
+    }
 }
 
 impl<Fs: CacheFs> FileCacheStore<Fs> {
@@ -164,10 +238,11 @@ impl<Fs: CacheFs> FileCacheStore<Fs> {
         let base = base.into();
         let writer_id = writer_id.into();
         let main = alloc::format!("{dir}/{base}.jsonl");
-        let sidecar = alloc::format!("{dir}/{base}.{writer_id}.log");
+        let sidecar_name = alloc::format!("{base}.{writer_id}.log");
+        let sidecar = alloc::format!("{dir}/{sidecar_name}");
         let lockfile = alloc::format!("{dir}/{base}.lock");
 
-        let (map, _folded) = load_merged(&fs, &dir, &base).await.map_err(fs_store)?;
+        let merged = load_merged(&fs, &dir, &base).await.map_err(fs_store)?;
 
         Ok(FileCacheStore {
             fs,
@@ -175,9 +250,10 @@ impl<Fs: CacheFs> FileCacheStore<Fs> {
             base,
             writer_id,
             main,
+            sidecar_name,
             sidecar,
             lockfile,
-            mem: RefCell::new(map),
+            mem: RefCell::new(merged.map),
         })
     }
 
@@ -207,7 +283,11 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
     fn put(&self, id: &str, record: CacheRecord) -> BoxFuture<'_, Result<(), StoreError>> {
         // Serialize the sidecar line first (borrowing `record`), then move the
         // record into the in-memory map — no clone, no RefCell borrow held
-        // across the await below.
+        // across the await below. Note the map is updated in this synchronous
+        // prologue while the append happens in the returned future: a future
+        // that is created and then dropped without being polled leaves `mem`
+        // one entry ahead of disk (harmless — the next `flush` re-reads disk
+        // and the entry simply reverts).
         let line = Self::entry_line(id, &record);
         self.mem.borrow_mut().insert(id.to_string(), record);
         let sidecar = self.sidecar.clone();
@@ -247,8 +327,12 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
 
     /// Compaction: the only operation that locks and the only one that
     /// rewrites the whole file. Folds the main file and every sidecar into one
-    /// map, writes it back atomically, deletes the folded sidecars, and
-    /// refreshes the in-memory view.
+    /// map, writes it back atomically, deletes **only this writer's own**
+    /// sidecar, and refreshes the in-memory view.
+    ///
+    /// See the module docs for why peers' sidecars are read but never unlinked
+    /// (the lock serializes compaction against compaction, never against a
+    /// lock-free `append`).
     fn flush(&self) -> BoxFuture<'_, Result<(), StoreError>> {
         Box::pin(async move {
             // Hold the guard for the whole critical section; dropping it at the
@@ -259,24 +343,40 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
                 .await
                 .map_err(fs_store)?;
 
-            let (map, folded) = load_merged(&self.fs, &self.dir, &self.base)
+            let merged = load_merged(&self.fs, &self.dir, &self.base)
                 .await
                 .map_err(fs_store)?;
 
-            let buf = serialize_main(&map)?;
+            // Defence in depth: compaction must never be the operation that
+            // empties a populated cache. An empty fold is legitimate only when
+            // tombstones explain it (a `prune` that removed everything);
+            // otherwise the main file's entries went missing for a reason we do
+            // not understand, and overwriting it would make that permanent.
+            if merged.map.is_empty() && merged.main_entries > 0 && !merged.saw_tombstone {
+                return Err(StoreError(alloc::format!(
+                    "{}: refusing to compact {} committed entries down to nothing (writer {})",
+                    self.main,
+                    merged.main_entries,
+                    self.writer_id
+                )));
+            }
+
+            let buf = serialize_main(&merged.map)?;
             self.fs
                 .atomic_replace(&self.main, buf.as_bytes())
                 .await
                 .map_err(fs_store)?;
 
-            // Prompt deletion of every sidecar we folded — safe because the
-            // lock serializes compaction.
-            for name in &folded {
-                let path = alloc::format!("{}/{}", self.dir, name);
-                self.fs.remove(&path).await.map_err(fs_store)?;
+            // Reap our own log — and only if this compaction actually folded it
+            // in, so the unlink can never drop writes we did not just persist.
+            // A failed unlink is not a failed flush: the data is already
+            // durable in the main file and the stale sidecar is simply re-folded
+            // (idempotently) next time.
+            if merged.folded.iter().any(|name| name == &self.sidecar_name) {
+                let _ = self.fs.remove(&self.sidecar).await;
             }
 
-            *self.mem.borrow_mut() = map;
+            *self.mem.borrow_mut() = merged.map;
             Ok(())
         })
     }
@@ -293,30 +393,70 @@ fn insert_max_expires(map: &mut BTreeMap<String, CacheRecord>, id: String, rec: 
     }
 }
 
-/// Parse a main file into `map`. Line 0 is the header and is skipped; every
-/// other non-blank line is parsed as an entry, and lines that fail to parse
-/// (e.g. a torn final line from a crash) are silently skipped.
-fn parse_main_into(bytes: &[u8], map: &mut BTreeMap<String, CacheRecord>) {
+/// Parse a main file into `map`, returning how many entry lines it contributed.
+///
+/// Every non-blank line must be either an entry (`{"id":…,"rec":…}`) or a
+/// `{"schema":N}` header for the version this build understands; anything else
+/// is an error. There is deliberately **no** torn-line tolerance here: the main
+/// file is only ever produced by [`CacheFs::atomic_replace`] (temp file +
+/// `fsync` + rename), so it cannot legitimately be half-written, and skipping a
+/// line we merely fail to understand would delete it on the next compaction.
+/// The two cases that matters for are a corrupted file and a file written by a
+/// *newer* build — both now surface as a refusal from `open`/`flush` instead of
+/// a silent truncation.
+///
+/// The header is recognized (and ignored) wherever it appears rather than only
+/// on line 0, so a hand-merged or concatenated file still loads, and a file
+/// with no header at all loads all of its entries.
+///
+/// Lines are `trim`ed, which is also what makes a `\r\n`-terminated file (a
+/// Windows editor, or git with `core.autocrlf`) read back correctly — this file
+/// is meant to be committed and hand-edited.
+fn parse_main_into(
+    bytes: &[u8],
+    path: &str,
+    map: &mut BTreeMap<String, CacheRecord>,
+) -> Result<usize, FsError> {
+    let mut entries = 0usize;
     for (idx, raw) in bytes.split(|&b| b == b'\n').enumerate() {
-        if idx == 0 {
-            continue; // header
-        }
+        let lineno = idx + 1;
         let Ok(s) = core::str::from_utf8(raw) else {
-            continue;
+            return Err(FsError(alloc::format!(
+                "{path}: line {lineno} is not valid UTF-8"
+            )));
         };
         let s = s.trim();
         if s.is_empty() {
             continue;
         }
+        if let Ok(header) = serde_json::from_str::<HeaderLine>(s) {
+            if header.schema != SCHEMA_VERSION {
+                return Err(FsError(alloc::format!(
+                    "{path}: line {lineno}: cache schema version {} is not supported by this \
+                     build (which writes version {SCHEMA_VERSION}); refusing to read the file \
+                     rather than overwrite it",
+                    header.schema
+                )));
+            }
+            continue;
+        }
         if let Ok(entry) = serde_json::from_str::<EntryLine>(s) {
             map.insert(entry.id, entry.rec);
+            entries += 1;
+            continue;
         }
+        return Err(FsError(alloc::format!(
+            "{path}: line {lineno} is neither a header nor an entry; refusing to load the file \
+             rather than silently drop the line on the next compaction"
+        )));
     }
+    Ok(entries)
 }
 
 /// Fold a sidecar log into `map`, recording re-added and deleted ids. Entries
-/// dedup by MAX-`expires`; tombstones are collected. Unparseable lines (a torn
-/// tail, blank lines) are skipped.
+/// dedup by MAX-`expires`; tombstones are collected. Unparseable lines are
+/// skipped — unlike the main file, a sidecar is appended to without `fsync`,
+/// so a crash legitimately leaves a torn tail. `trim` also absorbs `\r\n`.
 fn fold_sidecar_into(
     bytes: &[u8],
     map: &mut BTreeMap<String, CacheRecord>,
@@ -337,33 +477,75 @@ fn fold_sidecar_into(
         if line.del {
             deleted.insert(line.id);
         } else if let Some(rec) = line.rec {
+            // Both the map and `added` own the id, so one clone is unavoidable.
             insert_max_expires(map, line.id.clone(), rec);
             added.insert(line.id);
         }
     }
 }
 
-/// Whether `name` is a sidecar log for `base` (`{base}.*.log`) — but not the
-/// main file (`{base}.jsonl`) or the lockfile (`{base}.lock`).
+/// Whether `name` is a sidecar log belonging to this store's family:
+/// `{base}.{writer}.log` with a **non-empty** writer segment.
+///
+/// Rejected: the main file (`{base}.jsonl`), the lockfile (`{base}.lock`), a
+/// bare `{base}.log` with no writer segment at all, and anything under a
+/// different base.
+///
+/// The writer segment itself cannot be validated — `writer_id` is
+/// caller-supplied (the std host happens to use `<pid>-<nanos>`, but nothing in
+/// the core requires that shape), so `citations.notes.log` is genuinely
+/// indistinguishable from the log of a writer called `notes`. Matching one is
+/// harmless in both directions: a match only ever causes a **read**, lines that
+/// do not parse are skipped, and compaction unlinks nothing but this store's
+/// own sidecar. It must also stay permissive enough to always match our own
+/// `sidecar_name`, since `flush` folds and reaps by that name.
+///
+/// (A foreign `.log` that happens to contain entry-shaped JSON — say a copy of
+/// an old `citations.jsonl` — would still be folded in and could resurrect
+/// stale entries. Distinguishing that properly needs a self-identifying header
+/// line in the sidecar format; noted as follow-up, not fixed here.)
 fn is_sidecar(name: &str, base: &str) -> bool {
-    // e.g. base = "citations": accept "citations.<writer>.log".
-    let prefix = alloc::format!("{base}.");
-    name.starts_with(&prefix) && name.ends_with(".log")
+    let Some(rest) = name.strip_prefix(base) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('.') else {
+        return false;
+    };
+    let Some(writer) = rest.strip_suffix(".log") else {
+        return false;
+    };
+    !writer.is_empty()
 }
 
-/// Read the main file and every sidecar for `base` under `dir`, fold them into
-/// one map (records win over tombstones per the MAX-`expires` rule), and
-/// return the merged map together with the names of the sidecars folded.
-async fn load_merged<Fs: CacheFs>(
-    fs: &Fs,
-    dir: &str,
-    base: &str,
-) -> Result<(BTreeMap<String, CacheRecord>, Vec<String>), FsError> {
+/// One folded view of the whole cache directory.
+struct Merged {
+    /// The merged map: the main file, then every sidecar (records dedup by
+    /// MAX-`expires`), with orphan tombstones applied.
+    map: BTreeMap<String, CacheRecord>,
+    /// Names (not paths) of the sidecars actually read and folded, sorted.
+    /// `flush` consults this before unlinking its own log.
+    folded: Vec<String>,
+    /// How many entry lines the main file contributed.
+    main_entries: usize,
+    /// Whether any sidecar carried a tombstone.
+    saw_tombstone: bool,
+}
+
+/// Read the main file and every sidecar for `base` under `dir` and fold them
+/// into one map (records win over tombstones per the MAX-`expires` rule).
+///
+/// A failure to read the *main* file is fatal; a failure to read an individual
+/// *sidecar* is not — a directory that happens to be named like one, a
+/// permission error, or a peer reaping its own log mid-scan should not make the
+/// whole cache unopenable. Such a sidecar is left out of `folded`, so nothing
+/// unlinks it and its contents stay on disk for a later pass.
+async fn load_merged<Fs: CacheFs>(fs: &Fs, dir: &str, base: &str) -> Result<Merged, FsError> {
     let mut map = BTreeMap::new();
 
     let main_path = alloc::format!("{dir}/{base}.jsonl");
+    let mut main_entries = 0usize;
     if let Some(bytes) = fs.read(&main_path).await? {
-        parse_main_into(&bytes, &mut map);
+        main_entries = parse_main_into(&bytes, &main_path, &mut map)?;
     }
 
     let mut added: BTreeSet<String> = BTreeSet::new();
@@ -377,21 +559,29 @@ async fn load_merged<Fs: CacheFs>(
             continue;
         }
         let path = alloc::format!("{dir}/{name}");
-        if let Some(bytes) = fs.read(&path).await? {
-            fold_sidecar_into(&bytes, &mut map, &mut added, &mut deleted);
+        match fs.read(&path).await {
+            Ok(Some(bytes)) => fold_sidecar_into(&bytes, &mut map, &mut added, &mut deleted),
+            Ok(None) => {}
+            Err(_) => continue,
         }
         folded.push(name);
     }
 
     // Records always win over tombstones: only drop ids that were deleted and
     // never re-added by a sidecar entry.
+    let saw_tombstone = !deleted.is_empty();
     for id in &deleted {
         if !added.contains(id) {
             map.remove(id);
         }
     }
 
-    Ok((map, folded))
+    Ok(Merged {
+        map,
+        folded,
+        main_entries,
+        saw_tombstone,
+    })
 }
 
 /// Serialize `map` into a main-file buffer: the header line, then one sorted
@@ -418,14 +608,17 @@ mod tests {
 
     // --- an always-ready block_on (the mock fs never truly pends) ----------
 
+    /// Bounded like every other test file's driver: a mock that pends must
+    /// panic, not hang `cargo test` forever.
     fn block_on<F: Future>(fut: F) -> F::Output {
         let mut cx = Context::from_waker(Waker::noop());
         let mut fut = core::pin::pin!(fut);
-        loop {
+        for _ in 0..1_000_000 {
             if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
                 return v;
             }
         }
+        panic!("future did not complete (a mock unexpectedly pended)");
     }
 
     // --- an in-memory CacheFs mock -----------------------------------------
@@ -433,6 +626,9 @@ mod tests {
     #[derive(Default)]
     struct MemFs {
         files: RefCell<BTreeMap<String, Vec<u8>>>,
+        /// When set, every `remove` fails — used to prove a failed sidecar
+        /// unlink does not fail an otherwise successful compaction.
+        remove_fails: core::cell::Cell<bool>,
     }
 
     struct NoopGuard;
@@ -471,6 +667,9 @@ mod tests {
             Box::pin(async move { Ok(names) })
         }
         fn remove(&self, path: &str) -> BoxFuture<'_, Result<(), FsError>> {
+            if self.remove_fails.get() {
+                return Box::pin(async move { Err(FsError("remove denied".into())) });
+            }
             self.files.borrow_mut().remove(path);
             Box::pin(async move { Ok(()) })
         }
@@ -524,6 +723,7 @@ mod tests {
         let files = store.fs.files.borrow().clone();
         let fs2 = MemFs {
             files: RefCell::new(files),
+            ..Default::default()
         };
         let store2 = block_on(FileCacheStore::open(fs2, "cache", "citations", "w2")).unwrap();
         assert!(block_on(store2.get("doi:1")).unwrap().is_some());
@@ -607,8 +807,11 @@ mod tests {
         );
     }
 
+    /// Peers' logs are folded into the committed file but **left alone**: they
+    /// belong to writers that may be appending to them right now, without any
+    /// lock. Only this store's own sidecar is reaped.
     #[test]
-    fn multiple_sidecars_folded_and_deleted() {
+    fn peer_sidecars_are_folded_but_only_our_own_is_deleted() {
         let fs = MemFs::default();
         write_raw(
             &fs,
@@ -622,13 +825,300 @@ mod tests {
         );
 
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w3")).unwrap();
+        block_on(store.put("doi:3", rec(1000))).unwrap();
         block_on(store.flush()).unwrap();
 
         let files = store.fs.files.borrow();
         assert!(files.contains_key("cache/citations.jsonl"));
-        assert!(!files.contains_key("cache/citations.w1.log"));
-        assert!(!files.contains_key("cache/citations.w2.log"));
+        assert!(
+            files.contains_key("cache/citations.w1.log"),
+            "a peer's sidecar must survive our compaction"
+        );
+        assert!(
+            files.contains_key("cache/citations.w2.log"),
+            "a peer's sidecar must survive our compaction"
+        );
+        assert!(
+            !files.contains_key("cache/citations.w3.log"),
+            "our own sidecar is reaped"
+        );
         drop(files);
+        assert_eq!(block_on(store.entries()).unwrap().len(), 3);
+    }
+
+    /// Re-folding a peer's log is idempotent, so the peer's writes survive an
+    /// unbounded number of other writers' compactions.
+    #[test]
+    fn refolding_a_peer_sidecar_is_idempotent() {
+        let fs = MemFs::default();
+        write_raw(
+            &fs,
+            "cache/citations.peer.log",
+            &FileCacheStore::<MemFs>::entry_line("doi:1", &rec(1000)).unwrap(),
+        );
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        for _ in 0..3 {
+            block_on(store.flush()).unwrap();
+        }
+        assert_eq!(block_on(store.entries()).unwrap().len(), 1);
+        assert!(block_on(store.get("doi:1")).unwrap().is_some());
+    }
+
+    /// A failed unlink must not turn a durably persisted compaction into an
+    /// error, nor skip the in-memory refresh that follows it.
+    #[test]
+    fn a_failing_sidecar_unlink_does_not_fail_the_flush() {
+        let fs = MemFs::default();
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        block_on(store.put("doi:1", rec(1000))).unwrap();
+        store.fs.remove_fails.set(true);
+
+        block_on(store.flush()).expect("a failed unlink is not a failed flush");
+        assert!(
+            store
+                .fs
+                .files
+                .borrow()
+                .contains_key("cache/citations.jsonl")
+        );
+        assert_eq!(block_on(store.entries()).unwrap().len(), 1);
+    }
+
+    // --- main-file parsing -------------------------------------------------
+
+    #[test]
+    fn header_constant_matches_schema_version() {
+        let parsed: HeaderLine = serde_json::from_str(HEADER).unwrap();
+        assert_eq!(parsed.schema, SCHEMA_VERSION);
+    }
+
+    /// A main file with no header at all must keep *every* entry — the old
+    /// unconditional "line 0 is the header" skip silently ate the first one and
+    /// the next compaction made that permanent.
+    #[test]
+    fn headerless_main_file_keeps_its_first_entry() {
+        let fs = MemFs::default();
+        let a = FileCacheStore::<MemFs>::entry_line("doi:A", &rec(1000)).unwrap();
+        let b = FileCacheStore::<MemFs>::entry_line("doi:B", &rec(2000)).unwrap();
+        write_raw(&fs, "cache/citations.jsonl", &alloc::format!("{a}{b}"));
+
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        assert!(
+            block_on(store.get("doi:A")).unwrap().is_some(),
+            "first entry"
+        );
+        assert!(block_on(store.get("doi:B")).unwrap().is_some());
         assert_eq!(block_on(store.entries()).unwrap().len(), 2);
+
+        // ...and compaction re-emits it with a header, still complete.
+        block_on(store.flush()).unwrap();
+        let files = store.fs.files.borrow();
+        let main = core::str::from_utf8(&files["cache/citations.jsonl"]).unwrap();
+        assert!(main.starts_with(HEADER));
+        assert_eq!(main.lines().count(), 3);
+    }
+
+    /// A header line anywhere (e.g. after a careless hand-merge of two copies)
+    /// is ignored rather than treated as a broken entry.
+    #[test]
+    fn mid_file_header_line_is_ignored() {
+        let fs = MemFs::default();
+        let a = FileCacheStore::<MemFs>::entry_line("doi:A", &rec(1000)).unwrap();
+        let b = FileCacheStore::<MemFs>::entry_line("doi:B", &rec(2000)).unwrap();
+        write_raw(
+            &fs,
+            "cache/citations.jsonl",
+            &alloc::format!("{HEADER}\n{a}{HEADER}\n{b}"),
+        );
+
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        assert_eq!(block_on(store.entries()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn empty_main_file_loads_zero_entries() {
+        let fs = MemFs::default();
+        write_raw(&fs, "cache/citations.jsonl", "");
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        assert!(block_on(store.entries()).unwrap().is_empty());
+        block_on(store.flush()).expect("an empty cache compacts fine");
+    }
+
+    /// A newer build's cache must not be silently discarded: refuse to read it
+    /// (and therefore refuse to overwrite it) instead.
+    #[test]
+    fn unknown_schema_version_refuses_to_open() {
+        let fs = MemFs::default();
+        write_raw(
+            &fs,
+            "cache/citations.jsonl",
+            "{\"schema\":9}\n{\"id\":\"doi:A\",\"future_shape\":true}\n",
+        );
+        let err = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap_err();
+        assert!(
+            err.0.contains("schema version 9"),
+            "unexpected error: {}",
+            err.0
+        );
+    }
+
+    /// The same refusal applies to a store that is already open: `flush` must
+    /// not overwrite a main file it can no longer read.
+    #[test]
+    fn unknown_schema_version_refuses_to_flush() {
+        let fs = MemFs::default();
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        block_on(store.put("doi:A", rec(1000))).unwrap();
+        // A newer build compacted the file underneath us.
+        write_raw(&store.fs, "cache/citations.jsonl", "{\"schema\":2}\n");
+
+        let err = block_on(store.flush()).unwrap_err();
+        assert!(
+            err.0.contains("schema version 2"),
+            "unexpected error: {}",
+            err.0
+        );
+        // The newer file is untouched.
+        let files = store.fs.files.borrow();
+        assert_eq!(
+            core::str::from_utf8(&files["cache/citations.jsonl"]).unwrap(),
+            "{\"schema\":2}\n"
+        );
+    }
+
+    /// Torn-line tolerance is correct for a sidecar and destructive for the
+    /// main file, which can only ever appear via an atomic rename.
+    #[test]
+    fn corrupt_line_in_main_file_is_not_silently_dropped() {
+        let fs = MemFs::default();
+        let good = FileCacheStore::<MemFs>::entry_line("doi:A", &rec(1000)).unwrap();
+        let torn = r#"{"id":"doi:B","rec":{"payload":{"conc"#;
+        write_raw(
+            &fs,
+            "cache/citations.jsonl",
+            &alloc::format!("{HEADER}\n{good}{torn}"),
+        );
+
+        let err = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap_err();
+        assert!(
+            err.0.contains("line 3") && err.0.contains("neither a header nor an entry"),
+            "unexpected error: {}",
+            err.0
+        );
+    }
+
+    /// Pins current (deliberately deferred) merge behavior: MAX-`expires`
+    /// decides between the committed file and a sidecar exactly as it does
+    /// between two sidecars — recency does *not* win. A sidecar record whose
+    /// `expires` is not strictly later than the committed one is discarded.
+    #[test]
+    fn max_expires_decides_between_main_and_sidecar_not_recency() {
+        // (a) sidecar's expiry is later -> sidecar wins.
+        let fs = MemFs::default();
+        write_raw(
+            &fs,
+            "cache/citations.jsonl",
+            &alloc::format!(
+                "{HEADER}\n{}",
+                FileCacheStore::<MemFs>::entry_line("doi:1", &rec(1000)).unwrap()
+            ),
+        );
+        write_raw(
+            &fs,
+            "cache/citations.w1.log",
+            &FileCacheStore::<MemFs>::entry_line("doi:1", &rec(5000)).unwrap(),
+        );
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w2")).unwrap();
+        assert_eq!(
+            block_on(store.get("doi:1")).unwrap().unwrap().expires,
+            Timestamp::from_millis(5000)
+        );
+
+        // (b) sidecar's expiry is *earlier* -> the committed record survives,
+        // even though the sidecar line is the newer write. This is the
+        // `insert_max_expires` behavior the owner has deferred a decision on.
+        let fs = MemFs::default();
+        write_raw(
+            &fs,
+            "cache/citations.jsonl",
+            &alloc::format!(
+                "{HEADER}\n{}",
+                FileCacheStore::<MemFs>::entry_line("doi:1", &rec(5000)).unwrap()
+            ),
+        );
+        write_raw(
+            &fs,
+            "cache/citations.w1.log",
+            &FileCacheStore::<MemFs>::entry_line("doi:1", &rec(1000)).unwrap(),
+        );
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w2")).unwrap();
+        assert_eq!(
+            block_on(store.get("doi:1")).unwrap().unwrap().expires,
+            Timestamp::from_millis(5000)
+        );
+    }
+
+    /// Emptying the cache legitimately (a prune that removed everything) must
+    /// still compact, i.e. the "never compact to nothing" guard keys off
+    /// tombstones and not off emptiness alone.
+    #[test]
+    fn pruning_everything_still_compacts() {
+        let fs = MemFs::default();
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        block_on(store.put("doi:1", rec(1000))).unwrap();
+        block_on(store.flush()).unwrap();
+        block_on(store.remove("doi:1")).unwrap();
+        block_on(store.flush()).expect("prune-to-empty is legitimate");
+
+        assert!(block_on(store.entries()).unwrap().is_empty());
+        let files = store.fs.files.borrow();
+        assert_eq!(
+            core::str::from_utf8(&files["cache/citations.jsonl"]).unwrap(),
+            alloc::format!("{HEADER}\n")
+        );
+    }
+
+    // --- sidecar name matching ---------------------------------------------
+
+    #[test]
+    fn is_sidecar_matches_only_writer_logs() {
+        // Real sidecars, whatever the caller-supplied writer id looks like.
+        assert!(is_sidecar("citations.w1.log", "citations"));
+        assert!(is_sidecar("citations.4711-1234567890.log", "citations"));
+        // No writer segment at all.
+        assert!(!is_sidecar("citations.log", "citations"));
+        // The committed file and the lockfile are never sidecars.
+        assert!(!is_sidecar("citations.jsonl", "citations"));
+        assert!(!is_sidecar("citations.lock", "citations"));
+        // Another base entirely, and a stray temp file.
+        assert!(!is_sidecar("unrelated.log", "citations"));
+        assert!(!is_sidecar(".tmpAb12Cd", "citations"));
+        assert!(!is_sidecar("citationsX.w1.log", "citations"));
+        // Indistinguishable from writer id "jsonl" — accepted on purpose (see
+        // `is_sidecar`'s docs); folding is read-only and nothing unlinks it.
+        assert!(is_sidecar("citations.jsonl.log", "citations"));
+    }
+
+    /// A file the store never created is folded (harmlessly) but must never be
+    /// unlinked by a compaction.
+    #[test]
+    fn foreign_log_files_are_never_deleted() {
+        let fs = MemFs::default();
+        write_raw(&fs, "cache/citations.import-notes.log", "not json at all\n");
+        write_raw(&fs, "cache/citations.log", "nor is this\n");
+        write_raw(&fs, "cache/unrelated.log", "nor this\n");
+
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        block_on(store.put("doi:1", rec(1000))).unwrap();
+        block_on(store.flush()).unwrap();
+
+        let files = store.fs.files.borrow();
+        for name in [
+            "cache/citations.import-notes.log",
+            "cache/citations.log",
+            "cache/unrelated.log",
+        ] {
+            assert!(files.contains_key(name), "{name} must survive a compaction");
+        }
     }
 }
