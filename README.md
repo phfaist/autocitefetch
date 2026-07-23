@@ -20,7 +20,7 @@ crates/
       manager.rs          CitationManager: routing, retrieval loop, chaining, get()
       source/             the Source trait + built-in sources
         mod.rs            Source, Outcome, Resolution, RetrieveCtx
-        arxiv.rs          arXiv Atom API              (SCAFFOLD — see Status)
+        arxiv.rs          arXiv Atom API (xmlparser)   (implemented)
         doi.rs            doi.org content negotiation (implemented)
         manual.rs         key-is-the-text escape hatch (implemented)
         bibfile.rs        CSL-JSON bibliography files (implemented, JSON)
@@ -37,6 +37,8 @@ crates/
       clock.rs            SystemClock
       timer.rs            BlockingTimer (thread::sleep)
       store.rs            DirCacheStore (one JSON file per entry, atomic writes)
+      fetcher.rs          UreqFetcher (blocking HTTP + file:) — `http` feature
+    examples/resolve.rs   end-to-end demo (doi + manual + bib)
 ```
 
 ## Model
@@ -102,24 +104,29 @@ dependency.
 
 ## Status
 
-Scaffolding is complete and tested end-to-end. Implemented: the manager,
-routing, chaining, cache/TTL policy, the driver, and the `doi` / `manual` /
-`bib` (JSON) sources. **Not yet implemented:**
+Implemented and tested end-to-end: the manager, routing, chaining, cache/TTL
+policy, the driver, all four sources (`arxiv`, `doi`, `manual`, `bib`),
+concurrent within-pass source execution, and the `std` backends including a
+`ureq`-based HTTP `Fetcher` (with `file:` support). The arXiv source parses the
+Atom feed with `xmlparser` (a verified `no_std` crate), does version resolution,
+and chains to DOI. 9 tests pass; the core builds for `wasm32-unknown-unknown`.
 
-- `arxiv.rs` — Atom-feed retrieval, version resolution, DOI chaining (trait
-  wiring and rate limits are in place; returns a `Failed` outcome for now). Needs
-  a `no_std` XML pull parser.
-- Concurrent source execution (the driver loop is sequential; the join point is
-  marked in `manager.rs`).
-- A bundled `std` HTTP `Fetcher` and a WASM backend crate.
-- YAML bibliography files (JSON works).
+**Not yet implemented:**
+
+- A dedicated **WASM backend crate** (browser `fetch()` + IndexedDB + `setTimeout`
+  impls of the four traits). The core already compiles for wasm32.
+- **YAML** bibliography files (JSON works).
+- An async-runtime `Fetcher`/`Timer` (the bundled std ones are blocking, fine for
+  CLI/batch; on tokio, impl the traits with `reqwest` / `tokio::time::sleep`).
 
 ## Building
 
 ```sh
 cargo build                                        # workspace (host)
-cargo test                                         # end-to-end tests
-cargo build -p autocitefetch --target wasm32-unknown-unknown   # WASM core
+cargo test                                         # all tests
+cargo build -p autocitefetch --target wasm32-unknown-unknown   # WASM core (no_std)
+cargo build -p autocitefetch-std --no-default-features         # std backends, no HTTP dep
+cargo run   -p autocitefetch-std --example resolve             # live demo (needs network)
 ```
 
 ## License
