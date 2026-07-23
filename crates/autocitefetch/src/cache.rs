@@ -3,7 +3,7 @@
 
 use core::time::Duration;
 
-use crate::env::Timestamp;
+use crate::env::{Timestamp, millis_i64};
 use crate::store::CacheRecord;
 
 /// How a cached entry stands relative to `now`.
@@ -13,21 +13,27 @@ pub enum Freshness {
     Fresh,
     /// Past soft but before hard expiry — usable, but revalidate if cheap.
     Stale,
-    /// Past hard expiry — do not use unless kept alive by the grace window.
+    /// Past hard expiry — refetch. The grace window does not make it fresh
+    /// again; it only suppresses the *error* when the refetch fails (and keeps
+    /// [`prune`](crate::manager::CitationManager::prune) from dropping it).
     Expired,
 }
 
 /// Policy governing how TTLs become concrete expiries.
 #[derive(Clone, Copy, Debug)]
 pub struct TtlPolicy {
-    /// Soft expiry as a percentage of the full TTL (e.g. `80` ⇒ revalidate in
-    /// the last 20% of the lifetime).
+    /// Soft expiry as a percentage of the *jittered* hard TTL (e.g. `80` ⇒
+    /// revalidate in the last 20% of the lifetime). Clamped to `<= 100`.
     pub stale_percent: u32,
     /// Maximum jitter applied to the hard TTL, as ± this percentage. Spreads
-    /// out entries fetched together so they don't all expire at once.
+    /// out entries fetched together so they don't all expire at once. Clamped
+    /// to `<= 100` — a larger value could otherwise push the hard expiry
+    /// *before* `now`, so entries would be born already expired.
     pub jitter_percent: u32,
-    /// After hard expiry, keep serving a stale entry for this long *if* the
-    /// source is unreachable (stale-while-revalidate grace window).
+    /// After hard expiry, keep *tolerating* a stale entry for this long when
+    /// the source is unreachable: within the window a failed refetch is not
+    /// reported and [`prune`](crate::manager::CitationManager::prune) leaves
+    /// the entry alone (stale-while-revalidate).
     pub grace: Duration,
 }
 
@@ -60,15 +66,22 @@ impl TtlPolicy {
             };
         }
 
-        let ttl_ms = ttl.as_millis() as i64;
+        // Saturating, *not* a truncating `as i64` cast: `Duration::MAX as i64`
+        // is `-1`, which would make a "cache forever" TTL expire immediately
+        // and could drive `span` negative (panicking in debug on the `2 * span`
+        // below, wrapping into an absurd lifetime in release).
+        let ttl_ms = millis_i64(ttl);
 
         // Deterministic jitter in [-jitter_percent, +jitter_percent], seeded by
         // the id so identical entries are stable but distinct keys spread out.
-        let jitter_ms = if self.jitter_percent == 0 {
+        // The percentage is clamped like `stale_percent`: beyond 100% the
+        // negative half of the window would push `expires` before `now`.
+        let jitter_percent = self.jitter_percent.min(100);
+        let jitter_ms = if jitter_percent == 0 {
             0
         } else {
-            let span = ttl_ms.saturating_mul(self.jitter_percent as i64) / 100;
-            if span == 0 {
+            let span = percent_of(ttl_ms, jitter_percent);
+            if span <= 0 {
                 0
             } else {
                 // fnv-1a over the id → signed offset in [-span, +span].
@@ -79,7 +92,7 @@ impl TtlPolicy {
         };
 
         let hard_ms = ttl_ms.saturating_add(jitter_ms).max(0);
-        let soft_ms = hard_ms.saturating_mul(self.stale_percent.min(100) as i64) / 100;
+        let soft_ms = percent_of(hard_ms, self.stale_percent.min(100));
 
         CacheRecord {
             payload,
@@ -99,11 +112,29 @@ impl TtlPolicy {
         }
     }
 
-    /// Whether an already-hard-expired record may still be served because the
-    /// source is currently unreachable (within the grace window).
+    /// Whether an already-hard-expired record is still *within* the grace
+    /// window.
+    ///
+    /// This governs **error reporting and pruning**, not serving: the manager
+    /// uses it to decide whether a failed refetch should be surfaced as a
+    /// citation failure (`false` ⇒ report) and whether [`prune`] may drop the
+    /// entry. [`get`] never consults it — a cached entry is served for as long
+    /// as it is in the store.
+    ///
+    /// [`prune`]: crate::manager::CitationManager::prune
+    /// [`get`]: crate::manager::CitationManager::get
     pub fn usable_within_grace(&self, record: &CacheRecord, now: Timestamp) -> bool {
         now < record.expires.saturating_add(self.grace)
     }
+}
+
+/// `value * percent / 100`, exact and clamped to `[0, i64::MAX]`.
+///
+/// Computed in `i128` so a huge `value` neither saturates the multiplication
+/// (which would distort the ratio) nor goes negative.
+fn percent_of(value: i64, percent: u32) -> i64 {
+    let scaled = (value as i128 * percent as i128) / 100;
+    scaled.clamp(0, i64::MAX as i128) as i64
 }
 
 /// FNV-1a 64-bit hash. Small, dependency-free, good enough to seed jitter.
