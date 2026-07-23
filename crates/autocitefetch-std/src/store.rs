@@ -5,12 +5,26 @@
 //! per-writer append logs (`citations.<writer>.log`) and a compaction lockfile
 //! (`citations.lock`), all living in a user-chosen directory. Only
 //! `citations.jsonl` is worth committing to version control; users should
-//! **gitignore the sidecars and lockfile**, e.g.:
+//! **gitignore the sidecars, the lockfile and the compaction temp file**, e.g.:
 //!
 //! ```gitignore
 //! citations.*.log
 //! citations.lock
+//! citations.jsonl.tmp
 //! ```
+//!
+//! # What the store touches in that directory
+//!
+//! * It **writes** `citations.jsonl`, `citations.jsonl.tmp`, `citations.lock`
+//!   and its own `citations.<writer>.log`.
+//! * It **deletes** exactly one file, ever: its own `citations.<writer>.log`.
+//!   No other file in the directory is removed — not another process's
+//!   sidecar, not a file you put there yourself.
+//! * It **reads** every `citations.<something>.log` in the directory and folds
+//!   it into the cache. So while a stray `citations.notes.log` of your own is
+//!   never deleted, its contents are parsed (and, unless they happen to be
+//!   cache entries, ignored). Prefer a different name, or a different
+//!   directory, for unrelated files.
 //!
 //! All the interesting logic lives in the core [`FileCacheStore`]; this module
 //! only provides the real filesystem operations it needs.
@@ -68,6 +82,27 @@ impl CacheFs for StdCacheFs {
                 Ok(rd) => {
                     for entry in rd {
                         let entry = entry.map_err(fs_err)?;
+                        // Files only: a *directory* named like a sidecar
+                        // (`citations.x.log/`) would otherwise be handed to the
+                        // core, whose `read` of it fails with EISDIR. Skipping
+                        // it here keeps such a directory from making the whole
+                        // cache unopenable.
+                        match entry.file_type() {
+                            Ok(ft) if ft.is_file() => {}
+                            // A symlink to a file is fine; `is_file()` on the
+                            // *link* is false, so follow it before rejecting.
+                            Ok(ft) if ft.is_symlink() => {
+                                if !std::fs::metadata(entry.path())
+                                    .map(|m| m.is_file())
+                                    .unwrap_or(false)
+                                {
+                                    continue;
+                                }
+                            }
+                            // Unreadable metadata: leave it out rather than
+                            // fail the listing.
+                            _ => continue,
+                        }
                         if let Some(name) = entry.file_name().to_str() {
                             out.push(name.to_string());
                         }
@@ -135,16 +170,47 @@ fn fs_err(e: impl std::fmt::Display) -> FsError {
 
 /// Durably, all-or-nothing replace `path`'s contents with `bytes`: write a
 /// temp file in the *same* directory, fsync it, atomically rename it over the
-/// target, then fsync the parent directory so the rename itself is durable.
+/// target, then (best-effort) fsync the parent directory so the rename itself
+/// is durable. A failure of that last directory fsync is *not* reported: it is
+/// unsupported on some filesystems, and the rename has already happened.
+///
+/// Two details that are easy to get wrong:
+///
+/// * **Permissions.** A rename replaces the destination's mode with the temp
+///   file's, so a fresh 0600 temp file silently turns a shared, group-readable
+///   `citations.jsonl` into a private one and the next user's `open` fails with
+///   EACCES. The destination's mode is therefore carried onto the temp file
+///   before the rename; when there is no destination yet, the temp file is
+///   created with `File::create` so the process umask decides (rather than a
+///   hard-coded 0600, which `tempfile::NamedTempFile` would impose).
+/// * **Temp file name.** Deliberately fixed (`{path}.tmp`) rather than random:
+///   a random `.tmpXXXXXX` left behind by a crash is never reaped by anything,
+///   whereas a fixed name is simply overwritten by the next compaction. This is
+///   safe only because the sole caller is `FileCacheStore::flush`, which holds
+///   the exclusive compaction lock for the whole operation.
 fn atomic_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    let mut tmp_path = path.as_os_str().to_os_string();
+    tmp_path.push(".tmp");
+    let tmp_path = std::path::PathBuf::from(tmp_path);
+
+    let mut tmp = std::fs::File::create(&tmp_path)?;
+    // Match the destination's permissions *before* writing any content, so the
+    // bytes are never briefly visible under a looser mode than the cache had.
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = tmp.set_permissions(meta.permissions());
+    }
     tmp.write_all(bytes)?;
     tmp.flush()?;
-    tmp.as_file().sync_all()?;
+    tmp.sync_all()?;
+    drop(tmp);
+
     // Atomic rename over the destination.
-    tmp.persist(path).map_err(|e| e.error)?;
-    // fsync the directory so the rename survives a crash.
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    // fsync the directory so the rename survives a crash (best effort).
     if let Ok(dir_file) = std::fs::File::open(dir) {
         let _ = dir_file.sync_all();
     }
@@ -177,7 +243,15 @@ impl SingleFileCacheStore {
             .unwrap_or(0);
         let writer_id = format!("{}-{}", std::process::id(), nanos);
 
-        let dir = dir.to_string_lossy().into_owned();
+        // The core builds every path by string concatenation, so a lossy
+        // conversion here would leave it operating on a U+FFFD-mangled path
+        // that does not exist: reads would return `Ok(None)` and compaction
+        // would fail against a missing directory — a cache that silently never
+        // persists. Refuse instead.
+        let dir = dir
+            .to_str()
+            .ok_or_else(|| StoreError("cache dir path is not valid UTF-8".into()))?
+            .to_owned();
         let inner = FileCacheStore::open(StdCacheFs, dir, BASE, writer_id).await?;
         Ok(SingleFileCacheStore(inner))
     }
