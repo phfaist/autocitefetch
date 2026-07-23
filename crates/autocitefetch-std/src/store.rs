@@ -1,140 +1,208 @@
-use std::fs;
+//! A `std`-backed [`CacheFs`] and the [`SingleFileCacheStore`] convenience
+//! store built on top of it.
+//!
+//! The cache is a single committable `citations.jsonl` file plus lock-free
+//! per-writer append logs (`citations.<writer>.log`) and a compaction lockfile
+//! (`citations.lock`), all living in a user-chosen directory. Only
+//! `citations.jsonl` is worth committing to version control; users should
+//! **gitignore the sidecars and lockfile**, e.g.:
+//!
+//! ```gitignore
+//! citations.*.log
+//! citations.lock
+//! ```
+//!
+//! All the interesting logic lives in the core [`FileCacheStore`]; this module
+//! only provides the real filesystem operations it needs.
+
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use autocitefetch::{BoxFuture, CacheRecord, CacheStore, StoreError};
+use autocitefetch::{
+    BoxFuture, CacheFs, CacheGuard, CacheRecord, CacheStore, FileCacheStore, FsError, StoreError,
+};
 
-/// A [`CacheStore`] that keeps one JSON file per entry in a directory.
-///
-/// One-file-per-entry makes writes genuinely incremental (no whole-cache
-/// re-serialize on every store) and lets the OS handle concurrency. Entry ids
-/// are hex-encoded to form safe filenames.
-pub struct DirCacheStore {
-    dir: PathBuf,
-}
+/// A [`CacheFs`] over the local filesystem via `std::fs`.
+pub struct StdCacheFs;
 
-impl DirCacheStore {
-    /// Open (creating if needed) a cache directory.
-    pub fn new(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
-        let dir = dir.into();
-        fs::create_dir_all(&dir)?;
-        Ok(DirCacheStore { dir })
-    }
-
-    fn path_for(&self, id: &str) -> PathBuf {
-        let mut name = hex_encode(id.as_bytes());
-        name.push_str(".json");
-        self.dir.join(name)
-    }
-}
-
-impl CacheStore for DirCacheStore {
-    fn get(&self, id: &str) -> BoxFuture<'_, Result<Option<CacheRecord>, StoreError>> {
-        let path = self.path_for(id);
+impl CacheFs for StdCacheFs {
+    fn read(&self, path: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, FsError>> {
+        let path = path.to_string();
         Box::pin(async move {
-            match fs::read(&path) {
-                Ok(bytes) => {
-                    let rec = serde_json::from_slice(&bytes).map_err(store_err)?;
-                    Ok(Some(rec))
-                }
+            match std::fs::read(&path) {
+                Ok(bytes) => Ok(Some(bytes)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(store_err(e)),
+                Err(e) => Err(fs_err(e)),
             }
         })
     }
 
-    fn put(&self, id: &str, record: CacheRecord) -> BoxFuture<'_, Result<(), StoreError>> {
-        let path = self.path_for(id);
-        let dir = self.dir.clone();
+    fn append(&self, path: &str, bytes: &[u8]) -> BoxFuture<'_, Result<(), FsError>> {
+        let path = path.to_string();
+        let bytes = bytes.to_vec();
         Box::pin(async move {
-            let bytes = serde_json::to_vec(&record).map_err(store_err)?;
-            atomic_write(&dir, &path, &bytes).map_err(store_err)?;
+            // Create-if-absent + append; no fsync (the append log is
+            // throwaway — durability comes from compaction's atomic_replace).
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(fs_err)?;
+            f.write_all(&bytes).map_err(fs_err)?;
             Ok(())
         })
     }
 
-    fn remove(&self, id: &str) -> BoxFuture<'_, Result<(), StoreError>> {
-        let path = self.path_for(id);
-        Box::pin(async move {
-            match fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(store_err(e)),
-            }
-        })
+    fn atomic_replace(&self, path: &str, bytes: &[u8]) -> BoxFuture<'_, Result<(), FsError>> {
+        let path = path.to_string();
+        let bytes = bytes.to_vec();
+        Box::pin(async move { atomic_replace(Path::new(&path), &bytes).map_err(fs_err) })
     }
 
-    fn entries(&self) -> BoxFuture<'_, Result<Vec<(String, CacheRecord)>, StoreError>> {
-        let dir = self.dir.clone();
+    fn list(&self, dir: &str) -> BoxFuture<'_, Result<Vec<String>, FsError>> {
+        let dir = dir.to_string();
         Box::pin(async move {
             let mut out = Vec::new();
-            for entry in fs::read_dir(&dir).map_err(store_err)? {
-                let entry = entry.map_err(store_err)?;
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                    continue;
+            match std::fs::read_dir(&dir) {
+                Ok(rd) => {
+                    for entry in rd {
+                        let entry = entry.map_err(fs_err)?;
+                        if let Some(name) = entry.file_name().to_str() {
+                            out.push(name.to_string());
+                        }
+                    }
+                    Ok(out)
                 }
-                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                let Some(id_bytes) = hex_decode(stem) else { continue };
-                let Ok(id) = String::from_utf8(id_bytes) else { continue };
-                let bytes = fs::read(&path).map_err(store_err)?;
-                let rec: CacheRecord = serde_json::from_slice(&bytes).map_err(store_err)?;
-                out.push((id, rec));
+                // A not-yet-created dir simply has no files.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(out),
+                Err(e) => Err(fs_err(e)),
             }
-            Ok(out)
+        })
+    }
+
+    fn remove(&self, path: &str) -> BoxFuture<'_, Result<(), FsError>> {
+        let path = path.to_string();
+        Box::pin(async move {
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(fs_err(e)),
+            }
+        })
+    }
+
+    fn lock_exclusive(&self, path: &str) -> BoxFuture<'_, Result<Box<dyn CacheGuard>, FsError>> {
+        let path = path.to_string();
+        Box::pin(async move {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false) // a lock file: never wipe it, we only lock it
+                .open(&path)
+                .map_err(fs_err)?;
+            // Blocking exclusive advisory lock; released when the guard's owned
+            // `File` is dropped (fs4 unlocks on close; we also unlock in Drop).
+            // Fully-qualified so it resolves to fs4's trait method and not the
+            // inherent `File::lock`/`unlock` std stabilized in 1.89 (> our MSRV).
+            fs4::FileExt::lock_exclusive(&file).map_err(fs_err)?;
+            Ok(Box::new(StdGuard { file }) as Box<dyn CacheGuard>)
         })
     }
 }
 
-fn store_err(e: impl std::fmt::Display) -> StoreError {
-    StoreError(e.to_string())
+/// A held exclusive lock. Owns the locked `File`; dropping it releases the
+/// advisory lock.
+struct StdGuard {
+    file: std::fs::File,
 }
 
-/// Write `bytes` to `path` atomically (temp file in the same dir + rename).
-fn atomic_write(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("entry");
-    let tmp = dir.join(format!(".tmp-{file_name}"));
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+impl CacheGuard for StdGuard {}
+
+impl Drop for StdGuard {
+    fn drop(&mut self) {
+        // Fully-qualified to fs4's trait method (see the note in
+        // `lock_exclusive`); dropping the `File` would release the lock anyway.
+        let _ = fs4::FileExt::unlock(&self.file);
     }
-    fs::rename(&tmp, path)
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    s
+/// Convert any `std` error into an [`FsError`].
+fn fs_err(e: impl std::fmt::Display) -> FsError {
+    FsError(e.to_string())
 }
 
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
-        return None;
+/// Durably, all-or-nothing replace `path`'s contents with `bytes`: write a
+/// temp file in the *same* directory, fsync it, atomically rename it over the
+/// target, then fsync the parent directory so the rename itself is durable.
+fn atomic_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    // Atomic rename over the destination.
+    tmp.persist(path).map_err(|e| e.error)?;
+    // fsync the directory so the rename survives a crash.
+    if let Ok(dir_file) = std::fs::File::open(dir) {
+        let _ = dir_file.sync_all();
     }
-    let val = |c: u8| -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        }
-    };
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i < bytes.len() {
-        out.push((val(bytes[i])? << 4) | val(bytes[i + 1])?);
-        i += 2;
+    Ok(())
+}
+
+/// The base file name used by [`SingleFileCacheStore`] (`citations.jsonl` etc.).
+const BASE: &str = "citations";
+
+/// A ready-to-use single-file cache store over the local filesystem.
+///
+/// Thin wrapper over [`FileCacheStore`]`<`[`StdCacheFs`]`>`: keeps one
+/// `citations.jsonl` file (plus per-writer `*.log` sidecars and a `.lock`) in
+/// a directory of your choosing. Construct with [`SingleFileCacheStore::new`].
+pub struct SingleFileCacheStore(FileCacheStore<StdCacheFs>);
+
+impl SingleFileCacheStore {
+    /// Open (creating the directory if needed) a single-file cache in `dir`.
+    ///
+    /// The writer id is `"<pid>-<nanos-since-epoch>"`, unique per process run
+    /// without needing an RNG dependency, so concurrent processes never share
+    /// a sidecar log.
+    pub async fn new(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir).map_err(|e| StoreError(e.to_string()))?;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let writer_id = format!("{}-{}", std::process::id(), nanos);
+
+        let dir = dir.to_string_lossy().into_owned();
+        let inner = FileCacheStore::open(StdCacheFs, dir, BASE, writer_id).await?;
+        Ok(SingleFileCacheStore(inner))
     }
-    Some(out)
+
+    /// Access the underlying generic store.
+    pub fn inner(&self) -> &FileCacheStore<StdCacheFs> {
+        &self.0
+    }
+}
+
+// Delegate the store trait straight through to the inner `FileCacheStore`.
+impl CacheStore for SingleFileCacheStore {
+    fn get(&self, id: &str) -> BoxFuture<'_, Result<Option<CacheRecord>, StoreError>> {
+        self.0.get(id)
+    }
+    fn put(&self, id: &str, record: CacheRecord) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.0.put(id, record)
+    }
+    fn remove(&self, id: &str) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.0.remove(id)
+    }
+    fn entries(&self) -> BoxFuture<'_, Result<Vec<(String, CacheRecord)>, StoreError>> {
+        self.0.entries()
+    }
+    fn flush(&self) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.0.flush()
+    }
 }

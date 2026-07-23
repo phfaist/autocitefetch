@@ -10,6 +10,11 @@ repository.workspace = true
 [dependencies]
 autocitefetch = { workspace = true }
 serde_json = { workspace = true }
+# The single-file cache is a core feature of this crate, so these are not
+# optional: `tempfile` for durable atomic file replacement, `fs4` for the
+# advisory compaction lock.
+tempfile = "3"
+fs4 = "0.6"
 # Optional blocking HTTP backend. Gated behind the `http` feature so the crate
 # still builds with no network/TLS dependency (see `UreqFetcher`).
 ureq = { version = "2", optional = true }

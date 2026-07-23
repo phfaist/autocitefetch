@@ -11,9 +11,9 @@
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
-use autocitefetch::source::BibliographyFileSource;
 use autocitefetch::CitationManager;
-use autocitefetch_std::{BlockingTimer, DirCacheStore, SystemClock, UreqFetcher};
+use autocitefetch::source::BibliographyFileSource;
+use autocitefetch_std::{BlockingTimer, SingleFileCacheStore, SystemClock, UreqFetcher};
 
 /// Blocking driver: every backend resolves on the first poll (see the example).
 fn block_on<F: Future>(fut: F) -> F::Output {
@@ -51,7 +51,7 @@ fn bibliography_file_resolves_offline_through_file_url() {
     std::fs::write(&bib_path, BIB_JSON).expect("write bib file");
     let bib_url = format!("file://{}", bib_path.display());
 
-    let store = DirCacheStore::new(dir.join("cache")).expect("open cache dir");
+    let store = block_on(SingleFileCacheStore::new(dir.join("cache"))).expect("open cache dir");
     let manager = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
         .register(BibliographyFileSource::new([bib_url]));
 
