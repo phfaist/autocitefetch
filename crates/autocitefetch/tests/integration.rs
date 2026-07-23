@@ -222,6 +222,27 @@ fn arxiv_chains_to_doi_and_merges_set_properties() {
 }
 
 #[test]
+fn response_header_lookup_is_case_insensitive_in_both_directions() {
+    // `Response::headers` only *asks* fetchers to lowercase names. A host that
+    // stores the canonical `Retry-After` used to make `header()` return `None`,
+    // so the retry layer ignored an explicit `503 Retry-After: 120` and backed
+    // off on its own schedule instead.
+    let mut resp = Response {
+        status: 503,
+        headers: Default::default(),
+        body: Vec::new(),
+    };
+    resp.headers.insert("Retry-After".into(), "120".into());
+    resp.headers.insert("content-type".into(), "text/plain".into());
+
+    assert_eq!(resp.header("retry-after"), Some("120"));
+    assert_eq!(resp.header("Retry-After"), Some("120"));
+    assert_eq!(resp.header("RETRY-AFTER"), Some("120"));
+    assert_eq!(resp.header("Content-Type"), Some("text/plain"));
+    assert_eq!(resp.header("x-absent"), None);
+}
+
+#[test]
 fn doi_url_percent_encodes_the_key_but_keeps_slashes() {
     // A real DOI with parentheses, angle brackets, a colon and a semicolon.
     const KEY: &str = "10.1002/(SICI)1096-8628(20000403)91:4<317::AID-AJMG16>3.0.CO;2-9";
