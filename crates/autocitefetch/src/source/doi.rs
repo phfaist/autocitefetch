@@ -60,8 +60,16 @@ impl Source for DoiSource {
 }
 
 async fn resolve_one(doi: &str, ctx: &RetrieveCtx<'_>) -> Resolution {
+    // Guard the two inputs that would otherwise produce a *plausible* request:
+    // an empty key fetches doi.org's homepage, whitespace corrupts the path.
+    if doi.is_empty() {
+        return Resolution::failed(doi, Error::Source("empty DOI".into()));
+    }
     if doi.chars().any(char::is_whitespace) {
-        return Resolution::failed(doi, Error::Source("DOI contains whitespace".into()));
+        return Resolution::failed(
+            doi,
+            Error::Source(alloc::format!("DOI `{doi}` contains whitespace")),
+        );
     }
     let mut url = String::from("https://doi.org/");
     encode_path_into(&mut url, doi);
@@ -69,7 +77,19 @@ async fn resolve_one(doi: &str, ctx: &RetrieveCtx<'_>) -> Resolution {
     let req = Request::get(url).header("accept", ACCEPT_CSL_JSON);
     match ctx.fetcher.fetch(req).await {
         Ok(resp) if resp.is_success() => match serde_json::from_slice::<CslValue>(&resp.body) {
-            Ok(csl) => Resolution::concrete(doi, csl),
+            // A CSL-JSON item is a non-empty JSON *object*. Anything else that
+            // happens to parse (`null`, `[]`, `"nope"`, `123`, `{}` — a proxy,
+            // a captive portal, or an RA answering with a JSON error envelope)
+            // must not be cached: `csl::set_id` would replace it with a fresh
+            // object and we would store a plausible-looking `{"id": "doi:…"}`
+            // shell for the full 360-day TTL, with no failure reported.
+            Ok(csl) if is_csl_item(&csl) => Resolution::concrete(doi, csl),
+            Ok(_) => Resolution::failed(
+                doi,
+                Error::Parse(
+                    "doi.org returned 200 but the body is not a non-empty JSON object".into(),
+                ),
+            ),
             Err(e) => Resolution::failed(doi, Error::Parse(alloc::format!("{e}"))),
         },
         Ok(resp) => Resolution::failed(
@@ -78,6 +98,11 @@ async fn resolve_one(doi: &str, ctx: &RetrieveCtx<'_>) -> Resolution {
         ),
         Err(e) => Resolution::failed(doi, Error::Fetch(e)),
     }
+}
+
+/// Whether a parsed body can be a CSL-JSON item: a non-empty JSON object.
+fn is_csl_item(v: &CslValue) -> bool {
+    v.as_object().is_some_and(|o| !o.is_empty())
 }
 
 /// Percent-encode a DOI for use in a URL path. Keeps `/` (DOIs use it as a
