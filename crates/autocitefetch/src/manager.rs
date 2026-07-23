@@ -4,6 +4,7 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use futures_util::stream::{iter, StreamExt};
 use hashbrown::{HashMap, HashSet};
 
 use crate::cache::{Freshness, TtlPolicy};
@@ -12,8 +13,13 @@ use crate::driver::drive_source;
 use crate::env::{Clock, Timer};
 use crate::error::{Error, Result};
 use crate::fetch::Fetcher;
-use crate::source::{Outcome, RetrieveCtx, Source};
+use crate::source::{Outcome, Resolution, RetrieveCtx, Source};
 use crate::store::{CacheStore, Payload};
+
+/// Upper bound on how many sources' `drive_source` calls run concurrently
+/// within a single retrieval pass. Keeps a large fan-out from issuing an
+/// unbounded number of in-flight fetches at once.
+const MAX_CONCURRENT_SOURCES: usize = 8;
 
 /// A single citation that could not be resolved (and had no usable cached
 /// copy). Retrieval is per-citation tolerant: one failure does not abort the
@@ -142,15 +148,38 @@ where
                 }
             }
 
-            // Drive each source (sequentially for now; this is the natural
-            // point to run sources concurrently via a futures combinator).
-            for (prefix, keys) in buckets {
+            // Drive every source in this pass concurrently: the network-bound
+            // `drive_source` calls (one per prefix) now overlap instead of
+            // running one after another. Each future borrows `&self`
+            // immutably (shared `ctx` + `self.sources`); the single-threaded
+            // cooperative executor interleaves their awaits, so this is data-
+            // race free even though the store is interior-mutable.
+            let ctx = self.ctx();
+            let source_futures = buckets.into_iter().map(|(prefix, keys)| {
+                let ctx = &ctx;
+                async move {
+                    let source = self
+                        .sources
+                        .get(&prefix)
+                        .expect("prefix presence checked above");
+                    let resolutions = drive_source(source.as_ref(), keys, ctx).await;
+                    (prefix, resolutions)
+                }
+            });
+            let results: Vec<(String, Vec<Resolution>)> = iter(source_futures)
+                .buffer_unordered(MAX_CONCURRENT_SOURCES)
+                .collect()
+                .await;
+
+            // Apply the collected results sequentially. Keeping the store
+            // writes / `worklist` / `report` updates serial keeps them simple
+            // and correct; the concurrency win is in the overlap above. The
+            // source is re-looked-up by prefix for `default_ttl()`.
+            for (prefix, resolutions) in results {
                 let source = self
                     .sources
                     .get(&prefix)
                     .expect("prefix presence checked above");
-                let ctx = self.ctx();
-                let resolutions = drive_source(source.as_ref(), keys, &ctx).await;
                 self.store_resolutions(&prefix, source.as_ref(), resolutions, &mut worklist, &mut report)
                     .await?;
             }
