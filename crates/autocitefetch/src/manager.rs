@@ -10,7 +10,7 @@ use hashbrown::{HashMap, HashSet};
 use crate::cache::{Freshness, TtlPolicy};
 use crate::csl::{self, CslValue};
 use crate::driver::drive_source;
-use crate::env::{Clock, Timer};
+use crate::env::{Clock, Timer, Timestamp};
 use crate::error::{Error, Result};
 use crate::fetch::Fetcher;
 use crate::retry::{RetryPolicy, RetryingFetcher};
@@ -18,9 +18,30 @@ use crate::source::{Outcome, Resolution, RetrieveCtx, Source};
 use crate::store::{CacheStore, Payload};
 
 /// Upper bound on how many sources' `drive_source` calls run concurrently
-/// within a single retrieval pass. Keeps a large fan-out from issuing an
-/// unbounded number of in-flight fetches at once.
+/// within a single retrieval pass.
+///
+/// Buckets are keyed by prefix, so the number of futures in a pass is bounded
+/// by the number of *registered* sources (and each source's own fetches are
+/// serial inside `drive_source`). With fewer than nine sources registered this
+/// constant is therefore inert; it exists so a host that registers dozens of
+/// sources cannot open an unbounded number of connections at once.
 const MAX_CONCURRENT_SOURCES: usize = 8;
+
+/// A citation still to be looked at this retrieval: `(prefix, key, depth)`,
+/// where `depth` is how many chain links away from a *requested* citation it
+/// is (0 for the ones the caller asked for).
+type WorkItem = (String, String, usize);
+
+/// What one driven source contributes to a pass: its prefix, the keys it was
+/// asked for, the resolutions it returned, and when its last chunk started.
+type PassResult = (String, Vec<String>, Vec<Resolution>, Option<Timestamp>);
+
+/// The mutable per-pass state that applying a resolution feeds: newly
+/// discovered chain targets, and per-citation failures.
+struct PassSink<'a> {
+    worklist: &'a mut Vec<WorkItem>,
+    report: &'a mut RetrieveReport,
+}
 
 /// A single citation that could not be resolved (and had no usable cached
 /// copy). Retrieval is per-citation tolerant: one failure does not abort the
@@ -56,7 +77,9 @@ pub struct CitationManager<F, S, C, T> {
     policy: TtlPolicy,
     /// Backoff/retry policy for the transparent retrying fetcher wrapper.
     retry_policy: RetryPolicy,
-    /// Safety bound on chain length while resolving.
+    /// Safety bound on chain length, applied both while *following* a chain in
+    /// [`CitationManager::get`] and while *discovering* one in
+    /// [`CitationManager::retrieve`].
     max_chain_depth: usize,
 }
 
@@ -83,9 +106,21 @@ where
     }
 
     /// Register a source under its declared prefix. Builder-style.
+    ///
+    /// # Panics
+    ///
+    /// If the source's prefix contains a `':'`. Citation ids are
+    /// `"prefix:key"` and are split on the *first* colon, so such a prefix
+    /// would make ids ambiguous (`("a", "b:c")` and `("a:b", "c")` collide in
+    /// the cache) and break the [`CitationManager::get_by_id`] round-trip.
+    /// This is a construction-time programming error, not a runtime condition.
     pub fn register(mut self, source: impl Source + 'static) -> Self {
-        self.sources
-            .insert(source.prefix().to_string(), Box::new(source));
+        let prefix = source.prefix();
+        assert!(
+            !prefix.contains(':'),
+            "source prefix `{prefix}` must not contain ':' — citation ids are `prefix:key`"
+        );
+        self.sources.insert(prefix.to_string(), Box::new(source));
         self
     }
 
@@ -101,22 +136,82 @@ where
         self
     }
 
+    /// Override the maximum number of chain links to follow (default 16).
+    /// Builder-style.
+    ///
+    /// The same bound applies to retrieval and to reading: `retrieve` refuses
+    /// to *fetch* a link this crate's `get` could never *reach*.
+    pub fn with_max_chain_depth(mut self, depth: usize) -> Self {
+        self.max_chain_depth = depth;
+        self
+    }
+
     /// Populate the cache for every `(prefix, key)` in `cites` that is missing
     /// or stale, following chained pointers. Returns per-citation failures;
     /// only backend (store) errors abort with `Err`.
+    ///
+    /// A store error discards the report (the per-citation failures collected
+    /// so far are lost) — but the buffered writes are still flushed, so a
+    /// file-backed cache is never left with un-folded sidecars.
     pub async fn retrieve(&self, cites: &[(String, String)]) -> Result<RetrieveReport> {
         let mut report = RetrieveReport::default();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut worklist: Vec<(String, String)> = cites.to_vec();
+        let outcome = self.run_passes(cites, &mut report).await;
+        // Durably compact buffered writes *even if* a pass aborted: everything
+        // written before the error is still worth keeping.
+        let flushed = self.store.flush().await;
+        outcome?;
+        flushed?;
+        Ok(report)
+    }
+
+    /// The worklist loop behind [`CitationManager::retrieve`].
+    async fn run_passes(
+        &self,
+        cites: &[(String, String)],
+        report: &mut RetrieveReport,
+    ) -> Result<()> {
+        // id → the chain depth at which it was first requested. Doubles as the
+        // dedup set; the depth is what stops an ill-behaved source from making
+        // `retrieve` walk an unbounded chain.
+        let mut depths: HashMap<String, usize> = HashMap::new();
+        let mut worklist: Vec<WorkItem> = cites
+            .iter()
+            .map(|(p, k)| (p.clone(), k.clone(), 0))
+            .collect();
+        // Per-prefix start time of the most recent chunk. Carried across passes
+        // so a source's `min_interval` is not reset every pass (the arXiv→DOI
+        // chain guarantees at least two passes hit the `doi` source).
+        let mut last_start: HashMap<String, Timestamp> = HashMap::new();
 
         while !worklist.is_empty() {
-            let batch: Vec<(String, String)> = core::mem::take(&mut worklist);
+            let batch: Vec<WorkItem> = core::mem::take(&mut worklist);
+
+            // One clock reading for the whole pass: classifying a large batch
+            // against a drifting `now` would make the freshness cutoff depend
+            // on a citation's position in the batch.
+            let now = self.clock.now();
 
             // Decide, per citation, what needs fetching this pass.
             let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
-            for (prefix, key) in batch {
+            for (prefix, key, depth) in batch {
                 let id = csl::cite_id(&prefix, &key);
-                if !seen.insert(id.clone()) {
+                if depths.insert(id.clone(), depth).is_some() {
+                    continue;
+                }
+                if depth >= self.max_chain_depth {
+                    // `get()` follows at most `max_chain_depth` links, so
+                    // fetching this one could not help anyone — and without the
+                    // bound a source chaining `k -> k+1` would loop forever.
+                    let message = Error::Chain(alloc::format!(
+                        "`{id}` is more than {} links from a requested citation",
+                        self.max_chain_depth
+                    ))
+                    .to_string();
+                    report.failures.push(CiteFailure {
+                        prefix,
+                        key,
+                        message,
+                    });
                     continue;
                 }
                 if !self.sources.contains_key(&prefix) {
@@ -129,35 +224,55 @@ where
                 }
 
                 match self.store.get(&id).await? {
-                    Some(rec) => {
-                        // A cached chained entry: make sure its target is present.
-                        if let Payload::Chained {
-                            prefix: tp,
-                            key: tk,
-                            ..
-                        } = &rec.payload
-                        {
-                            worklist.push((tp.clone(), tk.clone()));
-                        }
-                        match self.policy.classify(&rec, self.clock.now()) {
-                            Freshness::Fresh => {}
-                            Freshness::Stale | Freshness::Expired => {
-                                buckets.entry(prefix).or_default().push(key);
+                    Some(rec) => match self.policy.classify(&rec, now) {
+                        Freshness::Fresh => {
+                            // Only a record we are *not* about to refetch needs
+                            // its target pulled in from here. Pre-pushing the
+                            // target of a stale pointer would fetch a link the
+                            // refetch is about to replace — and report a
+                            // failure for a citation nobody asked for if that
+                            // dead target 404s.
+                            if let Payload::Chained {
+                                prefix: tp,
+                                key: tk,
+                                ..
+                            } = &rec.payload
+                            {
+                                worklist.push((tp.clone(), tk.clone(), depth + 1));
                             }
                         }
-                    }
+                        Freshness::Stale | Freshness::Expired => {
+                            buckets.entry(prefix).or_default().push(key);
+                        }
+                    },
                     None => {
                         buckets.entry(prefix).or_default().push(key);
                     }
                 }
             }
 
-            // Drive every source in this pass concurrently: the network-bound
-            // `drive_source` calls (one per prefix) now overlap instead of
-            // running one after another. Each future borrows `&self`
-            // immutably (shared `ctx` + `self.sources`); the single-threaded
-            // cooperative executor interleaves their awaits, so this is data-
-            // race free even though the store is interior-mutable.
+            // Snapshot each source's pacing state before building the futures,
+            // so the concurrent phase does not borrow `last_start`.
+            let bucket_list: Vec<(String, Vec<String>, Option<Timestamp>)> = buckets
+                .into_iter()
+                .map(|(prefix, keys)| {
+                    let last = last_start.get(&prefix).copied();
+                    (prefix, keys, last)
+                })
+                .collect();
+
+            // Drive every source in this pass concurrently: the `drive_source`
+            // calls (one per prefix) can overlap instead of running one after
+            // another. Each future borrows `&self` immutably (shared `ctx` +
+            // `self.sources`); the single-threaded cooperative executor
+            // interleaves their awaits, so this is data-race free even though
+            // the store is interior-mutable.
+            //
+            // Caveat: overlap only materializes if the host backends actually
+            // yield. The shipped `std` backends do not — `UreqFetcher` blocks
+            // the thread and `BlockingTimer` sleeps it — so with them the
+            // sources still run one after another. The win is for hosts whose
+            // fetcher/timer are genuinely async (WASM `fetch()`/`setTimeout`).
             //
             // Transparently interpose the retrying fetcher: `retrying` and
             // `ctx` are locals that outlive the whole `buffer_unordered` pass,
@@ -172,18 +287,23 @@ where
                 timer: &self.timer,
                 clock: &self.clock,
             };
-            let source_futures = buckets.into_iter().map(|(prefix, keys)| {
+            let source_futures = bucket_list.into_iter().map(|(prefix, keys, last)| {
                 let ctx = &ctx;
                 async move {
                     let source = self
                         .sources
                         .get(&prefix)
                         .expect("prefix presence checked above");
-                    let resolutions = drive_source(source.as_ref(), keys, ctx).await;
-                    (prefix, resolutions)
+                    // Keep the keys we asked for: a source that silently omits
+                    // one must not leave the citation unstored *and*
+                    // unreported.
+                    let requested = keys.clone();
+                    let (resolutions, started) =
+                        drive_source(source.as_ref(), keys, ctx, last).await;
+                    (prefix, requested, resolutions, started)
                 }
             });
-            let results: Vec<(String, Vec<Resolution>)> = iter(source_futures)
+            let results: Vec<PassResult> = iter(source_futures)
                 .buffer_unordered(MAX_CONCURRENT_SOURCES)
                 .collect()
                 .await;
@@ -192,41 +312,68 @@ where
             // writes / `worklist` / `report` updates serial keeps them simple
             // and correct; the concurrency win is in the overlap above. The
             // source is re-looked-up by prefix for `default_ttl()`.
-            for (prefix, resolutions) in results {
+            for (prefix, requested, resolutions, started) in results {
+                if let Some(t) = started {
+                    last_start.insert(prefix.clone(), t);
+                }
                 let source = self
                     .sources
                     .get(&prefix)
                     .expect("prefix presence checked above");
+                let mut sink = PassSink {
+                    worklist: &mut worklist,
+                    report,
+                };
                 self.store_resolutions(
                     &prefix,
                     source.as_ref(),
+                    requested,
                     resolutions,
-                    &mut worklist,
-                    &mut report,
+                    &depths,
+                    &mut sink,
                 )
                 .await?;
             }
         }
 
-        // Durably compact any buffered writes before returning.
-        self.store.flush().await?;
-        Ok(report)
+        Ok(())
     }
 
     async fn store_resolutions(
         &self,
         prefix: &str,
         source: &dyn Source,
-        resolutions: Vec<crate::source::Resolution>,
-        worklist: &mut Vec<(String, String)>,
-        report: &mut RetrieveReport,
+        requested: Vec<String>,
+        resolutions: Vec<Resolution>,
+        depths: &HashMap<String, usize>,
+        sink: &mut PassSink<'_>,
     ) -> Result<()> {
         let now = self.clock.now();
+        let mut handled: HashSet<String> = HashSet::new();
+
         for res in resolutions {
+            // Contract: exactly one `Resolution` per requested key. A duplicate
+            // would double-write the store (or double-report a failure), so
+            // only the first one for a key counts.
+            if !handled.insert(res.key.clone()) {
+                continue;
+            }
             let id = csl::cite_id(prefix, &res.key);
+            let depth = depths.get(&id).copied().unwrap_or(0);
+
             match res.outcome {
                 Outcome::Concrete { mut csl, ttl } => {
-                    csl::set_id(&mut csl, &id);
+                    if !csl::set_id(&mut csl, &id) {
+                        // A bare array/string/number/null is not a CSL item.
+                        // Storing it used to silently replace the payload with
+                        // a `{"id": …}` stub and report success.
+                        let err = Error::Source(alloc::format!(
+                            "source returned a non-object CSL payload for `{id}`"
+                        ));
+                        self.note_failure(prefix, &res.key, err, now, depth, sink)
+                            .await?;
+                        continue;
+                    }
                     let ttl = ttl.unwrap_or_else(|| source.default_ttl());
                     let record = self
                         .policy
@@ -238,6 +385,14 @@ where
                     key: tk,
                     set_properties,
                 } => {
+                    if tp == prefix && tk == res.key {
+                        // Would otherwise be stored happily and only surface
+                        // as "chain too deep" `max_chain_depth` reads later.
+                        let err = Error::Chain(alloc::format!("`{id}` chains to itself"));
+                        self.note_failure(prefix, &res.key, err, now, depth, sink)
+                            .await?;
+                        continue;
+                    }
                     let payload = Payload::Chained {
                         prefix: tp.clone(),
                         key: tk.clone(),
@@ -247,24 +402,72 @@ where
                         .policy
                         .make_record(payload, now, source.default_ttl(), &id);
                     self.store.put(&id, record).await?;
-                    worklist.push((tp, tk));
+                    sink.worklist.push((tp, tk, depth + 1));
                 }
                 Outcome::Failed(err) => {
-                    // Graceful degradation: if a stale/expired copy is still
-                    // within the grace window, keep using it and don't report.
-                    let keep = match self.store.get(&id).await? {
-                        Some(rec) => self.policy.usable_within_grace(&rec, now),
-                        None => false,
-                    };
-                    if !keep {
-                        report.failures.push(CiteFailure {
-                            prefix: prefix.to_string(),
-                            key: res.key,
-                            message: err.to_string(),
-                        });
-                    }
+                    self.note_failure(prefix, &res.key, err, now, depth, sink)
+                        .await?;
                 }
             }
+        }
+
+        // A key the source never answered: the manager matches resolutions by
+        // `res.key`, so without this the citation would be neither stored nor
+        // reported and `retrieve` would claim success for something `get` can
+        // never return.
+        for key in requested {
+            if handled.contains(&key) {
+                continue;
+            }
+            let id = csl::cite_id(prefix, &key);
+            let depth = depths.get(&id).copied().unwrap_or(0);
+            let err = Error::Source(alloc::format!(
+                "source `{prefix}` returned no resolution for key `{key}`"
+            ));
+            self.note_failure(prefix, &key, err, now, depth, sink)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Record a per-citation failure — unless a cached copy is still within the
+    /// grace window, in which case the stale entry keeps being used and nothing
+    /// is reported (stale-while-revalidate).
+    async fn note_failure(
+        &self,
+        prefix: &str,
+        key: &str,
+        err: Error,
+        now: Timestamp,
+        depth: usize,
+        sink: &mut PassSink<'_>,
+    ) -> Result<()> {
+        let id = csl::cite_id(prefix, key);
+        let kept = match self.store.get(&id).await? {
+            Some(rec) if self.policy.usable_within_grace(&rec, now) => Some(rec),
+            _ => None,
+        };
+        match kept {
+            // Keeping a chained pointer alive means its target must be present
+            // too, otherwise `get()` breaks on the next link. Nothing else
+            // pushes it: the pointer was stale, so it was not pre-pushed during
+            // bucketing.
+            Some(rec) => {
+                if let Payload::Chained {
+                    prefix: tp,
+                    key: tk,
+                    ..
+                } = rec.payload
+                {
+                    sink.worklist.push((tp, tk, depth + 1));
+                }
+            }
+            None => sink.report.failures.push(CiteFailure {
+                prefix: prefix.to_string(),
+                key: key.to_string(),
+                message: err.to_string(),
+            }),
         }
         Ok(())
     }
@@ -280,11 +483,19 @@ where
         let mut accumulated = CslValue::Object(serde_json::Map::new());
 
         for _ in 0..self.max_chain_depth {
-            let rec = self
-                .store
-                .get(&current_id)
-                .await?
-                .ok_or_else(|| Error::NotFound(current_id.clone()))?;
+            let rec = match self.store.get(&current_id).await? {
+                Some(rec) => rec,
+                // Name both ids: a missing *chain target* is not a citation the
+                // caller ever asked for, so reporting only its id is confusing.
+                None if current_id == requested_id => {
+                    return Err(Error::NotFound(requested_id));
+                }
+                None => {
+                    return Err(Error::Chain(alloc::format!(
+                        "`{requested_id}` chains to `{current_id}`, which is not in the cache"
+                    )));
+                }
+            };
 
             match rec.payload {
                 Payload::Concrete(mut csl) => {
@@ -299,13 +510,20 @@ where
                 } => {
                     // already-seen wins ⇒ merge the new set as defaults under it
                     csl::merge_defaults(&mut accumulated, &set_properties);
-                    current_id = csl::cite_id(&tp, &tk);
+                    let next_id = csl::cite_id(&tp, &tk);
+                    if next_id == current_id {
+                        return Err(Error::Chain(alloc::format!(
+                            "`{current_id}` chains to itself"
+                        )));
+                    }
+                    current_id = next_id;
                 }
             }
         }
 
-        Err(Error::Source(alloc::format!(
-            "citation chain too deep resolving `{requested_id}`"
+        Err(Error::Chain(alloc::format!(
+            "chain from `{requested_id}` is longer than the {} link limit",
+            self.max_chain_depth
         )))
     }
 
@@ -313,7 +531,7 @@ where
     pub async fn get_by_id(&self, id: &str) -> Result<CslValue> {
         match id.split_once(':') {
             Some((prefix, key)) => self.get(prefix, key).await,
-            None => Err(Error::UnknownPrefix(id.to_string())),
+            None => Err(Error::InvalidId(id.to_string())),
         }
     }
 
@@ -322,9 +540,10 @@ where
         let now = self.clock.now();
         let mut removed = 0;
         for (id, rec) in self.store.entries().await? {
-            if !self.policy.usable_within_grace(&rec, now)
-                && self.policy.classify(&rec, now) == Freshness::Expired
-            {
+            // `grace` is non-negative, so being past `expires + grace` already
+            // implies `classify(..) == Expired`; testing both would be
+            // redundant.
+            if !self.policy.usable_within_grace(&rec, now) {
                 self.store.remove(&id).await?;
                 removed += 1;
             }
