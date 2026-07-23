@@ -25,6 +25,7 @@ use crate::fetch::Fetcher;
 use crate::BoxFuture;
 
 /// What a source resolved a single requested key into.
+#[derive(Debug)]
 pub enum Outcome {
     /// Concrete CSL-JSON metadata, with an optional per-entry TTL override
     /// (falls back to the source's [`Source::default_ttl`] when `None`).
@@ -45,6 +46,7 @@ pub enum Outcome {
 }
 
 /// The result of resolving one requested key.
+#[derive(Debug)]
 pub struct Resolution {
     /// The originally requested key (prefix stripped).
     pub key: String,
@@ -52,6 +54,7 @@ pub struct Resolution {
 }
 
 impl Resolution {
+    /// Resolved to concrete CSL-JSON, with the source's default TTL.
     pub fn concrete(key: impl Into<String>, csl: CslValue) -> Self {
         Resolution {
             key: key.into(),
@@ -59,6 +62,26 @@ impl Resolution {
         }
     }
 
+    /// Resolved to a pointer at `(target_prefix, target_key)`; `set_properties`
+    /// is merged into the target at read time (see [`Outcome::Chained`]).
+    pub fn chained(
+        key: impl Into<String>,
+        target_prefix: impl Into<String>,
+        target_key: impl Into<String>,
+        set_properties: CslValue,
+    ) -> Self {
+        Resolution {
+            key: key.into(),
+            outcome: Outcome::Chained {
+                prefix: target_prefix.into(),
+                key: target_key.into(),
+                set_properties,
+            },
+        }
+    }
+
+    /// Could not be resolved. Still counts as "one `Resolution` per requested
+    /// key" — see [`Source::retrieve_chunk`].
     pub fn failed(key: impl Into<String>, err: Error) -> Self {
         Resolution {
             key: key.into(),
@@ -97,14 +120,34 @@ pub trait Source {
         Duration::from_secs(30 * 24 * 60 * 60)
     }
 
-    /// Prefixes this source may chain *to* (e.g. arXiv → `["doi"]`). Used by
-    /// the manager to order retrieval so downstream targets are fetched after.
+    /// Prefixes this source may chain *to* (e.g. arXiv → `["doi"]`).
+    ///
+    /// **Advisory / introspection only** — the manager does not consult it.
+    /// Chain discovery is dynamic: an [`Outcome::Chained`] resolution pushes
+    /// its target onto the retrieval worklist, which is drained in further
+    /// passes, so ordering needs no static declaration. Declare it anyway to
+    /// document the source's shape (and so a host can warn about a chain
+    /// target whose prefix has no registered source).
     fn chains_to(&self) -> &[&'static str] {
         &[]
     }
 
     /// Resolve a batch of keys (already stripped of the prefix, and already
     /// filtered to cache-misses / stale entries by the manager).
+    ///
+    /// # Contract
+    ///
+    /// **Return exactly one [`Resolution`] per requested key**, with
+    /// `Resolution::key` equal to the requested key — the manager matches
+    /// results to requests by `res.key`, not by position. Use
+    /// [`Outcome::Failed`] (via [`Resolution::failed`]) for a key you could
+    /// not resolve, including a plain miss; a key you omit is silently
+    /// *neither stored nor reported*, so the caller sees no failure and no
+    /// entry. Extra resolutions for keys that were not requested are ignored.
+    ///
+    /// Do **not** implement retries here: the `ctx.fetcher` handed to a source
+    /// is already wrapped in a
+    /// [`RetryingFetcher`](crate::retry::RetryingFetcher).
     fn retrieve_chunk<'a>(
         &'a self,
         keys: Vec<String>,

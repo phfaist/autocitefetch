@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap as StdMap;
 use std::future::Future;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use autocitefetch::source::{DoiSource, ManualSource};
@@ -27,16 +28,33 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 
 // --- mocks -----------------------------------------------------------------
 
+/// A handle on what a [`MockFetcher`] was asked to fetch. Shared, so it stays
+/// readable after the fetcher is moved into the manager.
+#[derive(Clone, Default)]
+struct Calls(Rc<RefCell<Vec<Request>>>);
+
+impl Calls {
+    fn urls(&self) -> Vec<String> {
+        self.0.borrow().iter().map(|r| r.url.clone()).collect()
+    }
+    fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+    fn last(&self) -> Request {
+        self.0.borrow().last().cloned().expect("no fetch was made")
+    }
+}
+
 struct MockFetcher {
     routes: StdMap<String, (u16, Vec<u8>)>,
-    calls: RefCell<Vec<String>>,
+    calls: Calls,
 }
 
 impl MockFetcher {
     fn new() -> Self {
         MockFetcher {
             routes: StdMap::new(),
-            calls: RefCell::new(Vec::new()),
+            calls: Calls::default(),
         }
     }
     fn route(mut self, url: &str, status: u16, body: &str) -> Self {
@@ -44,17 +62,23 @@ impl MockFetcher {
             .insert(url.into(), (status, body.as_bytes().to_vec()));
         self
     }
+    /// Take a handle on the call log before handing the fetcher to a manager.
+    fn calls(&self) -> Calls {
+        self.calls.clone()
+    }
 }
 
 impl Fetcher for MockFetcher {
     fn fetch(&self, req: Request) -> BoxFuture<'_, Result<Response, FetchError>> {
-        self.calls.borrow_mut().push(req.url.clone());
+        self.calls.0.borrow_mut().push(req.clone());
         let result = match self.routes.get(&req.url) {
             Some((status, body)) => Ok(Response {
                 status: *status,
                 headers: Default::default(),
                 body: body.clone(),
             }),
+            // Unrouted: a *non-retryable* failure, so a test that expects a
+            // URL never to be hit fails fast instead of backing off five times.
             None => Err(FetchError::Status(404)),
         };
         Box::pin(async move { result })
@@ -195,6 +219,150 @@ fn arxiv_chains_to_doi_and_merges_set_properties() {
     assert_eq!(item["title"], "Chained Title");
     assert_eq!(item["arxivid"], "1211.1037", "set_properties should be merged in");
     assert_eq!(item["DOI"], "10.9999/1211.1037");
+}
+
+#[test]
+fn response_header_lookup_is_case_insensitive_in_both_directions() {
+    // `Response::headers` only *asks* fetchers to lowercase names. A host that
+    // stores the canonical `Retry-After` used to make `header()` return `None`,
+    // so the retry layer ignored an explicit `503 Retry-After: 120` and backed
+    // off on its own schedule instead.
+    let mut resp = Response {
+        status: 503,
+        headers: Default::default(),
+        body: Vec::new(),
+    };
+    resp.headers.insert("Retry-After".into(), "120".into());
+    resp.headers.insert("content-type".into(), "text/plain".into());
+
+    assert_eq!(resp.header("retry-after"), Some("120"));
+    assert_eq!(resp.header("Retry-After"), Some("120"));
+    assert_eq!(resp.header("RETRY-AFTER"), Some("120"));
+    assert_eq!(resp.header("Content-Type"), Some("text/plain"));
+    assert_eq!(resp.header("x-absent"), None);
+}
+
+#[test]
+fn doi_url_percent_encodes_the_key_but_keeps_slashes() {
+    // A real DOI with parentheses, angle brackets, a colon and a semicolon.
+    const KEY: &str = "10.1002/(SICI)1096-8628(20000403)91:4<317::AID-AJMG16>3.0.CO;2-9";
+    const URL: &str = "https://doi.org/10.1002/%28SICI%291096-8628%2820000403%2991%3A4%3C317%3A%3AAID-AJMG16%3E3.0.CO%3B2-9";
+
+    let fetcher = MockFetcher::new().route(URL, 200, r#"{"type":"article-journal","title":"Encoded"}"#);
+    let calls = fetcher.calls();
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(DoiSource::new());
+
+    let cites = vec![("doi".to_string(), KEY.to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    // If the encoding were wrong the URL would not match the route and the
+    // mock would 404, so this alone pins the whole encoding.
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    let urls = calls.urls();
+    assert_eq!(urls, vec![URL.to_string()]);
+    assert!(
+        urls[0].starts_with("https://doi.org/10.1002/"),
+        "a DOI's own `/` separator must stay unencoded: {}",
+        urls[0]
+    );
+}
+
+#[test]
+fn doi_requests_carry_the_csl_json_accept_header() {
+    // Without this, doi.org serves an HTML landing page instead of CSL-JSON.
+    let fetcher =
+        MockFetcher::new().route("https://doi.org/10.1/x", 200, r#"{"title":"t"}"#);
+    let calls = fetcher.calls();
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(DoiSource::new());
+
+    let cites = vec![("doi".to_string(), "10.1/x".to_string())];
+    block_on(mgr.retrieve(&cites)).unwrap();
+
+    let req = calls.last();
+    assert_eq!(
+        req.headers.get("accept").map(String::as_str),
+        Some("application/vnd.citationstyles.csl+json"),
+        "headers were {:?}",
+        req.headers
+    );
+}
+
+#[test]
+fn doi_non_success_status_is_one_reported_failure() {
+    let fetcher = MockFetcher::new().route("https://doi.org/10.1/missing", 404, "Not Found");
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(DoiSource::new());
+
+    let cites = vec![("doi".to_string(), "10.1/missing".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert_eq!(report.failures[0].prefix, "doi");
+    assert_eq!(report.failures[0].key, "10.1/missing");
+    assert!(
+        report.failures[0].message.contains("404"),
+        "message should name the status: {}",
+        report.failures[0].message
+    );
+    // Nothing was cached, so reading it back fails too.
+    assert!(block_on(mgr.get("doi", "10.1/missing")).is_err());
+}
+
+#[test]
+fn doi_body_that_is_not_json_is_a_parse_failure() {
+    // A captive portal / landing page, and a truncated response.
+    for body in ["<!DOCTYPE html><html><body>Landing</body></html>", ""] {
+        let fetcher = MockFetcher::new().route("https://doi.org/10.1/x", 200, body);
+        let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+            .register(DoiSource::new());
+
+        let cites = vec![("doi".to_string(), "10.1/x".to_string())];
+        let report = block_on(mgr.retrieve(&cites)).unwrap();
+        assert_eq!(report.failures.len(), 1, "body {body:?}: {:?}", report.failures);
+        assert!(
+            report.failures[0].message.contains("parse error"),
+            "body {body:?} should be a parse error, got {}",
+            report.failures[0].message
+        );
+        assert!(block_on(mgr.get("doi", "10.1/x")).is_err(), "body {body:?} must not be cached");
+    }
+}
+
+#[test]
+fn doi_200_with_json_that_is_not_a_csl_object_is_a_failure() {
+    // All of these parse as JSON. Accepting them used to cache an empty
+    // `{"id":"doi:…"}` shell for 360 days with an empty failure report.
+    for body in ["null", "[]", "\"nope\"", "123", "{}"] {
+        let fetcher = MockFetcher::new().route("https://doi.org/10.1/x", 200, body);
+        let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+            .register(DoiSource::new());
+
+        let cites = vec![("doi".to_string(), "10.1/x".to_string())];
+        let report = block_on(mgr.retrieve(&cites)).unwrap();
+        assert_eq!(report.failures.len(), 1, "body {body} was accepted: {:?}", report.failures);
+        assert!(
+            block_on(mgr.get("doi", "10.1/x")).is_err(),
+            "body {body} must not be cached"
+        );
+    }
+}
+
+#[test]
+fn a_malformed_doi_is_rejected_without_fetching_anything() {
+    // Whitespace would corrupt the path; an empty key would fetch doi.org's
+    // homepage and cache whatever came back.
+    for key in ["10.1103/Phys Rev.47.777", "", "   "] {
+        let fetcher = MockFetcher::new();
+        let calls = fetcher.calls();
+        let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+            .register(DoiSource::new());
+
+        let cites = vec![("doi".to_string(), key.to_string())];
+        let report = block_on(mgr.retrieve(&cites)).unwrap();
+        assert_eq!(report.failures.len(), 1, "key {key:?}: {:?}", report.failures);
+        assert_eq!(calls.len(), 0, "key {key:?} must not reach the network");
+    }
 }
 
 #[test]

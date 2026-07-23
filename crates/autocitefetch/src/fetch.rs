@@ -69,7 +69,8 @@ impl Request {
 #[derive(Clone, Debug)]
 pub struct Response {
     pub status: u16,
-    /// Header names should be lowercased by the fetcher.
+    /// Header names should be lowercased by the fetcher. Nothing enforces it,
+    /// so [`Response::header`] compares case-insensitively either way.
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
 }
@@ -86,8 +87,20 @@ impl Response {
     }
 
     /// Look up a response header (case-insensitive).
+    ///
+    /// [`Response::headers`] only *asks* fetchers to lowercase header names;
+    /// a host that stores the canonical `Retry-After` would otherwise make
+    /// this return `None` and defeat the retry layer's `Retry-After` handling.
+    /// So: fast path on the lowercased name, then a linear
+    /// ASCII-case-insensitive scan.
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers.get(&name.to_ascii_lowercase()).map(String::as_str)
+        if let Some(v) = self.headers.get(&name.to_ascii_lowercase()) {
+            return Some(v.as_str());
+        }
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -126,6 +139,24 @@ impl fmt::Display for FetchError {
 impl core::error::Error for FetchError {}
 
 /// Host-provided URL retrieval. Object-safe (usable as `&dyn Fetcher`).
+///
+/// # Implementor contract
+///
+/// - **Redirects MUST be followed, preserving the request headers.** This is
+///   load-bearing, not a nicety: doi.org content negotiation answers a DOI
+///   with a 3xx to the registration agency, and the `accept:
+///   application/vnd.citationstyles.csl+json` header has to survive the hop or
+///   the agency returns a landing page instead of CSL-JSON. [`Response`]
+///   cannot express "this is a redirect" ([`Response::is_success`] is 2xx
+///   only) and the sources treat any 3xx as a failure, so a fetcher built on
+///   an API that defaults to *not* following redirects (a browser `fetch()`
+///   with `redirect: "manual"`, say) must opt back in. The bundled
+///   `UreqFetcher` follows redirects and re-sends headers.
+/// - A **non-success status is not an error**: return
+///   `Ok(Response { status, .. })` and let the source decide.
+///   [`FetchError::Status`] is only for hosts that genuinely cannot produce a
+///   response body.
+/// - Response header names should be lowercased (see [`Response::headers`]).
 pub trait Fetcher {
     /// Perform one request and return the buffered response.
     fn fetch(&self, req: Request) -> BoxFuture<'_, core::result::Result<Response, FetchError>>;

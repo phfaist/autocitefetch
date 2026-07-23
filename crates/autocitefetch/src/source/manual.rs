@@ -3,7 +3,15 @@
 //! This is the escape hatch for citations that have no online source — the
 //! consumer passes the already-formatted text as the key and it is stored
 //! verbatim under the extension field `_formatted_text`, bypassing CSL
-//! rendering. Entries are ephemeral (TTL 0): they live only for the run.
+//! rendering.
+//!
+//! Entries carry **TTL 0**, so they are re-resolved on every run and never
+//! served from cache — which is free, since resolving is just copying the key.
+//! "TTL 0" is *not* "never written": with a persistent store the record is
+//! still written out and only pruning removes it, and pruning requires
+//! `now >= expires + grace` (14 days). So manual citation text does sit in a
+//! committed `citations.jsonl` for a fortnight after its last use. Nothing
+//! reads it in the meantime.
 
 use alloc::boxed::Box;
 use alloc::string::String;
