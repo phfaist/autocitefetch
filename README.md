@@ -23,7 +23,7 @@ crates/
         arxiv.rs          arXiv Atom API (xmlparser)   (implemented)
         doi.rs            doi.org content negotiation (implemented)
         manual.rs         key-is-the-text escape hatch (implemented)
-        bibfile.rs        CSL-JSON bibliography files (implemented, JSON)
+        bibfile.rs        bibliography files (pluggable parser; JSON default)
       cache.rs            TTL policy: soft/hard expiry, jitter, freshness
       driver.rs           per-source chunking + rate limiting
       fetch.rs            Fetcher trait + Request/Response
@@ -87,8 +87,14 @@ chained targets and fetches them; `get()` walks the chain on read.
 - **Careful arXiv version resolution** — groups returned entries by base id and
   prefers a versionless entry, else the highest version; explicitly-versioned
   requests stay concrete (fixes the Python reference, which silently drops them).
-- **arXiv DOI overrides** — inject/override a DOI per arXiv id, inline or from a
-  JSON file (`with_override_dois` / `with_override_dois_file`).
+- **arXiv DOI overrides** — supplied as *data* (`with_override_dois`): `Some(doi)`
+  injects/replaces, `None` *suppresses* (keep arXiv metadata, don't chain) — a
+  capability the references lack. A JSON file convenience is also provided; other
+  formats are parsed host-side and passed as data.
+- **Host-parses I/O for config** — the library takes overrides as data, and the
+  `bib` source's byte→CSL step is a pluggable parser (`with_parser`), so any
+  serde format (YAML, TOML, …) works without the `no_std` core depending on it.
+  `BibliographyFileSource::from_entries` skips loading entirely.
 
 ## Usage sketch (std)
 
@@ -124,7 +130,8 @@ and chains to DOI. 9 tests pass; the core builds for `wasm32-unknown-unknown`.
 
 - A dedicated **WASM backend crate** (browser `fetch()` + IndexedDB + `setTimeout`
   impls of the four traits). The core already compiles for wasm32.
-- **YAML** bibliography files (JSON works).
+- **YAML** files out of the box (JSON is the built-in; YAML/TOML/etc. work today
+  by passing a host parser via `with_parser`, or pre-parsed data).
 - An async-runtime `Fetcher`/`Timer` (the bundled std ones are blocking, fine for
   CLI/batch; on tokio, impl the traits with `reqwest` / `tokio::time::sleep`).
 

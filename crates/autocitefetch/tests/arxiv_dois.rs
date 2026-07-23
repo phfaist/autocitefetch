@@ -133,8 +133,13 @@ fn make_feed(entries: &[(&str, Option<&str>)]) -> String {
     s
 }
 
-fn kv(k: &str, v: &str) -> (String, String) {
-    (k.to_string(), v.to_string())
+fn kv(k: &str, v: &str) -> (String, Option<String>) {
+    (k.to_string(), Some(v.to_string()))
+}
+
+/// A suppressing override entry (`None` ⇒ no DOI, keep arXiv metadata).
+fn suppress(k: &str) -> (String, Option<String>) {
+    (k.to_string(), None)
 }
 
 // --- Task 1: DOI-override map ----------------------------------------------
@@ -368,4 +373,60 @@ fn explicit_version_selects_that_version_and_stays_concrete() {
     assert_eq!(item["title"], "Title 1801.00002v1");
     // The DOI is still recorded on the concrete entry (lowercased) but not chained.
     assert_eq!(item["doi"], "10.2222/should.not.chain");
+}
+
+// --- Task 1b: DOI suppression (None) ---------------------------------------
+
+#[test]
+fn override_none_suppresses_feed_doi() {
+    // The feed reports a DOI, but the inline override maps the id → None
+    // (suppress). No doi.org route is registered: if chaining happened it would
+    // 404 and fail. Success + a doi-less concrete entry proves suppression.
+    let arxiv_url = "https://export.arxiv.org/api/query?id_list=6001.00006&max_results=1";
+    let feed = make_feed(&[("6001.00006v1", Some("10.3333/feed.doi"))]);
+
+    let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
+
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(ArxivSource::new().with_override_dois([suppress("6001.00006")]))
+        .register(DoiSource::new());
+
+    let cites = vec![("arxiv".to_string(), "6001.00006".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(
+        report.is_complete(),
+        "suppressed DOI must not chain: {:?}",
+        report.failures
+    );
+
+    let item = block_on(mgr.get("arxiv", "6001.00006")).unwrap();
+    // Concrete arXiv metadata, NOT a chained DOI entry.
+    assert_eq!(item["id"], "arxiv:6001.00006");
+    assert_eq!(item["title"], "Title 6001.00006v1");
+    assert_eq!(item["arxiv_version_number"], 1);
+    assert!(item.get("doi").is_none(), "suppressed DOI should be absent");
+}
+
+#[test]
+fn override_file_null_suppresses_doi() {
+    // A JSON override-file value of `null` suppresses the feed's DOI.
+    let file_url = "https://host.example/arxiv-dois.json";
+    let arxiv_url = "https://export.arxiv.org/api/query?id_list=7001.00007&max_results=1";
+    let feed = make_feed(&[("7001.00007v1", Some("10.4444/feed.doi"))]);
+
+    let fetcher = MockFetcher::new()
+        .route(file_url, 200, r#"{"7001.00007":null}"#)
+        .route(arxiv_url, 200, &feed);
+
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(ArxivSource::new().with_override_dois_file(file_url))
+        .register(DoiSource::new());
+
+    let cites = vec![("arxiv".to_string(), "7001.00007".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    let item = block_on(mgr.get("arxiv", "7001.00007")).unwrap();
+    assert_eq!(item["title"], "Title 7001.00007v1");
+    assert!(item.get("doi").is_none(), "null in file suppresses the DOI");
 }

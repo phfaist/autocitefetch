@@ -10,7 +10,7 @@ pub mod doi;
 pub mod manual;
 
 pub use arxiv::ArxivSource;
-pub use bibfile::BibliographyFileSource;
+pub use bibfile::{BibParser, BibliographyFileSource};
 pub use doi::DoiSource;
 pub use manual::ManualSource;
 

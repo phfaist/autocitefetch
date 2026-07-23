@@ -14,11 +14,12 @@
 //!   corresponding requested key resolves to [`Outcome::Failed`].
 //! * Map to CSL-JSON (`type: "article-journal"`) with extension fields
 //!   `arxivid` and `arxiv_version_number`.
-//! * **DOI overrides.** A caller may inject/override the DOI for a given arXiv
-//!   id, either inline ([`ArxivSource::with_override_dois`]) or from a loadable
-//!   JSON file ([`ArxivSource::with_override_dois_file`]). When present, an
-//!   override DOI *wins* over the feed's `<arxiv:doi>` and drives chaining
-//!   exactly as a feed DOI would (matching the references' precedence).
+//! * **DOI overrides.** A caller may inject, replace, or *suppress* the DOI for
+//!   a given arXiv id — supplied as data ([`ArxivSource::with_override_dois`]:
+//!   `Some(doi)` to inject/replace, `None` to suppress) or via a convenience
+//!   JSON file ([`ArxivSource::with_override_dois_file`]). An override DOI *wins*
+//!   over the feed's `<arxiv:doi>` and drives chaining like a feed DOI; a
+//!   suppressing `None` keeps the arXiv metadata and skips chaining.
 //! * **Version resolution.** Feed entries are grouped by *base* arxivid (the id
 //!   without its `vN` suffix). A key requested *with* an explicit `vN` selects
 //!   that exact version and is emitted as [`Outcome::Concrete`] preserving the
@@ -56,8 +57,10 @@ const TTL_SECS: u64 = 10 * 24 * 60 * 60;
 pub struct ArxivSource {
     /// When true, resolved DOIs are chained to the `doi` source.
     pub chain_to_doi: bool,
-    /// Inline arxivid → DOI overrides. Takes precedence over file entries.
-    override_dois: HashMap<String, String>,
+    /// Inline arxivid → DOI overrides. `Some(doi)` injects/replaces the DOI;
+    /// `None` suppresses it (keep arXiv metadata, don't chain). Takes
+    /// precedence over file entries.
+    override_dois: HashMap<String, Option<String>>,
     /// Optional URL/path of a JSON override file (fetched once per chunk).
     override_dois_file: Option<String>,
 }
@@ -84,15 +87,19 @@ impl ArxivSource {
         self
     }
 
-    /// Attach/merge an inline arXiv-id → DOI override map. For any base arxivid
-    /// found in the map, the given DOI overrides whatever `<arxiv:doi>` the feed
-    /// reports (override wins) and drives chaining just like a feed DOI.
+    /// Attach/merge an inline arXiv-id → DOI override map, keyed by *base*
+    /// arxivid (no `vN` suffix). `Some(doi)` overrides whatever `<arxiv:doi>`
+    /// the feed reports (override wins) and drives chaining like a feed DOI;
+    /// `None` *suppresses* the DOI — the entry keeps its arXiv metadata and is
+    /// not chained, even if the feed reports a DOI. Ids absent from the map use
+    /// the feed's DOI as normal.
     ///
-    /// Accepts anything iterable into `(arxivid, doi)` pairs (a `HashMap`, a
-    /// `Vec`, an array, …). Later calls, and inline entries, win over any file.
+    /// Overrides are supplied as data: the host parses whatever config format
+    /// it likes and passes `(arxivid, Option<doi>)` pairs (from a `HashMap`,
+    /// `Vec`, array, …). Later calls, and inline entries, win over any file.
     pub fn with_override_dois(
         mut self,
-        map: impl IntoIterator<Item = (String, String)>,
+        map: impl IntoIterator<Item = (String, Option<String>)>,
     ) -> Self {
         for (k, v) in map {
             self.override_dois.insert(k, v);
@@ -100,13 +107,12 @@ impl ArxivSource {
         self
     }
 
-    /// Attach a URL/path to a DOI-override file. It is fetched through
-    /// `ctx.fetcher` and parsed as a JSON object `{ "<arxivid>": "<doi>", … }`.
-    ///
-    /// **JSON only:** unlike the JS/Python references (which also accept YAML),
-    /// the `no_std` core parses JSON exclusively — YAML is intentionally out of
-    /// scope here. Entries from the file are merged with any inline map; the
-    /// inline map takes precedence on conflicts. Builder-style.
+    /// Convenience: attach a URL/path to a **JSON** DOI-override file, fetched
+    /// through `ctx.fetcher` and parsed as an object `{ "<arxivid>": "<doi>" }`,
+    /// where a JSON `null` value means *suppress* (→ `None`). JSON is the one
+    /// built-in format (it is already a core dependency); for any other format,
+    /// parse it host-side and pass the data to [`Self::with_override_dois`].
+    /// File entries merge with the inline map; the inline map wins. Builder-style.
     pub fn with_override_dois_file(mut self, url: impl Into<String>) -> Self {
         self.override_dois_file = Some(url.into());
         self
@@ -136,7 +142,7 @@ impl Source for ArxivSource {
     ) -> BoxFuture<'a, Vec<Resolution>> {
         Box::pin(retrieve_impl(
             self.chain_to_doi,
-            Some(&self.override_dois),
+            &self.override_dois,
             self.override_dois_file.as_deref(),
             keys,
             ctx,
@@ -155,26 +161,24 @@ fn chains_to_slice(chain_to_doi: bool) -> &'static [&'static str] {
 /// The retrieval body. `inline`/`file` describe the (optional) DOI overrides.
 async fn retrieve_impl<'a>(
     chain_to_doi: bool,
-    inline: Option<&'a HashMap<String, String>>,
+    inline: &'a HashMap<String, Option<String>>,
     file: Option<&'a str>,
     keys: Vec<String>,
     ctx: &'a RetrieveCtx<'a>,
 ) -> Vec<Resolution> {
     // Resolve the effective override map. The file (if any) is loaded first,
-    // then the inline map is layered on top so the INLINE map wins on conflicts
-    // (matching the references' precedence). A failed file load degrades
-    // gracefully: it fails the whole chunk like any other fetch failure.
-    let mut overrides: HashMap<String, String> = HashMap::new();
+    // then the inline map is layered on top so the INLINE map wins on conflicts.
+    // A failed file load degrades gracefully: it fails the whole chunk like any
+    // other fetch failure.
+    let mut overrides: HashMap<String, Option<String>> = HashMap::new();
     if let Some(url) = file {
         match load_override_file(ctx, url).await {
             Ok(m) => overrides = m,
             Err(msg) => return fail_all(keys, msg),
         }
     }
-    if let Some(inl) = inline {
-        for (k, v) in inl {
-            overrides.insert(k.clone(), v.clone());
-        }
+    for (k, v) in inline {
+        overrides.insert(k.clone(), v.clone());
     }
 
     // Build the id_list query. Ids contain `/` and `.`, so each is
@@ -212,14 +216,15 @@ async fn retrieve_impl<'a>(
         .collect()
 }
 
-/// Fetch and parse the DOI-override file: a JSON object `{ "<arxivid>": "<doi>" }`.
-/// JSON only (YAML is intentionally out of scope for the `no_std` core). Any
+/// Fetch and parse the JSON DOI-override file: an object
+/// `{ "<arxivid>": "<doi>" | null }` where a string injects a DOI and `null`
+/// suppresses it. JSON only (for other formats, parse host-side). Any
 /// fetch/parse/shape error is returned as a message so the caller can fail the
 /// affected keys gracefully rather than panic.
 async fn load_override_file(
     ctx: &RetrieveCtx<'_>,
     url: &str,
-) -> Result<HashMap<String, String>, String> {
+) -> Result<HashMap<String, Option<String>>, String> {
     let resp = ctx
         .fetcher
         .fetch(Request::get(url.to_string()))
@@ -238,13 +243,16 @@ async fn load_override_file(
         .ok_or_else(|| "arXiv DOI-override file is not a JSON object".to_string())?;
     let mut map = HashMap::with_capacity(obj.len());
     for (k, v) in obj {
-        match v.as_str() {
-            Some(s) => {
-                map.insert(k.clone(), s.to_string());
+        match v {
+            CslValue::String(s) => {
+                map.insert(k.clone(), Some(s.clone()));
             }
-            None => {
+            CslValue::Null => {
+                map.insert(k.clone(), None);
+            }
+            _ => {
                 return Err(alloc::format!(
-                    "arXiv DOI-override entry `{k}` is not a string"
+                    "arXiv DOI-override entry `{k}` must be a string or null"
                 ));
             }
         }
@@ -263,24 +271,24 @@ fn fail_all(keys: Vec<String>, msg: String) -> Vec<Resolution> {
 /// override map.
 fn resolve_key(
     chain_to_doi: bool,
-    overrides: &HashMap<String, String>,
+    overrides: &HashMap<String, Option<String>>,
     key: String,
     entries: &[atom::Entry],
 ) -> Resolution {
     let (base, req_version) = split_version(&key);
 
-    // Effective DOI for this base id: an override (if any) wins over the feed.
-    let override_doi = overrides.get(base).map(String::as_str);
-
     // Explicit version requested: select that exact version, emit concrete
     // metadata preserving the version — never chain (a DOI would drop the
-    // version distinction). The override DOI still populates the `doi` field.
+    // version distinction). An override still applies to the `doi` field.
     if let Some(v) = req_version {
         return match entries
             .iter()
             .find(|e| e.arxivid == base && e.version == Some(v))
         {
-            Some(e) => Resolution::concrete(key, build_csl(e, override_doi.or(e.doi.as_deref()))),
+            Some(e) => {
+                let doi = effective_doi(overrides, base, e.doi.as_deref());
+                Resolution::concrete(key, build_csl(e, doi))
+            }
             None => Resolution::failed(
                 key.clone(),
                 Error::Source(alloc::format!("no arXiv entry returned for `{key}`")),
@@ -299,9 +307,10 @@ fn resolve_key(
         }
     };
 
-    let doi = override_doi.or(entry.doi.as_deref());
+    let doi = effective_doi(overrides, base, entry.doi.as_deref());
 
     // Chain to the DOI when we have one (after override) and chaining is on.
+    // A `None` override suppresses the DOI, so chaining is skipped.
     if chain_to_doi {
         if let Some(doi) = doi {
             let mut sp = serde_json::Map::new();
@@ -318,6 +327,21 @@ fn resolve_key(
     }
 
     Resolution::concrete(key, build_csl(entry, doi))
+}
+
+/// The effective DOI for a base arxivid: `Some(doi)` in the override map injects
+/// it, `None` in the map suppresses it, and an absent key falls back to the
+/// feed's DOI.
+fn effective_doi<'a>(
+    overrides: &'a HashMap<String, Option<String>>,
+    base: &str,
+    feed_doi: Option<&'a str>,
+) -> Option<&'a str> {
+    match overrides.get(base) {
+        Some(Some(doi)) => Some(doi.as_str()),
+        Some(None) => None,
+        None => feed_doi,
+    }
 }
 
 /// Choose the best entry for `base` among all returned entries: an entry that is
