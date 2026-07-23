@@ -13,6 +13,7 @@ use crate::driver::drive_source;
 use crate::env::{Clock, Timer};
 use crate::error::{Error, Result};
 use crate::fetch::Fetcher;
+use crate::retry::{RetryPolicy, RetryingFetcher};
 use crate::source::{Outcome, Resolution, RetrieveCtx, Source};
 use crate::store::{CacheStore, Payload};
 
@@ -53,6 +54,8 @@ pub struct CitationManager<F, S, C, T> {
     clock: C,
     timer: T,
     policy: TtlPolicy,
+    /// Backoff/retry policy for the transparent retrying fetcher wrapper.
+    retry_policy: RetryPolicy,
     /// Safety bound on chain length while resolving.
     max_chain_depth: usize,
 }
@@ -74,6 +77,7 @@ where
             clock,
             timer,
             policy: TtlPolicy::default(),
+            retry_policy: RetryPolicy::default(),
             max_chain_depth: 16,
         }
     }
@@ -91,12 +95,10 @@ where
         self
     }
 
-    fn ctx(&self) -> RetrieveCtx<'_> {
-        RetrieveCtx {
-            fetcher: &self.fetcher,
-            timer: &self.timer,
-            clock: &self.clock,
-        }
+    /// Override the retry/backoff policy applied to every fetch. Builder-style.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
     }
 
     /// Populate the cache for every `(prefix, key)` in `cites` that is missing
@@ -154,7 +156,20 @@ where
             // immutably (shared `ctx` + `self.sources`); the single-threaded
             // cooperative executor interleaves their awaits, so this is data-
             // race free even though the store is interior-mutable.
-            let ctx = self.ctx();
+            //
+            // Transparently interpose the retrying fetcher: `retrying` and
+            // `ctx` are locals that outlive the whole `buffer_unordered` pass,
+            // and every source future reaches the network through
+            // `ctx.fetcher` (= `&retrying`) — so retries happen without any
+            // source knowing. All of `retrying`, `ctx`, and the futures hold
+            // only shared borrows of `self`, so they coexist with the
+            // interior-mutable store just like the original shared `ctx` did.
+            let retrying = RetryingFetcher::new(&self.fetcher, &self.timer, self.retry_policy);
+            let ctx = RetrieveCtx {
+                fetcher: &retrying,
+                timer: &self.timer,
+                clock: &self.clock,
+            };
             let source_futures = buckets.into_iter().map(|(prefix, keys)| {
                 let ctx = &ctx;
                 async move {
