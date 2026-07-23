@@ -11,6 +11,13 @@ use alloc::string::String;
 pub type CslValue = serde_json::Value;
 
 /// Build the canonical citation id, `"prefix:key"`.
+///
+/// The prefix must not itself contain a `':'` or the id is ambiguous
+/// (`("a", "b:c")` and `("a:b", "c")` would both yield `"a:b:c"`, and
+/// [`CitationManager::get_by_id`](crate::manager::CitationManager::get_by_id)
+/// splits on the *first* colon). [`CitationManager::register`] enforces this.
+///
+/// [`CitationManager::register`]: crate::manager::CitationManager::register
 pub fn cite_id(prefix: &str, key: &str) -> String {
     let mut s = String::with_capacity(prefix.len() + 1 + key.len());
     s.push_str(prefix);
@@ -19,13 +26,19 @@ pub fn cite_id(prefix: &str, key: &str) -> String {
     s
 }
 
-/// Set the `id` field on a CSL object (creating the object shape if needed).
-pub fn set_id(item: &mut CslValue, id: &str) {
-    if !item.is_object() {
-        *item = CslValue::Object(serde_json::Map::new());
-    }
-    if let Some(obj) = item.as_object_mut() {
-        obj.insert("id".into(), CslValue::String(id.into()));
+/// Set the `id` field on a CSL object, returning whether it could be set.
+///
+/// A non-object value is left **untouched** (and `false` is returned): this
+/// used to replace the whole payload with a bare `{"id": …}`, silently
+/// destroying whatever a source had returned. Callers decide what a non-object
+/// payload means — the manager treats it as a source failure.
+pub fn set_id(item: &mut CslValue, id: &str) -> bool {
+    match item.as_object_mut() {
+        Some(obj) => {
+            obj.insert("id".into(), CslValue::String(id.into()));
+            true
+        }
+        None => false,
     }
 }
 
@@ -51,6 +64,10 @@ pub fn merge_defaults(target: &mut CslValue, overrides: &CslValue) {
         return;
     };
     for (k, v) in src {
-        dst.entry(k.clone()).or_insert_with(|| v.clone());
+        // `entry()` would clone the key on every iteration, including the
+        // common already-present case; only allocate when we actually insert.
+        if !dst.contains_key(k) {
+            dst.insert(k.clone(), v.clone());
+        }
     }
 }

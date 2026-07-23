@@ -36,12 +36,13 @@ pub mod retry;
 pub mod source;
 pub mod store;
 
+pub use crate::cache::{Freshness, TtlPolicy};
 pub use crate::csl::CslValue;
 pub use crate::env::{Clock, Timer, Timestamp};
 pub use crate::error::{Error, Result};
 pub use crate::fetch::{FetchError, Fetcher, Method, Request, Response};
 pub use crate::filecache::{CacheFs, CacheGuard, FileCacheStore, FsError};
-pub use crate::manager::CitationManager;
+pub use crate::manager::{CitationManager, CiteFailure, RetrieveReport};
 pub use crate::retry::{RetryPolicy, RetryingFetcher};
 pub use crate::source::{Outcome, Resolution, RetrieveCtx, Source};
 pub use crate::store::{CacheRecord, CacheStore, Payload, StoreError};
