@@ -34,9 +34,11 @@ crates/
       csl.rs              CSL-JSON helpers (id, merge, field lookup)
       error.rs            crate Error
     tests/                integration.rs, arxiv.rs, arxiv_dois.rs,
-                          bibfile_data.rs, concurrency.rs, retry.rs
+                          bibfile_data.rs, concurrency.rs, retry.rs,
+                          cache_policy.rs, manager_contract.rs
   autocitefetch-std/      std backends for non-WASM consumers
     src/
+      lib.rs              crate root, re-exports
       clock.rs            SystemClock
       timer.rs            BlockingTimer (thread::sleep)
       store.rs            StdCacheFs + SingleFileCacheStore (citations.jsonl)
@@ -74,15 +76,26 @@ chained targets and fetches them; `get()` walks the chain on read.
 * `citations.<writer>.log` — per-writer append logs. Writes go here lock-free
   and are folded into the main file by `flush()` (called at the end of
   `retrieve`/`prune`), which is the only operation that takes the lock or
-  rewrites the whole file.
+  rewrites the whole file. `flush()` folds *every* sidecar it finds but deletes
+  only **its own** — deleting a peer's would race its lock-free appends and
+  destroy acknowledged writes. Consequence: a sidecar left by a **crashed**
+  writer is never reaped. Delete stray `citations.*.log` files by hand while no
+  writer is running.
 * `citations.lock` — the compaction lockfile.
+* `citations.jsonl.tmp` — the staging file for the atomic replace.
 
 So commit the first and ignore the rest:
 
 ```gitignore
 citations.*.log
 citations.lock
+citations.jsonl.tmp
 ```
+
+The store *reads* every `citations.*.log` in this directory, so don't park
+unrelated files there under that name. A main file it cannot parse — a corrupt
+line, an unresolved merge conflict, or a `{"schema":N}` newer than this build —
+makes `open()` fail rather than silently dropping the entries it can't read.
 
 ## Design decisions
 
@@ -99,7 +112,14 @@ citations.lock
   outdated entries are still served when a source is unreachable.
 - **TTL jitter** (deterministic, seeded by entry id) — avoids a thundering herd
   when many entries expire together.
-- **Per-citation error tolerance** — failures are reported, not fatal.
+- **Per-citation error tolerance** — failures are reported, not fatal. The
+  manager also enforces the source contract: a key a source silently omits (or
+  answers twice) is reported rather than vanishing from both cache and report.
+- **Bounded chains** — `max_chain_depth` (default 16, configurable) bounds
+  `retrieve` as well as `get`, so a cyclic or runaway chain cannot fan out.
+- **Start→start rate limiting** — `min_interval` is measured request-start to
+  request-start and the timestamp is carried *across* retrieval passes, so the
+  arXiv→DOI chain's second pass cannot hit doi.org with zero spacing.
 - **Automatic retry/backoff** — a transparent `RetryingFetcher` retries
   transport errors and retryable statuses (429/5xx), honors `Retry-After`, and
   backs off with deterministic jitter — applied to every source, no source code
@@ -156,8 +176,9 @@ policy, the driver, transparent retry/backoff, the single-file JSONL cache, all
 four sources (`arxiv`, `doi`, `manual`, `bib`), concurrent within-pass source
 execution, and the `std` backends including a `ureq`-based HTTP `Fetcher` (with
 `file:` support). The arXiv source parses the Atom feed with `xmlparser` (a
-verified `no_std` crate), does version resolution, and chains to DOI. 30 tests
-pass; the core builds for `wasm32-unknown-unknown`.
+verified `no_std` crate), decodes XML entity references, does version resolution,
+and chains to DOI. 137 tests pass; the core builds for `wasm32-unknown-unknown`;
+clippy and rustdoc are warning-free.
 
 **Not yet implemented:**
 

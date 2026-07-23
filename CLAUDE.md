@@ -15,9 +15,10 @@ port of two prior libraries (see "Reference implementations" below).
 ## Commands
 
 ```sh
-cargo test                                   # all 30 tests (workspace)
+cargo test                                   # all 137 tests (workspace)
 cargo test -p autocitefetch --test arxiv_dois override_map_beats_feed_doi   # one integration test
 cargo test -p autocitefetch --lib filecache::tests::torn_tail_is_tolerated  # one unit test
+cargo doc -p autocitefetch-std --no-deps     # currently warning-free — keep it that way
 cargo clippy --workspace --all-targets       # currently clean — keep it that way
 cargo build -p autocitefetch --target wasm32-unknown-unknown  # MUST still pass after core changes
 cargo build -p autocitefetch-std --no-default-features        # std backends without ureq/TLS
@@ -55,8 +56,13 @@ holds only shared borrows while driving sources concurrently, so this is require
 A worklist loop, not a fixed pipeline:
 
 - Per pass: dedup against `seen`, look each id up in the store, classify freshness, and bucket the
-  misses/stale by prefix. A cached `Payload::Chained` entry always pushes its target onto the
-  worklist (even when fresh) so the target is guaranteed present.
+  misses/stale by prefix. A **fresh** cached `Payload::Chained` entry pushes its target onto the
+  worklist so the target is guaranteed present; a stale/expired one does *not* (it is about to be
+  refetched, and pre-pushing a superseded pointer would fetch — and report a failure for — a
+  citation nobody requested). When a refetch fails and the grace window keeps the old chained
+  record, the target is pushed from the failure path instead.
+- Worklist items carry a **depth**; `max_chain_depth` (default 16, `with_max_chain_depth`) bounds
+  `retrieve` as well as `get`, so retrieval never fetches links `get()` could not reach.
 - Buckets are driven concurrently with `buffer_unordered(MAX_CONCURRENT_SOURCES = 8)`; results are
   then applied to the store **serially** to keep writes/worklist/report updates simple.
 - New chained targets discovered during a pass feed the next pass; the loop runs until the worklist
@@ -89,7 +95,10 @@ together doesn't expire together.
 ### Sources (`source/`)
 
 Each `Source` declares `prefix`, `chunk_size`, `min_interval`, `default_ttl`, and implements
-`retrieve_chunk`. `driver.rs` does the chunking and sleeps `min_interval` *between* chunks.
+`retrieve_chunk`. `driver.rs` does the chunking and paces requests **start→start**: it sleeps
+`min_interval - elapsed_since_previous_request`, and the manager threads that per-prefix timestamp
+across passes, so the second pass of an arXiv→DOI chain cannot hit doi.org with 0 ms spacing.
+(Pacing state is per-`retrieve()` call; back-to-back `retrieve()`s on one manager still reset it.)
 
 | prefix | chunk / interval / TTL | notes |
 |---|---|---|
@@ -111,9 +120,17 @@ std crate supplies only real filesystem ops (`StdCacheFs`) and the `SingleFileCa
 Layout in one directory: `citations.jsonl` (header line 0 + one sorted entry per line — the only
 file worth committing), per-writer `citations.<pid>-<nanos>.log` append logs (lock-free writes), and
 `citations.lock`. `flush()` is the *only* operation that locks or rewrites the whole file: it folds
-main + all sidecars, atomically replaces the main file, and deletes the folded sidecars. Merge
-rules, all exercised by unit tests: max-`expires` wins on duplicate ids; a record beats a tombstone
-unless the id was never re-added; unparseable (torn) lines are silently skipped.
+main + all sidecars, atomically replaces the main file, and then deletes **only its own** sidecar.
+It must not delete a peer's: the lock serializes compaction against *compaction*, never against the
+lock-free `append`, so unlinking a peer's log destroys any write that landed after the fold read it
+(measured: ~300 of 400 acknowledged puts lost). The cost of that fix is that a **crashed** writer's
+sidecar is never reaped — reaping it needs a `CacheFs::try_lock_exclusive` that does not exist yet.
+
+Merge rules, all exercised by unit tests: max-`expires` wins on duplicate ids; a record beats a
+tombstone unless the id was never re-added. Torn-line tolerance applies to **sidecars only** — the
+main file is written via fsync+rename and so can never be legitimately torn, so an unparseable line
+or an unknown `{"schema":N}` header there is a hard `Err` rather than a silent skip (silently
+skipping then rewriting turned recoverable corruption into permanent loss).
 
 ## Invariants when editing
 

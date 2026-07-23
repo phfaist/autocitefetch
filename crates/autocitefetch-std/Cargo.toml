@@ -1,6 +1,6 @@
 [package]
 name = "autocitefetch-std"
-description = "std-backed backends (clock, timer, filesystem cache) for autocitefetch."
+description = "std backends for autocitefetch: blocking HTTP fetcher, clock, timer, single-file cache."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,14 +10,18 @@ repository.workspace = true
 [dependencies]
 autocitefetch = { workspace = true }
 serde_json = { workspace = true }
-# The single-file cache is a core feature of this crate, so these are not
-# optional: `tempfile` for durable atomic file replacement, `fs4` for the
-# advisory compaction lock.
-tempfile = "3"
+# The single-file cache is a core feature of this crate, so `fs4` (the advisory
+# compaction lock) is not optional. Note `atomic_replace` deliberately does *not*
+# use `tempfile` — it needs to carry the destination's permissions onto the temp
+# file, which `NamedTempFile`'s hard-coded 0600 would clobber.
 fs4 = "0.6"
 # Optional blocking HTTP backend. Gated behind the `http` feature so the crate
 # still builds with no network/TLS dependency (see `UreqFetcher`).
 ureq = { version = "2", optional = true }
+
+[dev-dependencies]
+# Test-only: scratch directories for the cache/fetcher/bib tests.
+tempfile = "3"
 
 [features]
 default = ["http"]

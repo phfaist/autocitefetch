@@ -27,7 +27,7 @@
 pub mod clock;
 #[cfg(feature = "http")]
 pub mod fetcher;
-mod store;
+pub mod store;
 pub mod timer;
 
 pub use clock::SystemClock;
