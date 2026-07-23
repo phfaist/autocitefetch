@@ -10,3 +10,15 @@ repository.workspace = true
 [dependencies]
 autocitefetch = { workspace = true }
 serde_json = { workspace = true }
+# Optional blocking HTTP backend. Gated behind the `http` feature so the crate
+# still builds with no network/TLS dependency (see `UreqFetcher`).
+ureq = { version = "2", optional = true }
+
+[features]
+default = ["http"]
+# A blocking HTTP `Fetcher` (`UreqFetcher`) backed by `ureq`.
+http = ["dep:ureq"]
+
+[[example]]
+name = "resolve"
+required-features = ["http"]

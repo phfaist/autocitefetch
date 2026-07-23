@@ -2,10 +2,14 @@
 //! targeting a browser/WASM: a system [`Clock`], a blocking [`Timer`], and a
 //! filesystem [`CacheStore`].
 //!
-//! A network [`Fetcher`](autocitefetch::Fetcher) is intentionally left out of
-//! the default build so this crate compiles with no HTTP dependency; wire one
-//! up with `reqwest`/`ureq` in your binary (see `examples/`).
+//! A blocking network [`Fetcher`](autocitefetch::Fetcher), [`UreqFetcher`], is
+//! provided behind the default-on `http` feature (backed by `ureq`). Disable
+//! default features to build with no HTTP/TLS dependency (the fetcher is then
+//! simply absent) and supply your own — e.g. `reqwest` on an async runtime, or
+//! a browser `fetch()` on WASM.
 
+#[cfg(feature = "http")]
+mod fetcher;
 mod clock;
 mod store;
 mod timer;
@@ -13,3 +17,6 @@ mod timer;
 pub use clock::SystemClock;
 pub use store::DirCacheStore;
 pub use timer::BlockingTimer;
+
+#[cfg(feature = "http")]
+pub use fetcher::{UreqFetcher, DEFAULT_USER_AGENT};
