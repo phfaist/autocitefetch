@@ -181,7 +181,7 @@ fn arxiv_concrete_parses_title_authors_and_issued() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, FEED_CONCRETE);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource { chain_to_doi: false })
+        .register(ArxivSource::new().chaining(false))
         .register(DoiSource::new());
 
     let cites = vec![("arxiv".to_string(), "0905.2794".to_string())];

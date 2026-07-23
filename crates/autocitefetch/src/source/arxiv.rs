@@ -50,20 +50,25 @@ const TTL_SECS: u64 = 10 * 24 * 60 * 60;
 
 /// The arXiv Atom API source.
 ///
-/// `ArxivSource` itself carries only the `chain_to_doi` switch. To attach a
-/// DOI-override map or file, call [`ArxivSource::with_override_dois`] /
-/// [`ArxivSource::with_override_dois_file`], which return an
-/// [`ArxivSourceWithOverrides`] (also a [`Source`]). This split keeps the plain
-/// `ArxivSource { chain_to_doi }` shape stable while still supporting per-id DOI
-/// overrides.
+/// Carries the `chain_to_doi` switch plus an optional per-id DOI-override map
+/// and/or file. Configure with the fluent builders, e.g.
+/// `ArxivSource::new().chaining(false).with_override_dois(map)`.
 pub struct ArxivSource {
     /// When true, resolved DOIs are chained to the `doi` source.
     pub chain_to_doi: bool,
+    /// Inline arxivid → DOI overrides. Takes precedence over file entries.
+    override_dois: HashMap<String, String>,
+    /// Optional URL/path of a JSON override file (fetched once per chunk).
+    override_dois_file: Option<String>,
 }
 
 impl Default for ArxivSource {
     fn default() -> Self {
-        ArxivSource { chain_to_doi: true }
+        ArxivSource {
+            chain_to_doi: true,
+            override_dois: HashMap::new(),
+            override_dois_file: None,
+        }
     }
 }
 
@@ -72,57 +77,19 @@ impl ArxivSource {
         Self::default()
     }
 
-    /// Attach an inline arXiv-id → DOI override map. For any base arxivid found
-    /// in the map, the given DOI overrides whatever `<arxiv:doi>` the feed
+    /// Set whether resolved DOIs are chained to the `doi` source (default
+    /// `true`). Builder-style.
+    pub fn chaining(mut self, yes: bool) -> Self {
+        self.chain_to_doi = yes;
+        self
+    }
+
+    /// Attach/merge an inline arXiv-id → DOI override map. For any base arxivid
+    /// found in the map, the given DOI overrides whatever `<arxiv:doi>` the feed
     /// reports (override wins) and drives chaining just like a feed DOI.
     ///
     /// Accepts anything iterable into `(arxivid, doi)` pairs (a `HashMap`, a
-    /// `Vec`, an array, …). Returns the configured source.
-    pub fn with_override_dois(
-        self,
-        map: impl IntoIterator<Item = (String, String)>,
-    ) -> ArxivSourceWithOverrides {
-        ArxivSourceWithOverrides::from(self).with_override_dois(map)
-    }
-
-    /// Attach a URL/path to a DOI-override file. It is fetched through
-    /// `ctx.fetcher` and parsed as a JSON object `{ "<arxivid>": "<doi>", … }`.
-    ///
-    /// **JSON only:** unlike the JS/Python references (which also accept YAML),
-    /// the `no_std` core parses JSON exclusively — YAML is intentionally out of
-    /// scope here. Entries from the file are merged with any inline map; the
-    /// inline map takes precedence on conflicts. Returns the configured source.
-    pub fn with_override_dois_file(self, url: impl Into<String>) -> ArxivSourceWithOverrides {
-        ArxivSourceWithOverrides::from(self).with_override_dois_file(url)
-    }
-}
-
-/// An [`ArxivSource`] configured with a DOI-override map and/or file.
-///
-/// Built via [`ArxivSource::with_override_dois`] /
-/// [`ArxivSource::with_override_dois_file`]; both builder methods are also
-/// available here so they can be chained.
-pub struct ArxivSourceWithOverrides {
-    chain_to_doi: bool,
-    /// Inline arxivid → DOI overrides. Takes precedence over file entries.
-    override_dois: HashMap<String, String>,
-    /// Optional URL/path of a JSON override file (fetched once per chunk).
-    override_dois_file: Option<String>,
-}
-
-impl From<ArxivSource> for ArxivSourceWithOverrides {
-    fn from(s: ArxivSource) -> Self {
-        ArxivSourceWithOverrides {
-            chain_to_doi: s.chain_to_doi,
-            override_dois: HashMap::new(),
-            override_dois_file: None,
-        }
-    }
-}
-
-impl ArxivSourceWithOverrides {
-    /// Merge more inline arxivid → DOI overrides in (later calls win over
-    /// earlier ones, and all inline entries win over the file).
+    /// `Vec`, an array, …). Later calls, and inline entries, win over any file.
     pub fn with_override_dois(
         mut self,
         map: impl IntoIterator<Item = (String, String)>,
@@ -133,8 +100,13 @@ impl ArxivSourceWithOverrides {
         self
     }
 
-    /// Set the JSON DOI-override file URL/path. See
-    /// [`ArxivSource::with_override_dois_file`] for the format and precedence.
+    /// Attach a URL/path to a DOI-override file. It is fetched through
+    /// `ctx.fetcher` and parsed as a JSON object `{ "<arxivid>": "<doi>", … }`.
+    ///
+    /// **JSON only:** unlike the JS/Python references (which also accept YAML),
+    /// the `no_std` core parses JSON exclusively — YAML is intentionally out of
+    /// scope here. Entries from the file are merged with any inline map; the
+    /// inline map takes precedence on conflicts. Builder-style.
     pub fn with_override_dois_file(mut self, url: impl Into<String>) -> Self {
         self.override_dois_file = Some(url.into());
         self
@@ -142,31 +114,6 @@ impl ArxivSourceWithOverrides {
 }
 
 impl Source for ArxivSource {
-    fn prefix(&self) -> &str {
-        PREFIX
-    }
-    fn chunk_size(&self) -> usize {
-        CHUNK_SIZE
-    }
-    fn min_interval(&self) -> Duration {
-        Duration::from_millis(MIN_INTERVAL_MS)
-    }
-    fn default_ttl(&self) -> Duration {
-        Duration::from_secs(TTL_SECS)
-    }
-    fn chains_to(&self) -> &[&'static str] {
-        chains_to_slice(self.chain_to_doi)
-    }
-    fn retrieve_chunk<'a>(
-        &'a self,
-        keys: Vec<String>,
-        ctx: &'a RetrieveCtx<'a>,
-    ) -> BoxFuture<'a, Vec<Resolution>> {
-        Box::pin(retrieve_impl(self.chain_to_doi, None, None, keys, ctx))
-    }
-}
-
-impl Source for ArxivSourceWithOverrides {
     fn prefix(&self) -> &str {
         PREFIX
     }
@@ -205,8 +152,7 @@ fn chains_to_slice(chain_to_doi: bool) -> &'static [&'static str] {
     }
 }
 
-/// The shared retrieval body for both source types. `inline`/`file` describe the
-/// (optional) DOI overrides; `ArxivSource` passes `None, None`.
+/// The retrieval body. `inline`/`file` describe the (optional) DOI overrides.
 async fn retrieve_impl<'a>(
     chain_to_doi: bool,
     inline: Option<&'a HashMap<String, String>>,
