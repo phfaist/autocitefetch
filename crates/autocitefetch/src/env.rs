@@ -32,13 +32,23 @@ impl Timestamp {
 
     /// `self + dur`, saturating instead of overflowing.
     pub fn saturating_add(self, dur: Duration) -> Timestamp {
-        Timestamp(self.0.saturating_add(dur.as_millis() as i64))
+        Timestamp(self.0.saturating_add(millis_i64(dur)))
     }
 
     /// `self - dur`, saturating instead of overflowing.
     pub fn saturating_sub(self, dur: Duration) -> Timestamp {
-        Timestamp(self.0.saturating_sub(dur.as_millis() as i64))
+        Timestamp(self.0.saturating_sub(millis_i64(dur)))
     }
+}
+
+/// A [`Duration`] as whole milliseconds, saturating at [`i64::MAX`].
+///
+/// `Duration::as_millis()` is a `u128`, and a plain `as i64` cast *truncates*
+/// (`Duration::MAX` → `-1`) — which silently turns "saturating" arithmetic into
+/// wrapping arithmetic and, worse, turns a huge TTL/grace into a negative one.
+/// Every conversion in the crate must go through this.
+pub(crate) fn millis_i64(dur: Duration) -> i64 {
+    i64::try_from(dur.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// Source of wall-clock time. The host provides one (`std`: `SystemTime`;
