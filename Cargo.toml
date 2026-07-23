@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/autocitefetch", "crates/autocitefetch-std"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+repository = "https://github.com/phfaist/autocitefetch"
+
+[workspace.dependencies]
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
+
+autocitefetch = { path = "crates/autocitefetch", version = "0.1.0" }
