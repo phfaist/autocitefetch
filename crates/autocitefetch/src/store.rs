@@ -36,8 +36,12 @@ pub enum Payload {
 ///
 /// * `stale_after` — soft expiry. Past this we *prefer* to revalidate, but the
 ///   entry is still usable.
-/// * `expires` — hard expiry. Past this the entry is dropped (unless it is
-///   being kept alive within a grace window because the source is down).
+/// * `expires` — hard expiry. Past this the entry is refetched on the next
+///   `retrieve`, and [`prune`](crate::manager::CitationManager::prune) may drop
+///   it — but only once it is also past the policy's grace window, which is
+///   what keeps a stale copy around while its source is unreachable. Reads
+///   ([`get`](crate::manager::CitationManager::get)) are not gated on either
+///   timestamp: whatever is in the store is served.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CacheRecord {
     pub payload: Payload,
