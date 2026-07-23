@@ -14,10 +14,18 @@
 //!   corresponding requested key resolves to [`Outcome::Failed`].
 //! * Map to CSL-JSON (`type: "article-journal"`) with extension fields
 //!   `arxivid` and `arxiv_version_number`.
-//! * Version resolution: a key requested *with* an explicit `vN` is emitted as
-//!   [`Outcome::Concrete`] preserving that exact version (never chained). A
-//!   *versionless* key resolves to arXiv's returned (latest) entry; if it
-//!   carries a DOI and `chain_to_doi` is set, it is emitted as
+//! * **DOI overrides.** A caller may inject/override the DOI for a given arXiv
+//!   id, either inline ([`ArxivSource::with_override_dois`]) or from a loadable
+//!   JSON file ([`ArxivSource::with_override_dois_file`]). When present, an
+//!   override DOI *wins* over the feed's `<arxiv:doi>` and drives chaining
+//!   exactly as a feed DOI would (matching the references' precedence).
+//! * **Version resolution.** Feed entries are grouped by *base* arxivid (the id
+//!   without its `vN` suffix). A key requested *with* an explicit `vN` selects
+//!   that exact version and is emitted as [`Outcome::Concrete`] preserving the
+//!   version — it is never chained. A *versionless* key selects the *best*
+//!   returned entry for its base id — an entry that is itself versionless wins,
+//!   otherwise the one with the highest version number — and, if that entry has
+//!   a DOI (after override) and chaining is enabled, is emitted as
 //!   [`Outcome::Chained`] to the `doi` source with `set_properties = { arxivid }`,
 //!   otherwise as concrete arXiv metadata.
 
@@ -26,13 +34,28 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use hashbrown::HashMap;
+
 use crate::csl::CslValue;
 use crate::error::Error;
 use crate::fetch::Request;
 use crate::source::{Outcome, Resolution, RetrieveCtx, Source};
 use crate::BoxFuture;
 
-/// See module docs.
+const PREFIX: &str = "arxiv";
+const CHUNK_SIZE: usize = 100;
+// arXiv asks for no more than one request every ~3 seconds.
+const MIN_INTERVAL_MS: u64 = 3100;
+const TTL_SECS: u64 = 10 * 24 * 60 * 60;
+
+/// The arXiv Atom API source.
+///
+/// `ArxivSource` itself carries only the `chain_to_doi` switch. To attach a
+/// DOI-override map or file, call [`ArxivSource::with_override_dois`] /
+/// [`ArxivSource::with_override_dois_file`], which return an
+/// [`ArxivSourceWithOverrides`] (also a [`Source`]). This split keeps the plain
+/// `ArxivSource { chain_to_doi }` shape stable while still supporting per-id DOI
+/// overrides.
 pub struct ArxivSource {
     /// When true, resolved DOIs are chained to the `doi` source.
     pub chain_to_doi: bool,
@@ -48,75 +71,239 @@ impl ArxivSource {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Attach an inline arXiv-id → DOI override map. For any base arxivid found
+    /// in the map, the given DOI overrides whatever `<arxiv:doi>` the feed
+    /// reports (override wins) and drives chaining just like a feed DOI.
+    ///
+    /// Accepts anything iterable into `(arxivid, doi)` pairs (a `HashMap`, a
+    /// `Vec`, an array, …). Returns the configured source.
+    pub fn with_override_dois(
+        self,
+        map: impl IntoIterator<Item = (String, String)>,
+    ) -> ArxivSourceWithOverrides {
+        ArxivSourceWithOverrides::from(self).with_override_dois(map)
+    }
+
+    /// Attach a URL/path to a DOI-override file. It is fetched through
+    /// `ctx.fetcher` and parsed as a JSON object `{ "<arxivid>": "<doi>", … }`.
+    ///
+    /// **JSON only:** unlike the JS/Python references (which also accept YAML),
+    /// the `no_std` core parses JSON exclusively — YAML is intentionally out of
+    /// scope here. Entries from the file are merged with any inline map; the
+    /// inline map takes precedence on conflicts. Returns the configured source.
+    pub fn with_override_dois_file(self, url: impl Into<String>) -> ArxivSourceWithOverrides {
+        ArxivSourceWithOverrides::from(self).with_override_dois_file(url)
+    }
+}
+
+/// An [`ArxivSource`] configured with a DOI-override map and/or file.
+///
+/// Built via [`ArxivSource::with_override_dois`] /
+/// [`ArxivSource::with_override_dois_file`]; both builder methods are also
+/// available here so they can be chained.
+pub struct ArxivSourceWithOverrides {
+    chain_to_doi: bool,
+    /// Inline arxivid → DOI overrides. Takes precedence over file entries.
+    override_dois: HashMap<String, String>,
+    /// Optional URL/path of a JSON override file (fetched once per chunk).
+    override_dois_file: Option<String>,
+}
+
+impl From<ArxivSource> for ArxivSourceWithOverrides {
+    fn from(s: ArxivSource) -> Self {
+        ArxivSourceWithOverrides {
+            chain_to_doi: s.chain_to_doi,
+            override_dois: HashMap::new(),
+            override_dois_file: None,
+        }
+    }
+}
+
+impl ArxivSourceWithOverrides {
+    /// Merge more inline arxivid → DOI overrides in (later calls win over
+    /// earlier ones, and all inline entries win over the file).
+    pub fn with_override_dois(
+        mut self,
+        map: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        for (k, v) in map {
+            self.override_dois.insert(k, v);
+        }
+        self
+    }
+
+    /// Set the JSON DOI-override file URL/path. See
+    /// [`ArxivSource::with_override_dois_file`] for the format and precedence.
+    pub fn with_override_dois_file(mut self, url: impl Into<String>) -> Self {
+        self.override_dois_file = Some(url.into());
+        self
+    }
 }
 
 impl Source for ArxivSource {
     fn prefix(&self) -> &str {
-        "arxiv"
+        PREFIX
     }
-
     fn chunk_size(&self) -> usize {
-        100
+        CHUNK_SIZE
     }
-
     fn min_interval(&self) -> Duration {
-        // arXiv asks for no more than one request every ~3 seconds.
-        Duration::from_millis(3100)
+        Duration::from_millis(MIN_INTERVAL_MS)
     }
-
     fn default_ttl(&self) -> Duration {
-        Duration::from_secs(10 * 24 * 60 * 60)
+        Duration::from_secs(TTL_SECS)
     }
-
     fn chains_to(&self) -> &[&'static str] {
-        if self.chain_to_doi {
-            &["doi"]
-        } else {
-            &[]
-        }
+        chains_to_slice(self.chain_to_doi)
     }
-
     fn retrieve_chunk<'a>(
         &'a self,
         keys: Vec<String>,
         ctx: &'a RetrieveCtx<'a>,
     ) -> BoxFuture<'a, Vec<Resolution>> {
-        Box::pin(async move {
-            // Build the id_list query. Ids contain `/` and `.`, so each is
-            // percent-encoded; they are joined with a literal comma.
-            let mut url = String::from("https://export.arxiv.org/api/query?id_list=");
-            for (i, k) in keys.iter().enumerate() {
-                if i > 0 {
-                    url.push(',');
-                }
-                encode_query_into(&mut url, k);
-            }
-            url.push_str("&max_results=");
-            url.push_str(&alloc::format!("{}", keys.len()));
-
-            let resp = match ctx.fetcher.fetch(Request::get(url)).await {
-                Ok(r) if r.is_success() => r,
-                Ok(r) => {
-                    return fail_all(keys, alloc::format!("arXiv API returned status {}", r.status));
-                }
-                Err(e) => return fail_all(keys, alloc::format!("arXiv fetch failed: {e}")),
-            };
-
-            let text = match resp.text() {
-                Ok(t) => t,
-                Err(_) => return fail_all(keys, "arXiv response is not UTF-8".to_string()),
-            };
-
-            let entries = match atom::parse_feed(text) {
-                Ok(e) => e,
-                Err(msg) => return fail_all(keys, msg),
-            };
-
-            keys.into_iter()
-                .map(|key| resolve_key(self.chain_to_doi, key, &entries))
-                .collect()
-        })
+        Box::pin(retrieve_impl(self.chain_to_doi, None, None, keys, ctx))
     }
+}
+
+impl Source for ArxivSourceWithOverrides {
+    fn prefix(&self) -> &str {
+        PREFIX
+    }
+    fn chunk_size(&self) -> usize {
+        CHUNK_SIZE
+    }
+    fn min_interval(&self) -> Duration {
+        Duration::from_millis(MIN_INTERVAL_MS)
+    }
+    fn default_ttl(&self) -> Duration {
+        Duration::from_secs(TTL_SECS)
+    }
+    fn chains_to(&self) -> &[&'static str] {
+        chains_to_slice(self.chain_to_doi)
+    }
+    fn retrieve_chunk<'a>(
+        &'a self,
+        keys: Vec<String>,
+        ctx: &'a RetrieveCtx<'a>,
+    ) -> BoxFuture<'a, Vec<Resolution>> {
+        Box::pin(retrieve_impl(
+            self.chain_to_doi,
+            Some(&self.override_dois),
+            self.override_dois_file.as_deref(),
+            keys,
+            ctx,
+        ))
+    }
+}
+
+fn chains_to_slice(chain_to_doi: bool) -> &'static [&'static str] {
+    if chain_to_doi {
+        &["doi"]
+    } else {
+        &[]
+    }
+}
+
+/// The shared retrieval body for both source types. `inline`/`file` describe the
+/// (optional) DOI overrides; `ArxivSource` passes `None, None`.
+async fn retrieve_impl<'a>(
+    chain_to_doi: bool,
+    inline: Option<&'a HashMap<String, String>>,
+    file: Option<&'a str>,
+    keys: Vec<String>,
+    ctx: &'a RetrieveCtx<'a>,
+) -> Vec<Resolution> {
+    // Resolve the effective override map. The file (if any) is loaded first,
+    // then the inline map is layered on top so the INLINE map wins on conflicts
+    // (matching the references' precedence). A failed file load degrades
+    // gracefully: it fails the whole chunk like any other fetch failure.
+    let mut overrides: HashMap<String, String> = HashMap::new();
+    if let Some(url) = file {
+        match load_override_file(ctx, url).await {
+            Ok(m) => overrides = m,
+            Err(msg) => return fail_all(keys, msg),
+        }
+    }
+    if let Some(inl) = inline {
+        for (k, v) in inl {
+            overrides.insert(k.clone(), v.clone());
+        }
+    }
+
+    // Build the id_list query. Ids contain `/` and `.`, so each is
+    // percent-encoded; they are joined with a literal comma.
+    let mut url = String::from("https://export.arxiv.org/api/query?id_list=");
+    for (i, k) in keys.iter().enumerate() {
+        if i > 0 {
+            url.push(',');
+        }
+        encode_query_into(&mut url, k);
+    }
+    url.push_str("&max_results=");
+    url.push_str(&alloc::format!("{}", keys.len()));
+
+    let resp = match ctx.fetcher.fetch(Request::get(url)).await {
+        Ok(r) if r.is_success() => r,
+        Ok(r) => {
+            return fail_all(keys, alloc::format!("arXiv API returned status {}", r.status));
+        }
+        Err(e) => return fail_all(keys, alloc::format!("arXiv fetch failed: {e}")),
+    };
+
+    let text = match resp.text() {
+        Ok(t) => t,
+        Err(_) => return fail_all(keys, "arXiv response is not UTF-8".to_string()),
+    };
+
+    let entries = match atom::parse_feed(text) {
+        Ok(e) => e,
+        Err(msg) => return fail_all(keys, msg),
+    };
+
+    keys.into_iter()
+        .map(|key| resolve_key(chain_to_doi, &overrides, key, &entries))
+        .collect()
+}
+
+/// Fetch and parse the DOI-override file: a JSON object `{ "<arxivid>": "<doi>" }`.
+/// JSON only (YAML is intentionally out of scope for the `no_std` core). Any
+/// fetch/parse/shape error is returned as a message so the caller can fail the
+/// affected keys gracefully rather than panic.
+async fn load_override_file(
+    ctx: &RetrieveCtx<'_>,
+    url: &str,
+) -> Result<HashMap<String, String>, String> {
+    let resp = ctx
+        .fetcher
+        .fetch(Request::get(url.to_string()))
+        .await
+        .map_err(|e| alloc::format!("arXiv DOI-override file fetch failed: {e}"))?;
+    if !resp.is_success() {
+        return Err(alloc::format!(
+            "arXiv DOI-override file returned status {}",
+            resp.status
+        ));
+    }
+    let value: CslValue = serde_json::from_slice(&resp.body)
+        .map_err(|e| alloc::format!("arXiv DOI-override file is not valid JSON: {e}"))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "arXiv DOI-override file is not a JSON object".to_string())?;
+    let mut map = HashMap::with_capacity(obj.len());
+    for (k, v) in obj {
+        match v.as_str() {
+            Some(s) => {
+                map.insert(k.clone(), s.to_string());
+            }
+            None => {
+                return Err(alloc::format!(
+                    "arXiv DOI-override entry `{k}` is not a string"
+                ));
+            }
+        }
+    }
+    Ok(map)
 }
 
 /// Every key in the chunk failed identically (whole-request failure).
@@ -126,16 +313,37 @@ fn fail_all(keys: Vec<String>, msg: String) -> Vec<Resolution> {
         .collect()
 }
 
-/// Resolve one requested key against the parsed feed entries.
-fn resolve_key(chain_to_doi: bool, key: String, entries: &[atom::Entry]) -> Resolution {
+/// Resolve one requested key against the parsed feed entries and the effective
+/// override map.
+fn resolve_key(
+    chain_to_doi: bool,
+    overrides: &HashMap<String, String>,
+    key: String,
+    entries: &[atom::Entry],
+) -> Resolution {
     let (base, req_version) = split_version(&key);
 
-    // Match by base arxivid; honour an explicit requested version if present.
-    let entry = entries.iter().find(|e| {
-        e.arxivid == base && (req_version.is_none() || e.version == req_version)
-    });
+    // Effective DOI for this base id: an override (if any) wins over the feed.
+    let override_doi = overrides.get(base).map(String::as_str);
 
-    let entry = match entry {
+    // Explicit version requested: select that exact version, emit concrete
+    // metadata preserving the version — never chain (a DOI would drop the
+    // version distinction). The override DOI still populates the `doi` field.
+    if let Some(v) = req_version {
+        return match entries
+            .iter()
+            .find(|e| e.arxivid == base && e.version == Some(v))
+        {
+            Some(e) => Resolution::concrete(key, build_csl(e, override_doi.or(e.doi.as_deref()))),
+            None => Resolution::failed(
+                key.clone(),
+                Error::Source(alloc::format!("no arXiv entry returned for `{key}`")),
+            ),
+        };
+    }
+
+    // Versionless: select the BEST entry among all returned for this base id.
+    let entry = match select_best(entries, base) {
         Some(e) => e,
         None => {
             return Resolution::failed(
@@ -145,15 +353,11 @@ fn resolve_key(chain_to_doi: bool, key: String, entries: &[atom::Entry]) -> Reso
         }
     };
 
-    // Explicit version requested: emit concrete metadata, preserving the exact
-    // version — never chain (a DOI would drop the version distinction).
-    if req_version.is_some() {
-        return Resolution::concrete(key, build_csl(entry));
-    }
+    let doi = override_doi.or(entry.doi.as_deref());
 
-    // Versionless: chain to the DOI when we have one and chaining is enabled.
+    // Chain to the DOI when we have one (after override) and chaining is on.
     if chain_to_doi {
-        if let Some(doi) = &entry.doi {
+        if let Some(doi) = doi {
             let mut sp = serde_json::Map::new();
             sp.insert("arxivid".into(), CslValue::String(key.clone()));
             return Resolution {
@@ -167,11 +371,33 @@ fn resolve_key(chain_to_doi: bool, key: String, entries: &[atom::Entry]) -> Reso
         }
     }
 
-    Resolution::concrete(key, build_csl(entry))
+    Resolution::concrete(key, build_csl(entry, doi))
 }
 
-/// Map a parsed arXiv entry to a CSL-JSON object (built by hand).
-fn build_csl(e: &atom::Entry) -> CslValue {
+/// Choose the best entry for `base` among all returned entries: an entry that is
+/// itself versionless (`version == None`) wins outright; otherwise the entry
+/// with the highest version number. Mirrors the JS/Python `source_finalize_run`
+/// reduction (which is more careful than the old first-match `.find(...)`).
+fn select_best<'e>(entries: &'e [atom::Entry], base: &str) -> Option<&'e atom::Entry> {
+    let mut best: Option<&atom::Entry> = None;
+    for e in entries.iter().filter(|e| e.arxivid == base) {
+        best = Some(match best {
+            None => e,
+            // A versionless best is the answer to a versionless query — keep it.
+            Some(b) if b.version.is_none() => b,
+            // This entry is versionless — prefer it.
+            Some(_) if e.version.is_none() => e,
+            // Both versioned: take the higher (ties take the later-seen).
+            Some(b) if e.version >= b.version => e,
+            Some(b) => b,
+        });
+    }
+    best
+}
+
+/// Map a parsed arXiv entry to a CSL-JSON object (built by hand). `doi` is the
+/// *effective* DOI (override-or-feed); when `Some`, it is written lowercased.
+fn build_csl(e: &atom::Entry, doi: Option<&str>) -> CslValue {
     let mut obj = serde_json::Map::new();
     obj.insert("type".into(), CslValue::String("article-journal".to_string()));
 
@@ -189,7 +415,7 @@ fn build_csl(e: &atom::Entry) -> CslValue {
         obj.insert("issued".into(), issued);
     }
 
-    if let Some(doi) = &e.doi {
+    if let Some(doi) = doi {
         obj.insert("doi".into(), CslValue::String(doi.to_ascii_lowercase()));
     }
 
