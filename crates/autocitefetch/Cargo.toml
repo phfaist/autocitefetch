@@ -12,6 +12,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 hashbrown = { workspace = true }
 futures-util = { workspace = true }
+xmlparser = { workspace = true }
 
 [features]
 default = []
