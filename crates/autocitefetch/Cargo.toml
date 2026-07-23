@@ -17,5 +17,9 @@ xmlparser = { workspace = true }
 [features]
 default = []
 
-[dev-dependencies]
-serde_json = "1"
+# No `[dev-dependencies]` on purpose. `serde_json = "1"` here would use default
+# features, pulling in `serde_json/std`; under resolver v2 that unifies with the
+# normal dependency for the test build, so `cargo test -p autocitefetch` would
+# compile this `#![no_std]` crate against a std-enabled serde_json — the exact
+# configuration it promises never to use. It is redundant anyway: the normal
+# dependency is already linkable from `tests/` and `examples/`.

@@ -10,7 +10,12 @@
 //! ```
 //!
 //! The `doi` citation needs network; `manual` and `bib` resolve fully offline
-//! (the `bib` entry is read from a temp `file:` URL through the fetcher).
+//! (the `bib` entry is read from a temp file through the fetcher).
+//!
+//! **Offline, this looks hung.** The `doi` fetch fails as a transport error,
+//! which is retryable, so the blocking backends spend ~16–19 s of
+//! `thread::sleep` exhausting the 5 retries — with no output — before the
+//! failure is reported and the two offline citations print.
 
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
@@ -24,23 +29,26 @@ use autocitefetch_std::{BlockingTimer, SingleFileCacheStore, SystemClock, UreqFe
 /// resolves its future on the first poll, so a no-op waker suffices — no async
 /// runtime is pulled in. On a real async runtime, use that runtime's `block_on`
 /// and async `Fetcher`/`Timer` instead.
+///
+/// The poll budget matters: with a `Waker::noop()` there is nothing to wake
+/// this loop, so a future that genuinely pends (a backend that is *not*
+/// blocking-in-a-future) would spin here forever. Fail loudly instead.
 fn block_on<F: Future>(fut: F) -> F::Output {
     let mut fut = std::pin::pin!(fut);
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
-    loop {
+    for _ in 0..1_000_000 {
         if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
             return v;
         }
-        // A backend unexpectedly pended (none of the std ones do); yield the
-        // thread and retry rather than spin hot.
         std::thread::yield_now();
     }
+    panic!("future did not complete (a backend unexpectedly pended — this driver only works with blocking backends)");
 }
 
 fn main() {
-    // A CSL-JSON bibliography written to a temp file, resolved offline via a
-    // `file:` URL — demonstrates the fetcher's local-file path.
+    // A CSL-JSON bibliography written to a temp file, resolved offline through
+    // the fetcher's local-file path.
     let tmp = std::env::temp_dir().join(format!("autocitefetch-example-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("create temp dir");
     let bib_path = tmp.join("refs.json");
@@ -57,7 +65,10 @@ fn main() {
         ]"#,
     )
     .expect("write bib file");
-    let bib_url = format!("file://{}", bib_path.display());
+    // A bare filesystem path, not `format!("file://{}", …)`: the fetcher takes
+    // plain paths verbatim, whereas a `file:` URL is percent-*decoded* on the
+    // way in — so any temp path containing a literal `%` would break.
+    let bib_url = bib_path.display().to_string();
 
     let cache_dir = tmp.join("cache");
     let store = block_on(SingleFileCacheStore::new(&cache_dir)).expect("open cache dir");
