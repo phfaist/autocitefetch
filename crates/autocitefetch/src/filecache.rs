@@ -903,7 +903,10 @@ mod tests {
         write_raw(&fs, "cache/citations.jsonl", &alloc::format!("{a}{b}"));
 
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
-        assert!(block_on(store.get("doi:A")).unwrap().is_some(), "first entry");
+        assert!(
+            block_on(store.get("doi:A")).unwrap().is_some(),
+            "first entry"
+        );
         assert!(block_on(store.get("doi:B")).unwrap().is_some());
         assert_eq!(block_on(store.entries()).unwrap().len(), 2);
 

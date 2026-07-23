@@ -212,7 +212,9 @@ fn reopen_returns_the_same_payload_and_expiry() {
 
     let reopened = block_on(SingleFileCacheStore::new(&dir)).expect("reopen");
 
-    let got = block_on(reopened.get("doi:10.1/a")).expect("get").expect("present");
+    let got = block_on(reopened.get("doi:10.1/a"))
+        .expect("get")
+        .expect("present");
     assert_eq!(got.stale_after, stored.stale_after);
     assert_eq!(got.expires, stored.expires);
     match got.payload {
@@ -220,11 +222,17 @@ fn reopen_returns_the_same_payload_and_expiry() {
         other => panic!("expected a concrete payload, got {other:?}"),
     }
 
-    let got = block_on(reopened.get("arxiv:2101.00001")).expect("get").expect("present");
+    let got = block_on(reopened.get("arxiv:2101.00001"))
+        .expect("get")
+        .expect("present");
     assert_eq!(got.stale_after, chained.stale_after);
     assert_eq!(got.expires, chained.expires);
     match got.payload {
-        Payload::Chained { prefix, key, set_properties } => {
+        Payload::Chained {
+            prefix,
+            key,
+            set_properties,
+        } => {
             assert_eq!(prefix, "doi");
             assert_eq!(key, "10.1/a");
             assert_eq!(set_properties, serde_json::json!({"note": "via arXiv"}));
@@ -251,12 +259,20 @@ fn flush_preserves_main_file_permissions() {
     // same mode a plain `File::create` in that directory would produce.
     let probe = dir.join("umask-probe");
     std::fs::File::create(&probe).expect("probe");
-    let want_default = std::fs::metadata(&probe).expect("stat probe").permissions().mode() & 0o777;
+    let want_default = std::fs::metadata(&probe)
+        .expect("stat probe")
+        .permissions()
+        .mode()
+        & 0o777;
     std::fs::remove_file(&probe).expect("rm probe");
 
     block_on(store.put("doi:10.1/a", record(1000))).expect("put");
     block_on(store.flush()).expect("first flush");
-    let created = std::fs::metadata(&main).expect("stat main").permissions().mode() & 0o777;
+    let created = std::fs::metadata(&main)
+        .expect("stat main")
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(
         created, want_default,
         "a new citations.jsonl should respect the umask, not a hard-coded 0600"
@@ -266,14 +282,25 @@ fn flush_preserves_main_file_permissions() {
     std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o644)).expect("chmod");
     block_on(store.put("doi:10.1/b", record(2000))).expect("put");
     block_on(store.flush()).expect("second flush");
-    let after = std::fs::metadata(&main).expect("stat main").permissions().mode() & 0o777;
-    assert_eq!(after, 0o644, "flush must not tighten the committed file's mode");
+    let after = std::fs::metadata(&main)
+        .expect("stat main")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        after, 0o644,
+        "flush must not tighten the committed file's mode"
+    );
 
     // ...including a group-shared mode, the case that actually breaks users.
     std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o664)).expect("chmod");
     block_on(store.put("doi:10.1/c", record(3000))).expect("put");
     block_on(store.flush()).expect("third flush");
-    let after = std::fs::metadata(&main).expect("stat main").permissions().mode() & 0o777;
+    let after = std::fs::metadata(&main)
+        .expect("stat main")
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(after, 0o664);
 }
 
