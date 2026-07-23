@@ -4,15 +4,16 @@
 //! incremental and maps naturally onto IndexedDB, `localStorage`, an embedded
 //! KV store, or one-file-per-entry on disk.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::BoxFuture;
 use crate::csl::CslValue;
 use crate::env::Timestamp;
-use crate::BoxFuture;
 
 /// The payload of a cache entry: either concrete metadata, or a pointer to
 /// another `(prefix, key)` whose metadata should be used instead.
@@ -61,7 +62,8 @@ impl core::error::Error for StoreError {}
 /// the store can be shared freely.
 pub trait CacheStore {
     /// Fetch a record by id.
-    fn get(&self, id: &str) -> BoxFuture<'_, core::result::Result<Option<CacheRecord>, StoreError>>;
+    fn get(&self, id: &str)
+    -> BoxFuture<'_, core::result::Result<Option<CacheRecord>, StoreError>>;
 
     /// Insert or replace a record.
     fn put(
@@ -77,4 +79,12 @@ pub trait CacheStore {
     fn entries(
         &self,
     ) -> BoxFuture<'_, core::result::Result<Vec<(String, CacheRecord)>, StoreError>>;
+
+    /// Durably persist any buffered writes (e.g. compact an append log into the
+    /// committed file). The default is a no-op: stores that persist on every
+    /// write, and in-memory mocks, need not override it. The manager calls this
+    /// at the end of `retrieve`/`prune`.
+    fn flush(&self) -> BoxFuture<'_, core::result::Result<(), StoreError>> {
+        Box::pin(async { Ok(()) })
+    }
 }

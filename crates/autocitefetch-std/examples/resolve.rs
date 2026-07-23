@@ -1,5 +1,5 @@
 //! End-to-end example: wire the `std` backends (blocking [`UreqFetcher`],
-//! [`DirCacheStore`], [`SystemClock`], [`BlockingTimer`]) into a
+//! [`SingleFileCacheStore`], [`SystemClock`], [`BlockingTimer`]) into a
 //! [`CitationManager`], register the `doi` / `manual` / `bib` sources, resolve
 //! a few citations, and print the resulting CSL-JSON.
 //!
@@ -15,12 +15,12 @@
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
-use autocitefetch::source::{BibliographyFileSource, DoiSource, ManualSource};
 use autocitefetch::CitationManager;
-use autocitefetch_std::{BlockingTimer, DirCacheStore, SystemClock, UreqFetcher};
+use autocitefetch::source::{BibliographyFileSource, DoiSource, ManualSource};
+use autocitefetch_std::{BlockingTimer, SingleFileCacheStore, SystemClock, UreqFetcher};
 
 /// A minimal blocking driver. Every backend here (`UreqFetcher` blocks the
-/// thread, `BlockingTimer` sleeps it, `DirCacheStore` does blocking I/O)
+/// thread, `BlockingTimer` sleeps it, `SingleFileCacheStore` does blocking I/O)
 /// resolves its future on the first poll, so a no-op waker suffices — no async
 /// runtime is pulled in. On a real async runtime, use that runtime's `block_on`
 /// and async `Fetcher`/`Timer` instead.
@@ -60,7 +60,7 @@ fn main() {
     let bib_url = format!("file://{}", bib_path.display());
 
     let cache_dir = tmp.join("cache");
-    let store = DirCacheStore::new(&cache_dir).expect("open cache dir");
+    let store = block_on(SingleFileCacheStore::new(&cache_dir)).expect("open cache dir");
 
     let manager = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
         .register(DoiSource::new())

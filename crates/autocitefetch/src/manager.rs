@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use futures_util::stream::{iter, StreamExt};
+use futures_util::stream::{StreamExt, iter};
 use hashbrown::{HashMap, HashSet};
 
 use crate::cache::{Freshness, TtlPolicy};
@@ -132,7 +132,9 @@ where
                     Some(rec) => {
                         // A cached chained entry: make sure its target is present.
                         if let Payload::Chained {
-                            prefix: tp, key: tk, ..
+                            prefix: tp,
+                            key: tk,
+                            ..
                         } = &rec.payload
                         {
                             worklist.push((tp.clone(), tk.clone()));
@@ -195,11 +197,19 @@ where
                     .sources
                     .get(&prefix)
                     .expect("prefix presence checked above");
-                self.store_resolutions(&prefix, source.as_ref(), resolutions, &mut worklist, &mut report)
-                    .await?;
+                self.store_resolutions(
+                    &prefix,
+                    source.as_ref(),
+                    resolutions,
+                    &mut worklist,
+                    &mut report,
+                )
+                .await?;
             }
         }
 
+        // Durably compact any buffered writes before returning.
+        self.store.flush().await?;
         Ok(report)
     }
 
@@ -218,7 +228,9 @@ where
                 Outcome::Concrete { mut csl, ttl } => {
                     csl::set_id(&mut csl, &id);
                     let ttl = ttl.unwrap_or_else(|| source.default_ttl());
-                    let record = self.policy.make_record(Payload::Concrete(csl), now, ttl, &id);
+                    let record = self
+                        .policy
+                        .make_record(Payload::Concrete(csl), now, ttl, &id);
                     self.store.put(&id, record).await?;
                 }
                 Outcome::Chained {
@@ -231,7 +243,9 @@ where
                         key: tk.clone(),
                         set_properties,
                     };
-                    let record = self.policy.make_record(payload, now, source.default_ttl(), &id);
+                    let record = self
+                        .policy
+                        .make_record(payload, now, source.default_ttl(), &id);
                     self.store.put(&id, record).await?;
                     worklist.push((tp, tk));
                 }
@@ -315,6 +329,8 @@ where
                 removed += 1;
             }
         }
+        // Durably compact the removals before returning.
+        self.store.flush().await?;
         Ok(removed)
     }
 
