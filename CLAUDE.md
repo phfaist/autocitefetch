@@ -126,11 +126,18 @@ lock-free `append`, so unlinking a peer's log destroys any write that landed aft
 (measured: ~300 of 400 acknowledged puts lost). The cost of that fix is that a **crashed** writer's
 sidecar is never reaped — reaping it needs a `CacheFs::try_lock_exclusive` that does not exist yet.
 
-Merge rules, all exercised by unit tests: max-`expires` wins on duplicate ids; a record beats a
-tombstone unless the id was never re-added. Torn-line tolerance applies to **sidecars only** — the
-main file is written via fsync+rename and so can never be legitimately torn, so an unparseable line
-or an unknown `{"schema":N}` header there is a hard `Err` rather than a silent skip (silently
-skipping then rewriting turned recoverable corruption into permanent loss).
+Merge rule (all exercised by unit tests): **last write wins over a deterministic total fold order** —
+the main file first (the baseline written at the last compaction), then each sidecar in sorted name
+order, and within a sidecar in line order (append order == that writer's time order). An entry line
+inserts, a tombstone removes. So `put;remove` removes, a re-fetch with a *smaller* `expires` wins
+(it is the newer write — the store does **not** keep the max-`expires` copy, which used to pin the
+entry `Expired` forever), and a sidecar always beats the committed main-file copy. The one thing this
+order cannot make exact is a **cross-writer** race — two live writers writing the same id
+concurrently are ordered only by sidecar name — an accepted known limitation; each writer's own
+sequence of ops is honored exactly. Torn-line tolerance applies to **sidecars only** — the main file
+is written via fsync+rename and so can never be legitimately torn, so an unparseable line or an
+unknown `{"schema":N}` header there is a hard `Err` rather than a silent skip (silently skipping then
+rewriting turned recoverable corruption into permanent loss).
 
 ## Invariants when editing
 

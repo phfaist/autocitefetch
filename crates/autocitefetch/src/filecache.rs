@@ -27,6 +27,30 @@
 //! writes it back atomically. All real I/O is injected through the [`CacheFs`]
 //! trait so the core stays `no_std`.
 //!
+//! # Merge order (last write wins)
+//!
+//! Folding the directory is a **last-write-wins replay over a total order**: the
+//! main file first (it is the baseline written at the previous compaction), then
+//! each sidecar in sorted name order, and within a sidecar in line order —
+//! append order is that writer's own time order. An entry line inserts, a
+//! tombstone removes. The consequences that matter:
+//!
+//! * `put(id); remove(id)` **removes** — the tombstone is folded after the
+//!   entry, so it wins.
+//! * a re-fetch that produces a *smaller* `expires` (a wall clock stepped back
+//!   by NTP or a VM restore, or a reduced TTL) **wins**, because it is the newer
+//!   write. The store deliberately does **not** keep the max-`expires` copy:
+//!   doing so pinned the entry `Expired` forever and drove a permanent re-fetch
+//!   loop.
+//! * a sidecar always beats the committed main-file copy for the same id.
+//!
+//! The one thing this order *cannot* make exact is a cross-writer race: two live
+//! writers appending the same id to their own sidecars concurrently are ordered
+//! only by sidecar **name**, so the higher-named writer wins regardless of which
+//! actually wrote last. This is an accepted known limitation — the concurrent
+//! shared-directory setup is best-effort, and each writer's *own* sequence of
+//! operations is always honored exactly.
+//!
 //! # Which files compaction may delete
 //!
 //! Exactly one: `{base}.{writer_id}.log`, *this* store's own sidecar, and only
@@ -42,8 +66,9 @@
 //! promised. Deleting the peer's sidecar at that point destroys it (and, since
 //! `flush` rebuilds `mem` purely from disk, the peer's own next flush would
 //! then erase its in-memory copy too). Re-folding somebody else's log instead
-//! is idempotent — entry dedup is max-`expires` and tombstones re-apply
-//! identically — and each peer reaps its own log on its next flush.
+//! is idempotent — the fold is a deterministic last-write-wins replay of the
+//! main file then every sidecar in a fixed order, so re-applying the same bytes
+//! reaches the same map — and each peer reaps its own log on its next flush.
 //!
 //! Known trade-off: a sidecar whose owning writer **crashed** is now never
 //! reaped (its writer id is never reused, so nobody claims it). It accumulates
@@ -74,7 +99,7 @@
 //! [`parse_main_into`].
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -382,17 +407,6 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
     }
 }
 
-/// Insert `rec` under `id` keeping the MAX-`expires` copy: overwrite only if
-/// the id is absent or the incoming record's hard expiry is strictly later.
-fn insert_max_expires(map: &mut BTreeMap<String, CacheRecord>, id: String, rec: CacheRecord) {
-    match map.get(&id) {
-        Some(existing) if rec.expires <= existing.expires => {}
-        _ => {
-            map.insert(id, rec);
-        }
-    }
-}
-
 /// Parse a main file into `map`, returning how many entry lines it contributed.
 ///
 /// Every non-blank line must be either an entry (`{"id":…,"rec":…}`) or a
@@ -453,16 +467,19 @@ fn parse_main_into(
     Ok(entries)
 }
 
-/// Fold a sidecar log into `map`, recording re-added and deleted ids. Entries
-/// dedup by MAX-`expires`; tombstones are collected. Unparseable lines are
-/// skipped — unlike the main file, a sidecar is appended to without `fsync`,
-/// so a crash legitimately leaves a torn tail. `trim` also absorbs `\r\n`.
-fn fold_sidecar_into(
-    bytes: &[u8],
-    map: &mut BTreeMap<String, CacheRecord>,
-    added: &mut BTreeSet<String>,
-    deleted: &mut BTreeSet<String>,
-) {
+/// Fold a sidecar log into `map` **in line order**, returning whether it
+/// carried any tombstone. Append order *is* this writer's time order, so a plain
+/// last-write-wins fold is correct: an entry line does `map.insert` (a later
+/// write for an id overwrites an earlier one, whatever its `expires`), and a
+/// tombstone does `map.remove` (a `remove` written after a `put` for the same id
+/// actually removes it). Because the caller folds the main file first and then
+/// each sidecar, a sidecar write always wins over the committed copy.
+///
+/// Unparseable lines are skipped — unlike the main file, a sidecar is appended
+/// to without `fsync`, so a crash legitimately leaves a torn tail. `trim` also
+/// absorbs `\r\n`.
+fn fold_sidecar_into(bytes: &[u8], map: &mut BTreeMap<String, CacheRecord>) -> bool {
+    let mut saw_tombstone = false;
     for raw in bytes.split(|&b| b == b'\n') {
         let Ok(s) = core::str::from_utf8(raw) else {
             continue;
@@ -475,13 +492,13 @@ fn fold_sidecar_into(
             continue;
         };
         if line.del {
-            deleted.insert(line.id);
+            map.remove(&line.id);
+            saw_tombstone = true;
         } else if let Some(rec) = line.rec {
-            // Both the map and `added` own the id, so one clone is unavoidable.
-            insert_max_expires(map, line.id.clone(), rec);
-            added.insert(line.id);
+            map.insert(line.id, rec);
         }
     }
+    saw_tombstone
 }
 
 /// Whether `name` is a sidecar log belonging to this store's family:
@@ -519,20 +536,34 @@ fn is_sidecar(name: &str, base: &str) -> bool {
 
 /// One folded view of the whole cache directory.
 struct Merged {
-    /// The merged map: the main file, then every sidecar (records dedup by
-    /// MAX-`expires`), with orphan tombstones applied.
+    /// The merged map, built last-write-wins in a total fold order: the main
+    /// file first (the baseline written at the last compaction), then each
+    /// sidecar in sorted name order, and within a sidecar in line order.
     map: BTreeMap<String, CacheRecord>,
     /// Names (not paths) of the sidecars actually read and folded, sorted.
     /// `flush` consults this before unlinking its own log.
     folded: Vec<String>,
     /// How many entry lines the main file contributed.
     main_entries: usize,
-    /// Whether any sidecar carried a tombstone.
+    /// Whether any sidecar carried a tombstone. Only used by the "never compact
+    /// a populated cache down to nothing" guard: an all-tombstoned empty result
+    /// is legitimate, an inexplicably empty one is not.
     saw_tombstone: bool,
 }
 
 /// Read the main file and every sidecar for `base` under `dir` and fold them
-/// into one map (records win over tombstones per the MAX-`expires` rule).
+/// into one map with **last-write-wins** semantics over a deterministic total
+/// order: the main file first, then each sidecar in sorted name order, and
+/// within each sidecar in line order (append order == that writer's time
+/// order). A later write for an id therefore beats an earlier one, and any
+/// sidecar beats the committed main-file copy — so `put;remove` removes,
+/// `put big; put small` keeps the *small* (newer) expiry, and a re-fetch in a
+/// fresh sidecar overrides the committed record.
+///
+/// The one irreducible ambiguity is cross-writer: two live writers that write
+/// the same id concurrently are ordered only by sidecar name, so the
+/// higher-named writer wins regardless of real time. That is a documented known
+/// limitation (see the module docs); the same-writer cases above are exact.
 ///
 /// A failure to read the *main* file is fatal; a failure to read an individual
 /// *sidecar* is not — a directory that happens to be named like one, a
@@ -548,32 +579,22 @@ async fn load_merged<Fs: CacheFs>(fs: &Fs, dir: &str, base: &str) -> Result<Merg
         main_entries = parse_main_into(&bytes, &main_path, &mut map)?;
     }
 
-    let mut added: BTreeSet<String> = BTreeSet::new();
-    let mut deleted: BTreeSet<String> = BTreeSet::new();
     let mut folded: Vec<String> = Vec::new();
+    let mut saw_tombstone = false;
 
     let mut names = fs.list(dir).await?;
-    names.sort(); // deterministic fold order (only matters for equal-`expires` ties)
+    names.sort(); // deterministic cross-writer fold order (see module docs)
     for name in names {
         if !is_sidecar(&name, base) {
             continue;
         }
         let path = alloc::format!("{dir}/{name}");
         match fs.read(&path).await {
-            Ok(Some(bytes)) => fold_sidecar_into(&bytes, &mut map, &mut added, &mut deleted),
+            Ok(Some(bytes)) => saw_tombstone |= fold_sidecar_into(&bytes, &mut map),
             Ok(None) => {}
             Err(_) => continue,
         }
         folded.push(name);
-    }
-
-    // Records always win over tombstones: only drop ids that were deleted and
-    // never re-added by a sidecar entry.
-    let saw_tombstone = !deleted.is_empty();
-    for id in &deleted {
-        if !added.contains(id) {
-            map.remove(id);
-        }
     }
 
     Ok(Merged {
@@ -732,13 +753,15 @@ mod tests {
         assert_eq!(entries.len(), 2);
     }
 
+    /// Within one sidecar the LAST-written line for an id wins, regardless of its
+    /// `expires` — append order is that writer's time order, so a re-fetch that
+    /// happens to shorten the expiry must not be discarded (bug #2).
     #[test]
-    fn max_expires_wins_across_sidecar_entries() {
+    fn last_write_wins_within_a_sidecar() {
         let fs = MemFs::default();
-        // Two entries for the same id in one sidecar: later `expires` must win.
-        let smaller = FileCacheStore::<MemFs>::entry_line("doi:1", &rec(1000)).unwrap();
         let larger = FileCacheStore::<MemFs>::entry_line("doi:1", &rec(5000)).unwrap();
-        // Write the *smaller* one last, to prove ordering doesn't decide it.
+        let smaller = FileCacheStore::<MemFs>::entry_line("doi:1", &rec(1000)).unwrap();
+        // Write the larger-expires line first, the smaller one last: last wins.
         write_raw(
             &fs,
             "cache/citations.w1.log",
@@ -748,11 +771,13 @@ mod tests {
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w2")).unwrap();
         block_on(store.flush()).unwrap();
         let got = block_on(store.get("doi:1")).unwrap().unwrap();
-        assert_eq!(got.expires, Timestamp::from_millis(5000));
+        assert_eq!(got.expires, Timestamp::from_millis(1000));
     }
 
+    /// A tombstone written *after* a record for the same id removes it (bug #1),
+    /// and an orphan tombstone (no competing record) still deletes.
     #[test]
-    fn tombstone_loses_to_record_but_deletes_orphan() {
+    fn tombstone_after_record_removes_it_and_deletes_orphan() {
         let fs = MemFs::default();
         // id B lives in the already-committed main file...
         let main = alloc::format!(
@@ -760,8 +785,9 @@ mod tests {
             FileCacheStore::<MemFs>::entry_line("doi:B", &rec(1000)).unwrap()
         );
         write_raw(&fs, "cache/citations.jsonl", &main);
-        // ...and the sidecar has: a record + tombstone for A (record wins),
-        // plus an orphan tombstone for B (no competing record -> B removed).
+        // ...and the sidecar has: a record then a tombstone for A (tombstone
+        // wins, it is the later write), plus an orphan tombstone for B (removes
+        // the committed main-file record).
         let a_rec = FileCacheStore::<MemFs>::entry_line("doi:A", &rec(1000)).unwrap();
         let a_del = FileCacheStore::<MemFs>::tombstone_line("doi:A").unwrap();
         let b_del = FileCacheStore::<MemFs>::tombstone_line("doi:B").unwrap();
@@ -774,12 +800,128 @@ mod tests {
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w2")).unwrap();
         block_on(store.flush()).unwrap();
         assert!(
-            block_on(store.get("doi:A")).unwrap().is_some(),
-            "record wins"
+            block_on(store.get("doi:A")).unwrap().is_none(),
+            "tombstone after record removes it"
         );
         assert!(
             block_on(store.get("doi:B")).unwrap().is_none(),
-            "orphan tombstone deletes"
+            "orphan tombstone deletes the main-file record"
+        );
+    }
+
+    /// The mirror image: a record written *after* a tombstone for the same id
+    /// re-adds it, again because the last write in line order wins.
+    #[test]
+    fn record_after_tombstone_re_adds_it() {
+        let fs = MemFs::default();
+        let a_del = FileCacheStore::<MemFs>::tombstone_line("doi:A").unwrap();
+        let a_rec = FileCacheStore::<MemFs>::entry_line("doi:A", &rec(1000)).unwrap();
+        write_raw(
+            &fs,
+            "cache/citations.w1.log",
+            &alloc::format!("{a_del}{a_rec}"),
+        );
+
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w2")).unwrap();
+        block_on(store.flush()).unwrap();
+        assert!(
+            block_on(store.get("doi:A")).unwrap().is_some(),
+            "record after tombstone re-adds it"
+        );
+    }
+
+    /// Bug #1 end-to-end through the public API: `put(id); remove(id); flush()`
+    /// must leave the id gone, on disk and across a reopen — the tombstone is the
+    /// last write for that id, so it wins.
+    #[test]
+    fn put_then_remove_then_flush_actually_removes() {
+        let fs = MemFs::default();
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        block_on(store.put("doi:1", rec(1000))).unwrap();
+        block_on(store.remove("doi:1")).unwrap();
+        block_on(store.flush()).unwrap();
+
+        assert!(
+            block_on(store.get("doi:1")).unwrap().is_none(),
+            "remove after put must actually remove"
+        );
+        assert!(block_on(store.entries()).unwrap().is_empty());
+
+        // ...and it stays gone across a reopen over the same on-disk bytes.
+        let files = store.fs.files.borrow().clone();
+        let fs2 = MemFs {
+            files: RefCell::new(files),
+            ..Default::default()
+        };
+        let store2 = block_on(FileCacheStore::open(fs2, "cache", "citations", "w2")).unwrap();
+        assert!(block_on(store2.get("doi:1")).unwrap().is_none());
+    }
+
+    /// Bug #2: a re-fetch that produces a *smaller* `expires` (wall clock stepped
+    /// back, or a reduced default TTL) wins because it is the newer write — both
+    /// within a single sidecar and when it lands in a sidecar over a larger
+    /// committed main-file copy. The old max-`expires` rule kept the stale larger
+    /// value and pinned the entry `Expired` forever.
+    #[test]
+    fn refetch_with_smaller_expires_wins() {
+        let larger = FileCacheStore::<MemFs>::entry_line("doi:1", &rec(5000)).unwrap();
+        let smaller = FileCacheStore::<MemFs>::entry_line("doi:1", &rec(1000)).unwrap();
+
+        // (a) within one sidecar: larger written first, smaller (the re-fetch) last.
+        let fs = MemFs::default();
+        write_raw(
+            &fs,
+            "cache/citations.w1.log",
+            &alloc::format!("{larger}{smaller}"),
+        );
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w2")).unwrap();
+        assert_eq!(
+            block_on(store.get("doi:1")).unwrap().unwrap().expires,
+            Timestamp::from_millis(1000),
+            "smaller re-fetch within one sidecar wins"
+        );
+
+        // (b) sidecar over main file: main committed the larger copy, a fresh
+        // sidecar holds the smaller re-fetch.
+        let fs = MemFs::default();
+        write_raw(
+            &fs,
+            "cache/citations.jsonl",
+            &alloc::format!("{HEADER}\n{larger}"),
+        );
+        write_raw(&fs, "cache/citations.w1.log", &smaller);
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w2")).unwrap();
+        assert_eq!(
+            block_on(store.get("doi:1")).unwrap().unwrap().expires,
+            Timestamp::from_millis(1000),
+            "smaller re-fetch in a sidecar beats the larger committed copy"
+        );
+    }
+
+    /// The documented cross-writer limitation: two writers that each commit a
+    /// different value for the same id are ordered only by sidecar **name**, so
+    /// the higher-named writer wins regardless of `expires` magnitude. Pinned so
+    /// the tiebreak stays deterministic.
+    #[test]
+    fn cross_writer_conflict_resolved_by_sidecar_name_order() {
+        let fs = MemFs::default();
+        // w1 writes the *larger* expiry, w2 the smaller — name order, not
+        // magnitude, must decide, so w2 (folded last) wins.
+        write_raw(
+            &fs,
+            "cache/citations.w1.log",
+            &FileCacheStore::<MemFs>::entry_line("doi:1", &rec(9000)).unwrap(),
+        );
+        write_raw(
+            &fs,
+            "cache/citations.w2.log",
+            &FileCacheStore::<MemFs>::entry_line("doi:1", &rec(1000)).unwrap(),
+        );
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w3")).unwrap();
+        assert_eq!(
+            block_on(store.get("doi:1")).unwrap().unwrap().expires,
+            Timestamp::from_millis(1000),
+            "later-sorted sidecar name wins, independent of expires"
         );
     }
 
@@ -1007,12 +1149,12 @@ mod tests {
         );
     }
 
-    /// Pins current (deliberately deferred) merge behavior: MAX-`expires`
-    /// decides between the committed file and a sidecar exactly as it does
-    /// between two sidecars — recency does *not* win. A sidecar record whose
-    /// `expires` is not strictly later than the committed one is discarded.
+    /// A sidecar (the newer write) always wins over the committed main file for
+    /// the same id — whether its `expires` is *later* or *earlier* than the
+    /// committed copy. Recency decides, not the max-`expires` rule of the old
+    /// code; the earlier-expiry half is the fix for bug #2.
     #[test]
-    fn max_expires_decides_between_main_and_sidecar_not_recency() {
+    fn recency_decides_between_main_and_sidecar() {
         // (a) sidecar's expiry is later -> sidecar wins.
         let fs = MemFs::default();
         write_raw(
@@ -1034,9 +1176,9 @@ mod tests {
             Timestamp::from_millis(5000)
         );
 
-        // (b) sidecar's expiry is *earlier* -> the committed record survives,
-        // even though the sidecar line is the newer write. This is the
-        // `insert_max_expires` behavior the owner has deferred a decision on.
+        // (b) sidecar's expiry is *earlier* -> the sidecar STILL wins, because
+        // it is the newer write. Under the old max-`expires` rule the committed
+        // record survived and the entry stayed stale forever.
         let fs = MemFs::default();
         write_raw(
             &fs,
@@ -1054,7 +1196,7 @@ mod tests {
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w2")).unwrap();
         assert_eq!(
             block_on(store.get("doi:1")).unwrap().unwrap().expires,
-            Timestamp::from_millis(5000)
+            Timestamp::from_millis(1000)
         );
     }
 

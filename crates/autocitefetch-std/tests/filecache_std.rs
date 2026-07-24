@@ -81,6 +81,67 @@ fn put_flush_reopen_roundtrip_leaves_single_committed_file() {
     assert_eq!(entries.len(), 2, "both entries present after reopen");
 }
 
+/// Bug #1 on the real filesystem: `put; remove; flush` must leave the id gone,
+/// both in the reopened store and in the committed file's bytes. The old
+/// order-free fold applied a global "records beat tombstones" rule, so the
+/// entry resurrected on flush.
+#[test]
+fn put_then_remove_then_flush_removes_on_disk() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("cache");
+    let store = block_on(SingleFileCacheStore::new(&dir)).expect("open");
+
+    block_on(store.put("doi:10.1/gone", record(1000))).expect("put");
+    block_on(store.remove("doi:10.1/gone")).expect("remove");
+    block_on(store.flush()).expect("flush");
+
+    assert!(
+        block_on(store.get("doi:10.1/gone")).expect("get").is_none(),
+        "remove after put must survive a flush"
+    );
+    // The committed file holds only the header — the entry is not in it.
+    let text = std::fs::read_to_string(dir.join("citations.jsonl")).expect("read main");
+    assert!(
+        !text.contains("doi:10.1/gone"),
+        "the removed id must not be in the committed file: {text}"
+    );
+
+    drop(store);
+    let reopened = block_on(SingleFileCacheStore::new(&dir)).expect("reopen");
+    assert!(
+        block_on(reopened.get("doi:10.1/gone")).expect("get").is_none(),
+        "the removal must survive a reopen"
+    );
+}
+
+/// Bug #2 on the real filesystem: a re-fetch that shortens `expires` (a stepped-
+/// back clock, a reduced TTL) must win because it is the newer write. The old
+/// max-`expires` rule kept the larger stale value and pinned the entry expired.
+#[test]
+fn refetch_with_smaller_expires_wins_on_disk() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("cache");
+    let store = block_on(SingleFileCacheStore::new(&dir)).expect("open");
+
+    // Commit the larger-expiry copy, then re-fetch a smaller one into a fresh
+    // sidecar and compact.
+    block_on(store.put("doi:10.1/a", record(5000))).expect("put large");
+    block_on(store.flush()).expect("first flush");
+    block_on(store.put("doi:10.1/a", record(1000))).expect("re-fetch smaller");
+    block_on(store.flush()).expect("second flush");
+
+    drop(store);
+    let reopened = block_on(SingleFileCacheStore::new(&dir)).expect("reopen");
+    let got = block_on(reopened.get("doi:10.1/a"))
+        .expect("get")
+        .expect("present");
+    assert_eq!(
+        got.expires,
+        Timestamp::from_millis(1000),
+        "the newer, smaller-expiry re-fetch must win"
+    );
+}
+
 /// Regression test for the compaction data-loss bug: `flush()` used to delete
 /// *every* sidecar it folded, including live peers' logs. A peer whose `put`
 /// landed after the folding read but before the unlink had its acknowledged
