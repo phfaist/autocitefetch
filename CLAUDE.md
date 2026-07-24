@@ -113,7 +113,7 @@ across passes, so the second pass of an arXiv→DOI chain cannot hit doi.org wit
 |---|---|---|
 | `arxiv` | 100 / 3100 ms / 10 d | Atom feed parsed with `xmlparser`; version resolution; chains to `doi` |
 | `doi` | 1 / 1100 ms / 360 d | doi.org content negotiation returns CSL-JSON verbatim — no field mapping |
-| `manual` | ∞ / 0 / **0** | key *is* the formatted text, stored under `_formatted_text`; TTL 0 ⇒ ephemeral |
+| `manual` | ∞ / 0 / **0** | key *is* the formatted text, stored under `_formatted_text`; TTL 0 ⇒ ephemeral (kept in the store's in-memory view for the run, **never persisted** to `citations.jsonl` or a sidecar, gone on restart — enforced by `FileCacheStore`, keyed on `stale_after == expires`, not on the prefix) |
 | `bib` | ∞ / 0 / 60 s | file(s) fetched through the `Fetcher` (`file:` URLs), indexed by `id` |
 
 arXiv version resolution: an explicitly-versioned key (`1211.1037v2`) resolves to that exact version
@@ -159,6 +159,14 @@ sequence of ops is honored exactly. Torn-line tolerance applies to **sidecars on
 is written via fsync+rename and so can never be legitimately torn, so an unparseable line or an
 unknown `{"schema":N}` header there is a hard `Err` rather than a silent skip (silently skipping then
 rewriting turned recoverable corruption into permanent loss).
+
+**Ephemeral (TTL-0) records are memory-only.** A record with no fresh window (`stale_after == expires`,
+what a zero TTL produces — `is_ephemeral`) is kept in `mem` so a same-run `get` works, but is never
+appended to a sidecar, never written into `citations.jsonl` (`serialize_main` skips it and `flush`
+carries the in-memory copies forward across its own disk reload), and dropped rather than resurrected
+when read back off an older on-disk file. This keeps `manual`-source citation text out of the
+committed file while preserving the two-phase `retrieve`→`get` flow within a run. Keyed on the
+timestamps, not the prefix.
 
 ## Invariants when editing
 

@@ -32,6 +32,16 @@ fn record(expires_ms: i64) -> CacheRecord {
     }
 }
 
+/// An *ephemeral* (TTL-0) record — the `manual` source's case: no fresh window,
+/// so `stale_after == expires`. Must never be persisted.
+fn ephemeral(now_ms: i64) -> CacheRecord {
+    CacheRecord {
+        payload: Payload::Concrete(serde_json::json!({"_formatted_text": "Bohr, N. (1913)"})),
+        stale_after: Timestamp::from_millis(now_ms),
+        expires: Timestamp::from_millis(now_ms),
+    }
+}
+
 /// Names of the sidecar append logs in `dir` — files ending in `.log` but not
 /// `.log.lock` (the companion liveness lock). Sorted for stable assertions.
 fn list_sidecars(dir: &std::path::Path) -> Vec<String> {
@@ -597,4 +607,142 @@ fn a_second_flush_blocks_while_the_first_holds_the_lock() {
 
     let text = std::fs::read_to_string(dir.join("citations.jsonl")).expect("read main file");
     assert_eq!(text.lines().count(), 3, "both entries committed: {text}");
+}
+
+/// Review item #7 on the real filesystem: a TTL-0 (ephemeral) record is served
+/// within the run — `get()` returns it before and after a `flush()` — but never
+/// lands in `citations.jsonl` or any sidecar, and is gone after a reopen. A
+/// normal record put alongside it is committed and survives.
+#[test]
+fn ephemeral_records_are_never_committed_to_disk() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("cache");
+    let store = block_on(SingleFileCacheStore::new(&dir)).expect("open");
+
+    block_on(store.put("doi:keep", record(1000))).expect("put normal");
+    block_on(store.put("manual:Bohr, N. (1913)", ephemeral(0))).expect("put ephemeral");
+
+    // Usable within the run, before the flush.
+    assert!(
+        block_on(store.get("manual:Bohr, N. (1913)"))
+            .expect("get")
+            .is_some()
+    );
+
+    block_on(store.flush()).expect("flush");
+
+    // Still usable after the flush, within the same run.
+    assert!(
+        block_on(store.get("manual:Bohr, N. (1913)"))
+            .expect("get")
+            .is_some(),
+        "an ephemeral record must survive a flush within the run"
+    );
+    assert!(block_on(store.get("doi:keep")).expect("get").is_some());
+
+    // The committed file holds the normal id, never the ephemeral text — and
+    // nothing else in the directory (any `.log` sidecar) mentions it either.
+    let main = std::fs::read_to_string(dir.join("citations.jsonl")).expect("read main");
+    assert!(main.contains("doi:keep"), "normal record committed: {main}");
+    assert!(
+        !main.contains("Bohr"),
+        "ephemeral text must never reach citations.jsonl: {main}"
+    );
+    for entry in std::fs::read_dir(&dir).expect("read dir") {
+        let path = entry.expect("entry").path();
+        let bytes = std::fs::read(&path).unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("Bohr"),
+            "ephemeral text leaked into {}: {text}",
+            path.display()
+        );
+    }
+
+    drop(store);
+    // Reopen (a fresh process would): normal survives, ephemeral is gone.
+    let reopened = block_on(SingleFileCacheStore::new(&dir)).expect("reopen");
+    assert!(
+        block_on(reopened.get("doi:keep")).expect("get").is_some(),
+        "the normal record survives a reopen"
+    );
+    assert!(
+        block_on(reopened.get("manual:Bohr, N. (1913)"))
+            .expect("get")
+            .is_none(),
+        "the ephemeral record must be gone after a reopen"
+    );
+}
+
+// --- minimal backends for a manager-level ephemeral test -------------------
+
+/// A fetcher that is never actually called (the `manual` source does no I/O);
+/// it exists only to satisfy `CitationManager::new`.
+struct NoFetch;
+impl autocitefetch::Fetcher for NoFetch {
+    fn fetch(
+        &self,
+        _req: autocitefetch::Request,
+    ) -> autocitefetch::BoxFuture<'_, Result<autocitefetch::Response, autocitefetch::FetchError>> {
+        Box::pin(async { Err(autocitefetch::FetchError::Status(599)) })
+    }
+}
+
+struct FixedClock(i64);
+impl autocitefetch::Clock for FixedClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::from_millis(self.0)
+    }
+}
+
+struct InstantTimer;
+impl autocitefetch::Timer for InstantTimer {
+    fn sleep(&self, _dur: std::time::Duration) -> autocitefetch::BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+}
+
+/// End-to-end through the manager: a `manual:` citation is resolved and readable
+/// within the run (after `retrieve`, which flushes), yet its text never reaches
+/// the committed file and it is gone after a restart (a fresh store over the
+/// same directory). This is the two-phase `retrieve`→`get` flow the ephemeral
+/// policy must not break.
+#[test]
+fn manual_citation_is_usable_in_run_but_never_persisted() {
+    use autocitefetch::CitationManager;
+    use autocitefetch::source::ManualSource;
+
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("cache");
+    let text = "Bohr, N. (1913). On the Constitution of Atoms.";
+
+    {
+        let store = block_on(SingleFileCacheStore::new(&dir)).expect("open");
+        let mgr = CitationManager::new(NoFetch, store, FixedClock(1_000), InstantTimer)
+            .register(ManualSource::new());
+
+        let cites = vec![("manual".to_string(), text.to_string())];
+        let report = block_on(mgr.retrieve(&cites)).expect("retrieve");
+        assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+        // Within the run (retrieve has flushed), get() still resolves it.
+        let item = block_on(mgr.get("manual", text)).expect("get within run");
+        assert_eq!(item["_formatted_text"], text);
+    } // the store (owned by the manager) drops here — simulating process exit.
+
+    // The committed file must not carry the citation text.
+    let main = std::fs::read_to_string(dir.join("citations.jsonl")).unwrap_or_default();
+    assert!(
+        !main.contains("Bohr"),
+        "manual citation text must never be committed: {main}"
+    );
+
+    // Restart: a fresh store over the same directory has no trace of it.
+    let reopened = block_on(SingleFileCacheStore::new(&dir)).expect("reopen");
+    assert!(
+        block_on(reopened.get(&format!("manual:{text}")))
+            .expect("get")
+            .is_none(),
+        "the ephemeral manual entry must be gone after a restart"
+    );
 }

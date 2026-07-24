@@ -27,6 +27,20 @@
 //! writes it back atomically. All real I/O is injected through the [`CacheFs`]
 //! trait so the core stays `no_std`.
 //!
+//! # Ephemeral (TTL-0) records are memory-only
+//!
+//! A record with no fresh window (`stale_after == expires`, what a zero TTL
+//! produces — see [`is_ephemeral`]) is *ephemeral*: it lives only for the
+//! current run. `put` keeps it in the in-memory map so a same-run `get` still
+//! serves it, but never appends it to a sidecar; `flush` never writes it to
+//! `citations.jsonl` (and carries the in-memory copies forward across its own
+//! disk reload); and an ephemeral record read back from an older on-disk file
+//! is dropped, not resurrected. The net effect: the `manual` source's citation
+//! text (the canonical TTL-0 case) is usable within a run but never lands in
+//! the committable file and is gone on the next `open`. This is a persistence
+//! policy, keyed on the record's timestamps — nothing here knows about the
+//! `manual` prefix.
+//!
 //! # Merge order (last write wins)
 //!
 //! Folding the directory is a **last-write-wins replay over a total order**: the
@@ -261,6 +275,21 @@ fn ser_store(e: impl fmt::Display) -> StoreError {
     StoreError(e.to_string())
 }
 
+/// Whether a record is *ephemeral* — a TTL-0 entry that must live only in
+/// memory for the current run and never touch the committable file.
+///
+/// Such a record has no fresh window, so its soft and hard expiries coincide
+/// (`stale_after == expires`); that is exactly what
+/// [`TtlPolicy::make_record`](crate::cache::TtlPolicy::make_record)'s zero-TTL
+/// branch produces. A normal record always has `stale_after < expires`, so
+/// `>=` is a safe, source-agnostic predicate (it is keyed on the timestamps,
+/// not on the `manual` prefix). Ephemeral records are skipped by `put`'s
+/// sidecar append, excluded from [`serialize_main`], and dropped when read back
+/// off disk — so they are never persisted and vanish on the next `open`.
+fn is_ephemeral(rec: &CacheRecord) -> bool {
+    rec.stale_after >= rec.expires
+}
+
 /// A [`CacheStore`] persisted as one committable JSONL file plus lock-free
 /// per-writer sidecar logs, compacted under a lock. Generic over the injected
 /// [`CacheFs`]; carries no clock.
@@ -369,22 +398,36 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
     }
 
     fn put(&self, id: &str, record: CacheRecord) -> BoxFuture<'_, Result<(), StoreError>> {
+        // An *ephemeral* (TTL-0) record lives only for this run: it goes into
+        // the in-memory view so `get()` still serves it, but is deliberately
+        // **never** appended to a sidecar (nor, therefore, folded into the
+        // committable `citations.jsonl`). Otherwise arbitrary manual citation
+        // text would land in a git-tracked file and be pinned there by the
+        // grace window for a fortnight. See [`is_ephemeral`].
+        let ephemeral = is_ephemeral(&record);
         // Serialize the sidecar line first (borrowing `record`), then move the
         // record into the in-memory map — no clone, no RefCell borrow held
         // across the await below. Note the map is updated in this synchronous
         // prologue while the append happens in the returned future: a future
         // that is created and then dropped without being polled leaves `mem`
         // one entry ahead of disk (harmless — the next `flush` re-reads disk
-        // and the entry simply reverts).
-        let line = Self::entry_line(id, &record);
+        // and the entry simply reverts). An ephemeral record is *always* "ahead
+        // of disk" by design.
+        let line = if ephemeral {
+            None
+        } else {
+            Some(Self::entry_line(id, &record))
+        };
         self.mem.borrow_mut().insert(id.to_string(), record);
         let sidecar = self.sidecar.clone();
         Box::pin(async move {
-            let line = line?;
-            self.fs
-                .append(&sidecar, line.as_bytes())
-                .await
-                .map_err(fs_store)?;
+            if let Some(line) = line {
+                let line = line?;
+                self.fs
+                    .append(&sidecar, line.as_bytes())
+                    .await
+                    .map_err(fs_store)?;
+            }
             Ok(())
         })
     }
@@ -492,7 +535,23 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
                 }
             }
 
-            *self.mem.borrow_mut() = merged.map;
+            // Carry forward this run's *ephemeral* (TTL-0) records. They were
+            // never written to any sidecar (see `put`) nor to the main file
+            // (see `serialize_main`), so the disk-only `merged.map` above does
+            // not contain them — and overwriting `mem` with it verbatim would
+            // forget them mid-run, breaking a same-run `get()` of a `manual:`
+            // citation after `retrieve` (which flushes). Re-inserting them keeps
+            // them memory-only: still absent from disk, still gone on restart.
+            let mut merged_map = merged.map;
+            {
+                let mem = self.mem.borrow();
+                for (id, rec) in mem.iter() {
+                    if is_ephemeral(rec) {
+                        merged_map.insert(id.clone(), rec.clone());
+                    }
+                }
+            }
+            *self.mem.borrow_mut() = merged_map;
             Ok(())
         })
     }
@@ -546,6 +605,15 @@ fn parse_main_into(
             continue;
         }
         if let Ok(entry) = serde_json::from_str::<EntryLine>(s) {
+            // An ephemeral (TTL-0) record must never have been persisted; a
+            // cache written by an older build may still hold one, so drop it on
+            // read rather than resurrect it. It is deliberately *not* counted
+            // in `entries`: dropping it is a legitimate reason for the map to
+            // shrink, and counting it would trip the "refusing to compact to
+            // nothing" guard in `flush`.
+            if is_ephemeral(&entry.rec) {
+                continue;
+            }
             map.insert(entry.id, entry.rec);
             entries += 1;
             continue;
@@ -586,7 +654,12 @@ fn fold_sidecar_into(bytes: &[u8], map: &mut BTreeMap<String, CacheRecord>) -> b
             map.remove(&line.id);
             saw_tombstone = true;
         } else if let Some(rec) = line.rec {
-            map.insert(line.id, rec);
+            // Drop an ephemeral (TTL-0) record read off disk rather than
+            // resurrect it — a stale sidecar from an older build could carry
+            // one. New writes never put one here (see `put`).
+            if !is_ephemeral(&rec) {
+                map.insert(line.id, rec);
+            }
         }
     }
     saw_tombstone
@@ -703,6 +776,14 @@ fn serialize_main(map: &BTreeMap<String, CacheRecord>) -> Result<String, StoreEr
     buf.push_str(HEADER);
     buf.push('\n');
     for (id, rec) in map {
+        // Ephemeral (TTL-0) records are memory-only and must never be
+        // committed. Defence in depth: the fold already drops them and `put`
+        // never appends one, so `map` should not contain one here — but a
+        // record that *became* ephemeral, or slipped in before this policy,
+        // still must not reach `citations.jsonl`.
+        if is_ephemeral(rec) {
+            continue;
+        }
         let line = serde_json::to_string(&EntryLineRef { id, rec }).map_err(ser_store)?;
         buf.push_str(&line);
         buf.push('\n');
@@ -846,6 +927,17 @@ mod tests {
         }
     }
 
+    /// An *ephemeral* (TTL-0) record: no fresh window, so `stale_after ==
+    /// expires` — exactly what `TtlPolicy::make_record`'s zero-TTL branch
+    /// produces for a `manual:` citation.
+    fn ephemeral_rec(now_ms: i64) -> CacheRecord {
+        CacheRecord {
+            payload: Payload::Concrete(serde_json::json!({"_formatted_text": "Bohr (1913)"})),
+            stale_after: Timestamp::from_millis(now_ms),
+            expires: Timestamp::from_millis(now_ms),
+        }
+    }
+
     /// Directly seed a sidecar file's raw bytes on the mock fs.
     fn write_raw(fs: &MemFs, path: &str, contents: &str) {
         fs.files
@@ -887,6 +979,109 @@ mod tests {
         assert!(block_on(store2.get("doi:2")).unwrap().is_some());
         let entries = block_on(store2.entries()).unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    /// A TTL-0 (ephemeral) record is usable within the run — `get()` returns it
+    /// both before and after a `flush()` — but is NEVER appended to a sidecar,
+    /// never written to the committed file, and gone on reopen. A normal record
+    /// put alongside it is persisted and survives the reopen (review item #7).
+    #[test]
+    fn ephemeral_records_are_memory_only() {
+        let fs = MemFs::default();
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+
+        block_on(store.put("doi:keep", rec(1000))).unwrap();
+        block_on(store.put("manual:Bohr (1913)", ephemeral_rec(0))).unwrap();
+
+        // Both readable this run, before the flush.
+        assert!(block_on(store.get("doi:keep")).unwrap().is_some());
+        assert!(block_on(store.get("manual:Bohr (1913)")).unwrap().is_some());
+
+        block_on(store.flush()).unwrap();
+
+        // ...and the ephemeral one still readable after the flush (its in-memory
+        // copy is carried across the disk reload).
+        assert!(
+            block_on(store.get("manual:Bohr (1913)")).unwrap().is_some(),
+            "an ephemeral record must survive a flush within the same run"
+        );
+        assert!(block_on(store.get("doi:keep")).unwrap().is_some());
+
+        // The committed file holds the normal id but not the ephemeral text,
+        // and no sidecar retains it either.
+        {
+            let files = store.fs.files.borrow();
+            let main = core::str::from_utf8(&files["cache/citations.jsonl"]).unwrap();
+            assert!(main.contains("doi:keep"), "normal record is committed: {main}");
+            assert!(
+                !main.contains("Bohr"),
+                "ephemeral text must never reach the committed file: {main}"
+            );
+            for (path, bytes) in files.iter() {
+                if path.ends_with(".log") {
+                    let text = core::str::from_utf8(bytes).unwrap();
+                    assert!(
+                        !text.contains("Bohr"),
+                        "ephemeral text leaked into sidecar {path}: {text}"
+                    );
+                }
+            }
+        }
+
+        // Reopen over the same on-disk bytes: normal survives, ephemeral is gone.
+        let disk = store.fs.files.borrow().clone();
+        let fs2 = MemFs {
+            files: RefCell::new(disk),
+            ..Default::default()
+        };
+        let store2 = block_on(FileCacheStore::open(fs2, "cache", "citations", "w2")).unwrap();
+        assert!(
+            block_on(store2.get("doi:keep")).unwrap().is_some(),
+            "the normal record survives a reopen"
+        );
+        assert!(
+            block_on(store2.get("manual:Bohr (1913)")).unwrap().is_none(),
+            "the ephemeral record must be gone after a reopen"
+        );
+    }
+
+    /// An ephemeral record left behind in a pre-existing on-disk file by an
+    /// older build — in the main file *or* a sidecar — is dropped on read, not
+    /// resurrected, and does not survive compaction.
+    #[test]
+    fn pre_existing_on_disk_ephemeral_records_are_dropped() {
+        let fs = MemFs::default();
+        let keep = FileCacheStore::<MemFs>::entry_line("doi:keep", &rec(1000)).unwrap();
+        let eph_main =
+            FileCacheStore::<MemFs>::entry_line("manual:old-main", &ephemeral_rec(0)).unwrap();
+        write_raw(
+            &fs,
+            "cache/citations.jsonl",
+            &alloc::format!("{HEADER}\n{keep}{eph_main}"),
+        );
+        let eph_side =
+            FileCacheStore::<MemFs>::entry_line("manual:old-side", &ephemeral_rec(0)).unwrap();
+        write_raw(&fs, "cache/citations.peer.log", &eph_side);
+
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        assert!(block_on(store.get("doi:keep")).unwrap().is_some());
+        assert!(
+            block_on(store.get("manual:old-main")).unwrap().is_none(),
+            "a main-file ephemeral record must be dropped on load"
+        );
+        assert!(
+            block_on(store.get("manual:old-side")).unwrap().is_none(),
+            "a sidecar ephemeral record must be dropped on load"
+        );
+
+        block_on(store.flush()).unwrap();
+        let files = store.fs.files.borrow();
+        let main = core::str::from_utf8(&files["cache/citations.jsonl"]).unwrap();
+        assert!(main.contains("doi:keep"));
+        assert!(
+            !main.contains("old-main") && !main.contains("old-side"),
+            "compaction must not re-commit the dropped ephemeral records: {main}"
+        );
     }
 
     /// Within one sidecar the LAST-written line for an id wins, regardless of its

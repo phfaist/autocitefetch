@@ -7,11 +7,16 @@
 //!
 //! Entries carry **TTL 0**, so they are re-resolved on every run and never
 //! served from cache — which is free, since resolving is just copying the key.
-//! "TTL 0" is *not* "never written": with a persistent store the record is
-//! still written out and only pruning removes it, and pruning requires
-//! `now >= expires + grace` (14 days). So manual citation text does sit in a
-//! committed `citations.jsonl` for a fortnight after its last use. Nothing
-//! reads it in the meantime.
+//!
+//! TTL 0 makes an entry *ephemeral*: it is kept in the store's in-memory view
+//! for the duration of the run (so `get()` still returns it after `retrieve`),
+//! but is **never persisted** — a persistent [`FileCacheStore`] keeps it out of
+//! the committable `citations.jsonl` and its sidecar logs entirely, and it is
+//! gone the moment the store is reopened. So arbitrary manual citation text
+//! never lands in a git-tracked file. (This is enforced by the store, keyed on
+//! the record's timestamps, not by anything special about this prefix.)
+//!
+//! [`FileCacheStore`]: crate::filecache::FileCacheStore
 
 use alloc::boxed::Box;
 use alloc::string::String;
