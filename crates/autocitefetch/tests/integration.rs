@@ -167,14 +167,16 @@ impl Source for ChainSource {
 #[test]
 fn manual_source_stores_verbatim_text() {
     let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
-        .register("manual", ManualSource::new()).unwrap();
+        .register("manual", ManualSource::new("flm")).unwrap();
 
     let cites = vec![("manual".to_string(), "Bohr, N. (1913)".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
     let item = block_on(mgr.get("manual", "Bohr, N. (1913)")).unwrap();
-    assert_eq!(item["_formatted_text"], "Bohr, N. (1913)");
+    // `_ready_formatted` is a map from format name to text, and the format name
+    // is the one the source was constructed with.
+    assert_eq!(item["_ready_formatted"]["flm"], "Bohr, N. (1913)");
     assert_eq!(item["id"], "manual:Bohr, N. (1913)");
 }
 
@@ -186,7 +188,7 @@ fn manual_source_preserves_key_case_and_whitespace() {
     // — where every other source would have trimmed, and the default policy
     // would also have lowercased.
     let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
-        .register("manual", ManualSource::new()).unwrap();
+        .register("manual", ManualSource::new("flm")).unwrap();
 
     let padded = "  Bohr, N. (1913). ON THE CONSTITUTION of Atoms  ".to_string();
     let cites = vec![("manual".to_string(), padded.clone())];
@@ -195,7 +197,10 @@ fn manual_source_preserves_key_case_and_whitespace() {
 
     // Stored under (and retrievable by) the padded id, whitespace and case intact.
     let item = block_on(mgr.get("manual", &padded)).unwrap();
-    assert_eq!(item["_formatted_text"], padded, "text preserved verbatim");
+    assert_eq!(
+        item["_ready_formatted"]["flm"], padded,
+        "text preserved verbatim"
+    );
     assert_eq!(
         item["id"],
         "manual:  Bohr, N. (1913). ON THE CONSTITUTION of Atoms  ",
@@ -211,6 +216,31 @@ fn manual_source_preserves_key_case_and_whitespace() {
             block_on(mgr.get("manual", other)).is_err(),
             "a manual key must not collapse with {other:?}"
         );
+    }
+}
+
+#[test]
+fn manual_format_name_is_configuration() {
+    // The inner key under `_ready_formatted` is whatever the host said the text
+    // is written in — nothing here assumes the JS reference's hard-coded `flm`.
+    // Two prefixes, two formats, one manager.
+    let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
+        .register("manual", ManualSource::new("latex")).unwrap()
+        .register("html", ManualSource::new("html")).unwrap();
+
+    let cites = vec![
+        ("manual".to_string(), r"Bohr, N. \emph{Phil.\ Mag.} (1913)".to_string()),
+        ("html".to_string(), "Bohr, N. <em>Phil. Mag.</em> (1913)".to_string()),
+    ];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    for (prefix, key) in &cites {
+        let item = block_on(mgr.get(prefix, key)).unwrap();
+        let formatted = item["_ready_formatted"].as_object().expect("a format map");
+        assert_eq!(formatted.len(), 1, "exactly one format is emitted");
+        let format = if prefix == "manual" { "latex" } else { "html" };
+        assert_eq!(formatted[format], key.as_str());
     }
 }
 
@@ -569,7 +599,7 @@ fn a_malformed_doi_is_rejected_without_fetching_anything() {
 #[test]
 fn unknown_prefix_is_reported_not_fatal() {
     let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
-        .register("manual", ManualSource::new()).unwrap();
+        .register("manual", ManualSource::new("flm")).unwrap();
 
     let cites = vec![
         ("nope".to_string(), "x".to_string()),

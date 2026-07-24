@@ -992,7 +992,9 @@ mod tests {
     /// produces for a `manual:` citation.
     fn ephemeral_rec(now_ms: i64) -> CacheRecord {
         CacheRecord {
-            payload: Payload::Concrete(serde_json::json!({"_formatted_text": "Bohr (1913)"})),
+            payload: Payload::Concrete(
+                serde_json::json!({"_ready_formatted": {"flm": "Bohr (1913)"}}),
+            ),
             stale_after: Timestamp::from_millis(now_ms),
             expires: Timestamp::from_millis(now_ms),
         }

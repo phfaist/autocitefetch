@@ -36,7 +36,9 @@ fn record(expires_ms: i64) -> CacheRecord {
 /// so `stale_after == expires`. Must never be persisted.
 fn ephemeral(now_ms: i64) -> CacheRecord {
     CacheRecord {
-        payload: Payload::Concrete(serde_json::json!({"_formatted_text": "Bohr, N. (1913)"})),
+        payload: Payload::Concrete(
+            serde_json::json!({"_ready_formatted": {"flm": "Bohr, N. (1913)"}}),
+        ),
         stale_after: Timestamp::from_millis(now_ms),
         expires: Timestamp::from_millis(now_ms),
     }
@@ -719,7 +721,7 @@ fn manual_citation_is_usable_in_run_but_never_persisted() {
     {
         let store = block_on(SingleFileCacheStore::new(&dir)).expect("open");
         let mgr = CitationManager::new(NoFetch, store, FixedClock(1_000), InstantTimer)
-            .register("manual", ManualSource::new()).unwrap();
+            .register("manual", ManualSource::new("flm")).unwrap();
 
         let cites = vec![("manual".to_string(), text.to_string())];
         let report = block_on(mgr.retrieve(&cites)).expect("retrieve");
@@ -727,7 +729,7 @@ fn manual_citation_is_usable_in_run_but_never_persisted() {
 
         // Within the run (retrieve has flushed), get() still resolves it.
         let item = block_on(mgr.get("manual", text)).expect("get within run");
-        assert_eq!(item["_formatted_text"], text);
+        assert_eq!(item["_ready_formatted"]["flm"], text);
     } // the store (owned by the manager) drops here — simulating process exit.
 
     // The committed file must not carry the citation text.

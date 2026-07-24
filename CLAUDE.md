@@ -211,7 +211,7 @@ across passes, so the second pass of an arXiv→DOI chain cannot hit doi.org wit
 |---|---|---|
 | `arxiv` | 100 / 3100 ms / 10 d | Atom feed parsed with `xmlparser`; version resolution; chains to the prefix set by `chain_dois_to` (default `Some("doi")`) |
 | `doi` | 1 / 1100 ms / 360 d | doi.org content negotiation returns CSL-JSON stored verbatim, values included — the only touch is `canonicalize_doi_key`, which renames a nonstandard lowercase `doi` key up to the CSL-standard uppercase `DOI` (doi.org already sends `DOI`, so it is normally a no-op) |
-| `manual` | ∞ / 0 / **0** | key *is* the formatted text, stored under `_formatted_text`; TTL 0 ⇒ ephemeral (kept in the store's in-memory view for the run, **never persisted** to `citations.jsonl` or a sidecar, gone on restart — enforced by `FileCacheStore`, keyed on `stale_after == expires`, not on the prefix) |
+| `manual` | ∞ / 0 / **0** | key *is* the formatted text, stored under `_ready_formatted: {<format_name>: <text>}` — the format name is a required `ManualSource::new` argument (host config, like a chain prefix; the CLI's `--manual-format` defaults to `flm`, matching JS); TTL 0 ⇒ ephemeral (kept in the store's in-memory view for the run, **never persisted** to `citations.jsonl` or a sidecar, gone on restart — enforced by `FileCacheStore`, keyed on `stale_after == expires`, not on the prefix) |
 | `bib` | ∞ / 0 / 60 s | file(s) fetched through the `Fetcher` (`file:` URLs), indexed by `id` |
 
 arXiv version resolution: an explicitly-versioned key (`1211.1037v2`) resolves to that exact version

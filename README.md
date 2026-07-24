@@ -199,7 +199,7 @@ let store = SingleFileCacheStore::new(".citecache").await?;
 let mgr = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
     .register("arxiv", ArxivSource::new())?
     .register("doi", DoiSource::new())?
-    .register("manual", ManualSource::new())?
+    .register("manual", ManualSource::new("flm"))?
     .register("bib", BibliographyFileSource::new(["file:refs.json".into()]))?
     // Same source type, second prefix, different files — nothing special needed.
     .register("theses", BibliographyFileSource::new(["file:theses.json".into()]))?;
@@ -237,6 +237,7 @@ colon so a `manual:` key can contain colons of its own.
 | `--bib <FILE>`, `--bib-format` | bibliography files or URLs for the `bib` source — **JSON or YAML**, auto-detected |
 | `--arxiv-doi-overrides <FILE>` | JSON/YAML map of arXiv id → DOI; a `null` value suppresses the DOI |
 | `--no-arxiv-chaining` | keep arXiv metadata instead of chaining to doi.org |
+| `--manual-format <NAME>` | markup name a `manual:` text is emitted under — `{"_ready_formatted": {"<NAME>": …}}` (default `flm`) |
 | `--cache-dir`, `--cache-name` | where the cache lives (default: `.citations` in the working directory) |
 | `--output`, `--compact`, `--user-agent`, `--verbose` | |
 

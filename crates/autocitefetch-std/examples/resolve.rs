@@ -76,7 +76,7 @@ fn main() {
     let manager = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
         .register("doi", DoiSource::new())
         .expect("register doi source")
-        .register("manual", ManualSource::new())
+        .register("manual", ManualSource::new("flm"))
         .expect("register manual source")
         .register("bib", BibliographyFileSource::new([bib_url]))
         .expect("register bibliography source");

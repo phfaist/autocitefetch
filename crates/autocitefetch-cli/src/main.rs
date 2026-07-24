@@ -210,7 +210,9 @@ fn build_manager(
                 BibliographyFileSource::new(cli.bib.iter().cloned())
                     .with_parser(formats::parser_for(cli.bib_format)),
             ),
-            SourceKind::Manual => manager.register(prefix, ManualSource::new()),
+            SourceKind::Manual => {
+                manager.register(prefix, ManualSource::new(cli.manual_format()))
+            }
         }
         .map_err(|e| format!("registering the `{prefix}` source: {e}"))?;
     }
@@ -249,6 +251,9 @@ fn warn_about_unusable_options(cli: &Cli, cites: &[(String, String)], sources: &
         && (cli.arxiv_doi_overrides.is_some() || cli.no_arxiv_chaining)
     {
         warn("the `arxiv` source is disabled; its options will be ignored");
+    }
+    if !enabled(SourceKind::Manual) && cli.manual_format.is_some() {
+        warn("the `manual` source is disabled; --manual-format will be ignored");
     }
     if cli.drop_field.iter().any(|f| f == "id") {
         // Harmless — the manager stamps the id on *after* dropping — but say so

@@ -134,6 +134,14 @@ pub struct Cli {
     #[arg(long)]
     pub no_arxiv_chaining: bool,
 
+    /// Markup format the `manual:` citation texts are written in.
+    ///
+    /// A manual entry is emitted as `{"_ready_formatted": {"<NAME>": "<text>"}}`,
+    /// so this is what tells a downstream renderer how to read the text.
+    /// Defaults to `flm`.
+    #[arg(long, value_name = "NAME")]
+    pub manual_format: Option<String>,
+
     /// Drop this top-level CSL field from every entry. Repeatable.
     ///
     /// Applied before an entry is cached, so bulky fields nobody cites —
@@ -161,7 +169,20 @@ pub struct Cli {
     pub verbose: bool,
 }
 
+/// Format name given to [`ManualSource`](autocitefetch::source::ManualSource)
+/// when `--manual-format` is not passed: what the JS reference hard-codes.
+pub const DEFAULT_MANUAL_FORMAT: &str = "flm";
+
 impl Cli {
+    /// The `--manual-format` value, or [`DEFAULT_MANUAL_FORMAT`].
+    ///
+    /// The flag is an `Option` rather than a clap `default_value` so that
+    /// `warn_about_unusable_options` can tell "asked for" from "not mentioned"
+    /// and warn when the `manual` source is disabled.
+    pub fn manual_format(&self) -> &str {
+        self.manual_format.as_deref().unwrap_or(DEFAULT_MANUAL_FORMAT)
+    }
+
     /// The sources to register: all of them, narrowed by `--enable`, then by
     /// `--disable`.
     pub fn enabled_sources(&self) -> Vec<SourceKind> {
