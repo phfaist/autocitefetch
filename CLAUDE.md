@@ -120,11 +120,23 @@ std crate supplies only real filesystem ops (`StdCacheFs`) and the `SingleFileCa
 Layout in one directory: `citations.jsonl` (header line 0 + one sorted entry per line — the only
 file worth committing), per-writer `citations.<pid>-<nanos>.log` append logs (lock-free writes), and
 `citations.lock`. `flush()` is the *only* operation that locks or rewrites the whole file: it folds
-main + all sidecars, atomically replaces the main file, and then deletes **only its own** sidecar.
-It must not delete a peer's: the lock serializes compaction against *compaction*, never against the
-lock-free `append`, so unlinking a peer's log destroys any write that landed after the fold read it
-(measured: ~300 of 400 acknowledged puts lost). The cost of that fix is that a **crashed** writer's
-sidecar is never reaped — reaping it needs a `CacheFs::try_lock_exclusive` that does not exist yet.
+main + all sidecars, atomically replaces the main file, then reaps its own sidecar **plus any
+crashed peer's**. It must never delete a *live* peer's: the compaction lock serializes compaction
+against *compaction*, never against the lock-free `append`, so unlinking a live peer's log destroys
+any write that landed after the fold read it (measured: ~300 of 400 acknowledged puts lost).
+
+Live-vs-crashed is told apart by an **OS-advisory liveness lock**. On `open` a writer takes and
+holds — for the store's whole lifetime — an exclusive `CacheFs::try_lock_exclusive` on a companion
+file `citations.<writer>.log.lock` next to its sidecar; the kernel releases it if the process
+crashes. When `flush` folds a peer's sidecar it tries that peer's companion lock: **held** (`Ok(None)`)
+⇒ owner alive ⇒ fold read-only, never delete; **acquired** (`Ok(Some)`) ⇒ owner gone ⇒ delete the
+log and its orphaned companion (the fold already captured its lines). The companion is a *separate*
+file from the `.log` so reaping our own sidecar each flush never orphans the lock we hold — a writer
+never `try_lock`s its own companion (self-deadlock) and deletes its own `.log` unconditionally. A
+foreign `citations.*.log` with no companion is folded but never reaped, same as round 1. The stored
+guard is `CacheFs::Guard` (an associated type, not `Box<dyn CacheGuard>`) so `FileCacheStore<StdCacheFs>`
+stays `Send` — the concurrent regression test still moves stores across threads. A failed unlink
+never fails the flush.
 
 Merge rule (all exercised by unit tests): **last write wins over a deterministic total fold order** —
 the main file first (the baseline written at the last compaction), then each sidecar in sorted name

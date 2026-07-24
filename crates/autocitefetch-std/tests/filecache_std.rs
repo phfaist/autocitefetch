@@ -32,6 +32,22 @@ fn record(expires_ms: i64) -> CacheRecord {
     }
 }
 
+/// Names of the sidecar append logs in `dir` — files ending in `.log` but not
+/// `.log.lock` (the companion liveness lock). Sorted for stable assertions.
+fn list_sidecars(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".log") {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 #[test]
 fn put_flush_reopen_roundtrip_leaves_single_committed_file() {
     let tmp = tempfile::tempdir().expect("temp dir");
@@ -199,6 +215,95 @@ fn concurrent_writer_appends_are_not_eaten_by_a_peer_flush() {
         "{} of {N} acknowledged puts were destroyed by the peer's flush: {:?}…",
         missing.len(),
         &missing[..missing.len().min(5)]
+    );
+}
+
+/// Reaping a *crashed* writer's sidecar. Writer A records an entry and then is
+/// dropped without flushing — simulating a crash, which releases the liveness
+/// lock A held for its whole life and leaves its `citations.<A>.log` behind.
+/// A fresh writer B must fold A's orphaned data into the committed file and,
+/// finding A's liveness lock free, reap the stray sidecar (and its companion).
+#[test]
+fn a_crashed_writers_sidecar_is_reaped() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("cache");
+
+    let a = block_on(SingleFileCacheStore::new(&dir)).expect("open A");
+    block_on(a.put("doi:crashed", record(1234))).expect("A put");
+
+    // A's stray sidecar is on disk before the crash.
+    let before = list_sidecars(&dir);
+    assert_eq!(before.len(), 1, "exactly A's sidecar present, found {before:?}");
+    drop(a); // crash: the lifetime lock is released, the sidecar orphaned.
+
+    let b = block_on(SingleFileCacheStore::new(&dir)).expect("open B");
+    block_on(b.flush()).expect("B flush");
+
+    // A's entry survived into the committed file.
+    assert!(
+        block_on(b.get("doi:crashed")).expect("get").is_some(),
+        "the crashed writer's data must be folded into the main file"
+    );
+    let text = std::fs::read_to_string(dir.join("citations.jsonl")).expect("read main");
+    assert!(text.contains("doi:crashed"), "committed file holds A's entry");
+
+    // The stray sidecar — and its now-orphaned companion lock — are reaped.
+    let after = list_sidecars(&dir);
+    assert!(
+        after.is_empty(),
+        "the crashed writer's sidecar must be reaped, found {after:?}"
+    );
+    for name in &before {
+        assert!(
+            !dir.join(format!("{name}.lock")).exists(),
+            "the crashed writer's orphaned companion lock must be reaped too"
+        );
+    }
+}
+
+/// The mirror of the above: a *live* writer's sidecar must survive a peer's
+/// flush. A holds its liveness lock; B compacts while A is alive and must fold
+/// A's log read-only without unlinking it — and A's own later work must not be
+/// lost. If reaping ignored the lock, B would delete A's live sidecar here.
+#[test]
+fn a_live_writers_sidecar_is_not_reaped() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("cache");
+
+    let a = block_on(SingleFileCacheStore::new(&dir)).expect("open A");
+    block_on(a.put("doi:from-a", record(1234))).expect("A put");
+
+    let sidecars = list_sidecars(&dir);
+    assert_eq!(sidecars.len(), 1, "A's sidecar present, found {sidecars:?}");
+    let a_sidecar = sidecars[0].clone();
+
+    // B compacts while A is still alive and holding its liveness lock.
+    let b = block_on(SingleFileCacheStore::new(&dir)).expect("open B");
+    block_on(b.flush()).expect("B flush");
+
+    // The discriminating assertion: A's sidecar is untouched.
+    assert!(
+        dir.join(&a_sidecar).is_file(),
+        "a live writer's sidecar must survive a peer's flush"
+    );
+
+    // A keeps working: a later put + flush must not be lost, and A's earlier
+    // acknowledged put (which B folded) must still be present too.
+    block_on(a.put("doi:from-a-again", record(5678))).expect("A second put");
+    block_on(a.flush()).expect("A flush");
+
+    drop(a);
+    drop(b);
+    let reader = block_on(SingleFileCacheStore::new(&dir)).expect("reopen");
+    assert!(
+        block_on(reader.get("doi:from-a")).expect("get").is_some(),
+        "A's first put (folded by B) must survive"
+    );
+    assert!(
+        block_on(reader.get("doi:from-a-again"))
+            .expect("get")
+            .is_some(),
+        "A's later put must not be lost"
     );
 }
 

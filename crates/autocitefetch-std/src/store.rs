@@ -9,22 +9,27 @@
 //!
 //! ```gitignore
 //! citations.*.log
+//! citations.*.log.lock
 //! citations.lock
 //! citations.jsonl.tmp
 //! ```
 //!
 //! # What the store touches in that directory
 //!
-//! * It **writes** `citations.jsonl`, `citations.jsonl.tmp`, `citations.lock`
-//!   and its own `citations.<writer>.log`.
-//! * It **deletes** exactly one file, ever: its own `citations.<writer>.log`.
-//!   No other file in the directory is removed — not another process's
-//!   sidecar, not a file you put there yourself.
+//! * It **writes** `citations.jsonl`, `citations.jsonl.tmp`, `citations.lock`,
+//!   its own `citations.<writer>.log`, and its own companion liveness lock
+//!   `citations.<writer>.log.lock` (held open for the store's whole life; the
+//!   OS releases it if the process crashes).
+//! * It **deletes** its own `citations.<writer>.log`, and — only once their
+//!   owning process is proven dead via that companion lock — a *crashed* peer's
+//!   `citations.<peer>.log` plus its `citations.<peer>.log.lock`. A **live**
+//!   peer's sidecar, the main file, and any file you put there yourself are
+//!   never removed.
 //! * It **reads** every `citations.<something>.log` in the directory and folds
-//!   it into the cache. So while a stray `citations.notes.log` of your own is
-//!   never deleted, its contents are parsed (and, unless they happen to be
-//!   cache entries, ignored). Prefer a different name, or a different
-//!   directory, for unrelated files.
+//!   it into the cache. A stray `citations.notes.log` of your own has no
+//!   companion `.log.lock`, so it is never reaped, but its contents are parsed
+//!   (and, unless they happen to be cache entries, ignored). Prefer a different
+//!   name, or a different directory, for unrelated files.
 //!
 //! All the interesting logic lives in the core [`FileCacheStore`]; this module
 //! only provides the real filesystem operations it needs.
@@ -41,6 +46,8 @@ use autocitefetch::{
 pub struct StdCacheFs;
 
 impl CacheFs for StdCacheFs {
+    type Guard = StdGuard;
+
     fn read(&self, path: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, FsError>> {
         let path = path.to_string();
         Box::pin(async move {
@@ -145,11 +152,41 @@ impl CacheFs for StdCacheFs {
             Ok(Box::new(StdGuard { file }) as Box<dyn CacheGuard>)
         })
     }
+
+    fn try_lock_exclusive(
+        &self,
+        path: &str,
+    ) -> BoxFuture<'_, Result<Option<StdGuard>, FsError>> {
+        let path = path.to_string();
+        Box::pin(async move {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false) // a lock file: never wipe it, we only lock it
+                .open(&path)
+                .map_err(fs_err)?;
+            // Non-blocking exclusive advisory lock. Fully-qualified to fs4's
+            // trait method for the same MSRV reason as `lock_exclusive` (std's
+            // inherent `File::try_lock` stabilized in 1.89, past our MSRV).
+            // fs4 returns `Ok(())` on acquire and a `WouldBlock` error when the
+            // lock is already held elsewhere — that latter case is `Ok(None)`,
+            // not an error (it is exactly the "owner alive" signal).
+            match fs4::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => Ok(Some(StdGuard { file })),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(fs_err(e)),
+            }
+        })
+    }
 }
 
 /// A held exclusive lock. Owns the locked `File`; dropping it releases the
-/// advisory lock.
-struct StdGuard {
+/// advisory lock. Public only because it is [`StdCacheFs`]'s
+/// [`CacheFs::Guard`](autocitefetch::CacheFs::Guard) associated type; it has no
+/// API of its own beyond being held and dropped. Being `Send` (it owns just a
+/// `File`) is what keeps a `FileCacheStore<StdCacheFs>` movable across threads.
+pub struct StdGuard {
     file: std::fs::File,
 }
 

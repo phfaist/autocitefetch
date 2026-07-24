@@ -76,11 +76,13 @@ chained targets and fetches them; `get()` walks the chain on read.
 * `citations.<writer>.log` — per-writer append logs. Writes go here lock-free
   and are folded into the main file by `flush()` (called at the end of
   `retrieve`/`prune`), which is the only operation that takes the lock or
-  rewrites the whole file. `flush()` folds *every* sidecar it finds but deletes
-  only **its own** — deleting a peer's would race its lock-free appends and
-  destroy acknowledged writes. Consequence: a sidecar left by a **crashed**
-  writer is never reaped. Delete stray `citations.*.log` files by hand while no
-  writer is running.
+  rewrites the whole file. `flush()` folds *every* sidecar it finds but only
+  deletes **its own** and any left by a **crashed** peer — never a live peer's,
+  since that would race its lock-free appends and destroy acknowledged writes.
+* `citations.<writer>.log.lock` — a per-writer **liveness lock**, held open for
+  the store's whole life. `flush()` reaps a peer's sidecar only when it can take
+  that peer's lock (the OS frees it when the owner process crashes); a held lock
+  means the owner is alive, so the sidecar is folded read-only and left in place.
 * `citations.lock` — the compaction lockfile.
 * `citations.jsonl.tmp` — the staging file for the atomic replace.
 
@@ -88,6 +90,7 @@ So commit the first and ignore the rest:
 
 ```gitignore
 citations.*.log
+citations.*.log.lock
 citations.lock
 citations.jsonl.tmp
 ```

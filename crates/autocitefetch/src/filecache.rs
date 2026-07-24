@@ -53,34 +53,57 @@
 //!
 //! # Which files compaction may delete
 //!
-//! Exactly one: `{base}.{writer_id}.log`, *this* store's own sidecar, and only
-//! when that compaction actually folded it in. Every other file in the
-//! directory — peers' sidecars, the main file, the lockfile, anything the user
-//! happens to keep there — is only ever **read**.
+//! Its own sidecar always, and a peer's sidecar only once that peer is proven
+//! dead. The main file, the lockfile, and anything else the user keeps in the
+//! directory are only ever **read**.
 //!
-//! This is not fussiness, it is the correctness argument. The lock serializes
-//! compaction against *compaction*; it does **not** serialize compaction
-//! against `append`, which takes no lock at all. A peer's `put` can therefore
-//! land after this writer's fold has read that peer's sidecar and before the
-//! rewrite completes — an acknowledged, on-disk write that the peer has been
-//! promised. Deleting the peer's sidecar at that point destroys it (and, since
-//! `flush` rebuilds `mem` purely from disk, the peer's own next flush would
-//! then erase its in-memory copy too). Re-folding somebody else's log instead
-//! is idempotent — the fold is a deterministic last-write-wins replay of the
-//! main file then every sidecar in a fixed order, so re-applying the same bytes
-//! reaches the same map — and each peer reaps its own log on its next flush.
+//! Deleting a *live* peer's sidecar is the data-loss bug this design guards
+//! against. The compaction lock serializes compaction against *compaction*; it
+//! does **not** serialize compaction against `append`, which takes no lock at
+//! all. A live peer's `put` can therefore land after this writer's fold has
+//! read that peer's sidecar and before the rewrite completes — an acknowledged,
+//! on-disk write that the peer has been promised. Unlinking the sidecar then
+//! destroys it (and, since `flush` rebuilds `mem` purely from disk, the peer's
+//! own next flush would erase its in-memory copy too). Re-folding a live peer's
+//! log instead is idempotent — the fold is a deterministic last-write-wins
+//! replay of the main file then every sidecar in a fixed order, so re-applying
+//! the same bytes reaches the same map.
 //!
-//! Known trade-off: a sidecar whose owning writer **crashed** is now never
-//! reaped (its writer id is never reused, so nobody claims it). It accumulates
-//! in the directory, and its lines are re-folded on every compaction forever.
-//! For entry lines that is merely wasted work; for a *tombstone* it is worse —
-//! an orphaned `{"id":…,"del":true}` re-deletes that id on every compaction,
-//! so a subsequent re-fetch is committed and then dropped again on the next
-//! flush. Reaping such a log safely needs a way to prove the owner is gone — a
-//! `CacheFs::try_lock_exclusive`, which a live appender would hold and a dead
-//! one would not — and that is a trait change, left as follow-up work. Until
-//! then, deleting stray `{base}.*.log` files is a safe manual cleanup while no
-//! writer is running.
+//! # Liveness locks — reaping a crashed writer's sidecar safely
+//!
+//! A sidecar left behind by a *crashed* writer must still be reclaimed: its
+//! writer id is never reused, so nobody rewrites it, and its lines are re-folded
+//! on every compaction forever. For a plain entry that is only wasted work; for
+//! a **tombstone** it is a correctness bug — an orphaned `{"id":…,"del":true}`
+//! re-deletes that id on every compaction, so a later re-fetch is committed and
+//! then dropped again on the next flush.
+//!
+//! The distinction between a live owner and a dead one is an OS-advisory
+//! **liveness lock**. On `open`, a writer takes and holds — for the whole life
+//! of the store — an exclusive [`CacheFs::try_lock_exclusive`] on a companion
+//! file `{base}.{writer_id}.log.lock` sitting next to its sidecar. The lock is
+//! held by the process, not written into any file, so the kernel releases it
+//! automatically when the process exits or crashes. When `flush` folds a
+//! **peer's** sidecar it then tries that peer's companion lock:
+//!
+//! * lock **held** (`Ok(None)`) ⇒ the owner is alive and may be appending
+//!   lock-free right now ⇒ fold read-only, never delete (the rule above);
+//! * lock **acquired** (`Ok(Some)`) ⇒ the OS released it on the owner's death
+//!   ⇒ the sidecar is abandoned, so — its lines already captured by this same
+//!   fold — delete both it and its now-orphaned companion, then drop the guard.
+//!
+//! The companion lock is a *separate* file from the sidecar precisely so that a
+//! writer reaping its **own** sidecar every flush never orphans its liveness
+//! lock onto a deleted inode. A writer therefore never `try_lock`s its own
+//! companion (that would self-deadlock); it deletes its own `.log`
+//! unconditionally, exactly as before, and keeps holding the companion lock.
+//!
+//! A foreign `{base}.*.log` that no managed writer ever created has **no**
+//! companion lock file, so `flush` finds none to probe and leaves it untouched
+//! — a stray or hand-placed log is folded (read-only) but never reaped, the
+//! same guarantee as for the main file. A failed unlink is never a failed
+//! flush: the data is already durable in the main file and a surviving sidecar
+//! is merely re-folded (idempotently) next time.
 //!
 //! Because a store deletes its own sidecar, `flush` must not be polled
 //! concurrently with a `put`/`remove` *on the same store*; the core is
@@ -135,15 +158,24 @@ impl fmt::Display for FsError {
 impl core::error::Error for FsError {}
 
 /// An opaque, held lock guard. The host returns one from
-/// [`CacheFs::lock_exclusive`]; dropping it releases the lock. The trait is
-/// intentionally empty — the core only ever *holds* a guard for the duration
-/// of a compaction and lets `Drop` do the work.
+/// [`CacheFs::lock_exclusive`] or [`CacheFs::try_lock_exclusive`]; dropping it
+/// releases the lock. The trait is intentionally empty — the core only ever
+/// *holds* a guard (for a compaction, or for a store's whole lifetime as a
+/// liveness signal) and lets `Drop` do the work.
 pub trait CacheGuard {}
 
 /// Host-provided filesystem, injected so the store can run `no_std` (native
 /// files, or something else entirely on WASM). All methods are async and
 /// object-safe; paths use `/` separators and are built by the store.
 pub trait CacheFs {
+    /// The held-lock type [`try_lock_exclusive`](CacheFs::try_lock_exclusive)
+    /// hands back and that a store keeps alive for its whole lifetime. A
+    /// concrete associated type rather than a `Box<dyn CacheGuard>` on purpose:
+    /// it lets a [`FileCacheStore`] stay `Send` whenever the host's guard is
+    /// (the std store is moved across threads in tests, even though its futures
+    /// are `!Send`), which a boxed `dyn CacheGuard` field would forfeit.
+    type Guard: CacheGuard;
+
     /// Read a whole file. `Ok(None)` means the file is absent (not an error).
     fn read(&self, path: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, FsError>>;
 
@@ -163,6 +195,18 @@ pub trait CacheFs {
     /// Take an exclusive advisory lock on `path`, returning a held guard.
     /// Dropping the guard releases the lock.
     fn lock_exclusive(&self, path: &str) -> BoxFuture<'_, Result<Box<dyn CacheGuard>, FsError>>;
+
+    /// **Non-blocking** exclusive advisory lock on `path`, creating the file if
+    /// absent (like [`lock_exclusive`](CacheFs::lock_exclusive)). Returns
+    /// `Ok(Some(guard))` when the lock was free and is now held by the returned
+    /// guard, or `Ok(None)` when some other holder already has it. Used as a
+    /// liveness probe: a writer holds one of these on its own sidecar's
+    /// companion for its whole life, so a peer's `flush` can reclaim that
+    /// sidecar only once the lock comes free (i.e. the owner process is gone).
+    fn try_lock_exclusive(
+        &self,
+        path: &str,
+    ) -> BoxFuture<'_, Result<Option<Self::Guard>, FsError>>;
 }
 
 // --- on-disk line shapes ---------------------------------------------------
@@ -235,6 +279,13 @@ pub struct FileCacheStore<Fs: CacheFs> {
     sidecar: String,
     /// `{dir}/{base}.lock`.
     lockfile: String,
+    /// The liveness lock on `sidecar_lock`, taken at `open` and held until the
+    /// store drops. Its being held is the signal a peer's `flush` reads to
+    /// decide our sidecar is live and must not be reaped; the OS releases it if
+    /// this process crashes. Normally `Some` — `None` only if the (unique)
+    /// writer id somehow collided with a live holder, in which case we simply
+    /// forgo the protection rather than fail to open.
+    lifelock: Option<Fs::Guard>,
     /// The authoritative in-memory view; reads clone out of it.
     mem: RefCell<BTreeMap<String, CacheRecord>>,
 }
@@ -244,6 +295,7 @@ impl<Fs: CacheFs> fmt::Debug for FileCacheStore<Fs> {
         f.debug_struct("FileCacheStore")
             .field("main", &self.main)
             .field("writer_id", &self.writer_id)
+            .field("live", &self.lifelock.is_some())
             .field("entries", &self.mem.borrow().len())
             .finish()
     }
@@ -265,9 +317,19 @@ impl<Fs: CacheFs> FileCacheStore<Fs> {
         let main = alloc::format!("{dir}/{base}.jsonl");
         let sidecar_name = alloc::format!("{base}.{writer_id}.log");
         let sidecar = alloc::format!("{dir}/{sidecar_name}");
+        // The companion liveness-lock path for this writer's sidecar: a
+        // *separate* file from the sidecar, so reaping our own `.log` every
+        // flush never orphans the lock we are about to take on this one.
+        let sidecar_lock = alloc::format!("{sidecar}.lock");
         let lockfile = alloc::format!("{dir}/{base}.lock");
 
         let merged = load_merged(&fs, &dir, &base).await.map_err(fs_store)?;
+
+        // Take this writer's liveness lock and hold it for the store's lifetime.
+        // A peer reaps our sidecar only when it can take this lock, which it
+        // never can while we are alive; the OS frees it if we crash. The writer
+        // id is unique per process run, so this normally always succeeds.
+        let lifelock = fs.try_lock_exclusive(&sidecar_lock).await.map_err(fs_store)?;
 
         Ok(FileCacheStore {
             fs,
@@ -278,6 +340,7 @@ impl<Fs: CacheFs> FileCacheStore<Fs> {
             sidecar_name,
             sidecar,
             lockfile,
+            lifelock,
             mem: RefCell::new(merged.map),
         })
     }
@@ -352,12 +415,14 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
 
     /// Compaction: the only operation that locks and the only one that
     /// rewrites the whole file. Folds the main file and every sidecar into one
-    /// map, writes it back atomically, deletes **only this writer's own**
-    /// sidecar, and refreshes the in-memory view.
+    /// map, writes it back atomically, reaps this writer's own sidecar plus any
+    /// **provably-dead** peer's sidecar (see the liveness-lock section of the
+    /// module docs), and refreshes the in-memory view.
     ///
-    /// See the module docs for why peers' sidecars are read but never unlinked
-    /// (the lock serializes compaction against compaction, never against a
-    /// lock-free `append`).
+    /// A *live* peer's sidecar is read but never unlinked — the compaction lock
+    /// serializes compaction against compaction, never against a lock-free
+    /// `append`, so unlinking a live peer's log would destroy an acknowledged
+    /// write. The liveness lock is what distinguishes a live peer from a crash.
     fn flush(&self) -> BoxFuture<'_, Result<(), StoreError>> {
         Box::pin(async move {
             // Hold the guard for the whole critical section; dropping it at the
@@ -392,13 +457,39 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
                 .await
                 .map_err(fs_store)?;
 
-            // Reap our own log — and only if this compaction actually folded it
-            // in, so the unlink can never drop writes we did not just persist.
-            // A failed unlink is not a failed flush: the data is already
-            // durable in the main file and the stale sidecar is simply re-folded
-            // (idempotently) next time.
-            if merged.folded.iter().any(|name| name == &self.sidecar_name) {
-                let _ = self.fs.remove(&self.sidecar).await;
+            // Reap the sidecars this fold captured and can prove safe to unlink.
+            // A failed unlink is never a failed flush: the data is already
+            // durable in the main file and any surviving sidecar is simply
+            // re-folded (idempotently) next time.
+            for name in &merged.folded {
+                if name == &self.sidecar_name {
+                    // Our own log: reap unconditionally, exactly as before. We
+                    // still hold our liveness lock — it lives on the *separate*
+                    // `sidecar_lock` companion, never on the log we delete here,
+                    // so this unlink can never orphan it, and we must never
+                    // `try_lock` our own companion (that would self-deadlock).
+                    let _ = self.fs.remove(&self.sidecar).await;
+                    continue;
+                }
+                // A peer's log. Reap it only if its owner is provably gone. A
+                // managed sidecar always has a companion `{name}.lock` on disk;
+                // a foreign `*.log` no writer ever created has none, so probe
+                // first — never create a companion for, and therefore never
+                // reap, a file no writer owns.
+                let peer_lock = alloc::format!("{}/{name}.lock", self.dir);
+                if !matches!(self.fs.read(&peer_lock).await, Ok(Some(_))) {
+                    continue;
+                }
+                // Held (`Ok(None)`) ⇒ owner alive, leave it be. Acquired
+                // (`Ok(Some)`) ⇒ the OS released it on the owner's death, so the
+                // log is abandoned; its lines were already captured by the fold
+                // above, so delete both it and its now-orphaned companion.
+                if let Ok(Some(_reaped)) = self.fs.try_lock_exclusive(&peer_lock).await {
+                    let peer_log = alloc::format!("{}/{name}", self.dir);
+                    let _ = self.fs.remove(&peer_log).await;
+                    let _ = self.fs.remove(&peer_lock).await;
+                    // `_reaped` drops here, releasing the lock we just took.
+                }
             }
 
             *self.mem.borrow_mut() = merged.map;
@@ -644,9 +735,17 @@ mod tests {
 
     // --- an in-memory CacheFs mock -----------------------------------------
 
+    use alloc::collections::BTreeSet;
+    use alloc::rc::Rc;
+
     #[derive(Default)]
     struct MemFs {
         files: RefCell<BTreeMap<String, Vec<u8>>>,
+        /// Paths whose advisory lock is currently *held*. `try_lock_exclusive`
+        /// returns `None` for a path already in here and otherwise inserts it,
+        /// so the two-writer reap tests are meaningful rather than vacuous. The
+        /// `Rc` lets a held-lock guard share the set and drop-release its path.
+        locks: Rc<RefCell<BTreeSet<String>>>,
         /// When set, every `remove` fails — used to prove a failed sidecar
         /// unlink does not fail an otherwise successful compaction.
         remove_fails: core::cell::Cell<bool>,
@@ -655,7 +754,21 @@ mod tests {
     struct NoopGuard;
     impl CacheGuard for NoopGuard {}
 
+    /// A held liveness lock on the `MemFs`: releases its path on drop, exactly
+    /// as an OS advisory lock is released when the holding process exits.
+    struct MemGuard {
+        locks: Rc<RefCell<BTreeSet<String>>>,
+        path: String,
+    }
+    impl CacheGuard for MemGuard {}
+    impl Drop for MemGuard {
+        fn drop(&mut self) {
+            self.locks.borrow_mut().remove(&self.path);
+        }
+    }
+
     impl CacheFs for MemFs {
+        type Guard = MemGuard;
         fn read(&self, path: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, FsError>> {
             let v = self.files.borrow().get(path).cloned();
             Box::pin(async move { Ok(v) })
@@ -699,6 +812,29 @@ mod tests {
             _path: &str,
         ) -> BoxFuture<'_, Result<Box<dyn CacheGuard>, FsError>> {
             Box::pin(async move { Ok(Box::new(NoopGuard) as Box<dyn CacheGuard>) })
+        }
+        fn try_lock_exclusive(
+            &self,
+            path: &str,
+        ) -> BoxFuture<'_, Result<Option<MemGuard>, FsError>> {
+            // Create the lock file if absent, mirroring the std impl's
+            // `create(true)` — so an existence probe over a real companion
+            // behaves the same on the mock.
+            self.files
+                .borrow_mut()
+                .entry(path.to_string())
+                .or_default();
+            // `insert` returns false when the path is already held.
+            let acquired = self.locks.borrow_mut().insert(path.to_string());
+            let out = if acquired {
+                Ok(Some(MemGuard {
+                    locks: self.locks.clone(),
+                    path: path.to_string(),
+                }))
+            } else {
+                Ok(None)
+            };
+            Box::pin(async move { out })
         }
     }
 
@@ -1004,6 +1140,85 @@ mod tests {
         }
         assert_eq!(block_on(store.entries()).unwrap().len(), 1);
         assert!(block_on(store.get("doi:1")).unwrap().is_some());
+    }
+
+    /// The liveness-lock reap branch. A crashed peer — sidecar **and** a
+    /// companion `.log.lock` on disk, but nothing holding the lock — is folded
+    /// and then unlinked together with its orphaned companion; a live peer —
+    /// companion lock **held**, as if its owner process were alive — is folded
+    /// read-only and left in place. Exercises both `try_lock_exclusive` arms in
+    /// `flush` (`Ok(Some)` reaps, `Ok(None)` leaves alone).
+    #[test]
+    fn crashed_peer_is_reaped_but_live_peer_is_not() {
+        let fs = MemFs::default();
+        // A crashed writer: sidecar + companion lock both exist, lock unheld.
+        write_raw(
+            &fs,
+            "cache/citations.dead.log",
+            &FileCacheStore::<MemFs>::entry_line("doi:dead", &rec(1000)).unwrap(),
+        );
+        write_raw(&fs, "cache/citations.dead.log.lock", "");
+        // A live writer: sidecar + companion both exist, and the companion is
+        // held (as its owner's lifelock would hold it for the store's life).
+        write_raw(
+            &fs,
+            "cache/citations.alive.log",
+            &FileCacheStore::<MemFs>::entry_line("doi:alive", &rec(1000)).unwrap(),
+        );
+        write_raw(&fs, "cache/citations.alive.log.lock", "");
+        fs.locks
+            .borrow_mut()
+            .insert("cache/citations.alive.log.lock".to_string());
+
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        block_on(store.flush()).unwrap();
+
+        // Both writers' entries were folded into the committed file.
+        assert!(block_on(store.get("doi:dead")).unwrap().is_some());
+        assert!(block_on(store.get("doi:alive")).unwrap().is_some());
+
+        let files = store.fs.files.borrow();
+        assert!(
+            !files.contains_key("cache/citations.dead.log"),
+            "a crashed peer's sidecar must be reaped"
+        );
+        assert!(
+            !files.contains_key("cache/citations.dead.log.lock"),
+            "the crashed peer's orphaned companion lock must be reaped too"
+        );
+        assert!(
+            files.contains_key("cache/citations.alive.log"),
+            "a live peer's sidecar must never be reaped"
+        );
+        assert!(
+            files.contains_key("cache/citations.alive.log.lock"),
+            "a live peer's companion lock must never be reaped"
+        );
+    }
+
+    /// A foreign `citations.*.log` with **no** companion lock file is folded but
+    /// never reaped — the reap path must not create a companion for, and then
+    /// delete, a file no writer ever managed.
+    #[test]
+    fn peer_log_without_a_companion_lock_is_never_reaped() {
+        let fs = MemFs::default();
+        write_raw(
+            &fs,
+            "cache/citations.orphan.log",
+            &FileCacheStore::<MemFs>::entry_line("doi:x", &rec(1000)).unwrap(),
+        );
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        block_on(store.flush()).unwrap();
+
+        let files = store.fs.files.borrow();
+        assert!(
+            files.contains_key("cache/citations.orphan.log"),
+            "a companion-less peer log must be left untouched"
+        );
+        assert!(
+            !files.contains_key("cache/citations.orphan.log.lock"),
+            "the reap probe must not create a companion lock for it"
+        );
     }
 
     /// A failed unlink must not turn a durably persisted compaction into an
