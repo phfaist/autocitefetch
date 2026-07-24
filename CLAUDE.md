@@ -36,7 +36,14 @@ only what you touch (or leave formatting alone) rather than running it workspace
 Nothing else returns CSL data.
 
 1. `manager.retrieve(&[(prefix, key), …])` → `RetrieveReport { failures }`. Per-citation tolerant:
-   one bad citation never aborts the batch, and only *store* errors produce `Err`.
+   one bad citation never aborts the batch, and only *store* errors produce `Err`. Each
+   `CiteFailure` carries `prefix`/`key` (the citation that *actually* failed — the chain **target**
+   when the failure is on a chained descendant) plus `origin: Option<(String,String)>`: `None` for a
+   directly-requested cite, `Some(requested)` naming the request a chained-target failure descends
+   from. Guarantee: every requested cite that ultimately fails is discoverable in `failures` either
+   directly (matching `(prefix,key)`) or via a failure whose `origin` is it — so a caller joining the
+   report against its input `cites` never wrongly concludes a cite succeeded (only for `get()` to
+   later break on the chain). `origin.unwrap_or((prefix,key))` recovers the failed request.
 2. `manager.get(prefix, key)` → `CslValue`. Walks chain pointers, merges `set_properties`, and
    rewrites `id` back to the originally requested `"prefix:key"`.
 
@@ -77,6 +84,13 @@ A worklist loop, not a fixed pipeline:
   old chained record, the target is pushed from the failure path instead.
 - Worklist items carry a **depth**; `max_chain_depth` (default 16, `with_max_chain_depth`) bounds
   `retrieve` as well as `get`, so retrieval never fetches links `get()` could not reach.
+- Worklist items also carry an **origin** — the originally-requested `(prefix, key)` the item
+  descends from (itself for a requested cite). Every push of a chain target (kept-pointer during
+  bucketing, `Outcome::Chained` store arm, grace-served pointer in `note_failure`) inherits the
+  current item's origin, so a multi-hop chain still points back to the root request. The dedup set
+  (`seen`) records `(depth, origin)` per id; `store_resolutions` reads it back so any `CiteFailure`
+  it builds is attributed correctly. First-writer-wins: a directly-requested cite is in the initial
+  batch, so it is recorded before any chain could reach the same id — it is never mis-attributed.
 - Buckets are driven concurrently with `buffer_unordered(MAX_CONCURRENT_SOURCES = 8)`; results are
   then applied to the store **serially** to keep writes/worklist/report updates simple.
 - New chained targets discovered during a pass feed the next pass; the loop runs until the worklist

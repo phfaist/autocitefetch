@@ -569,6 +569,118 @@ fn a_set_properties_id_cannot_override_the_requested_id() {
     assert_eq!(item["title"], "T", "target field with no override is kept");
 }
 
+// --- failure provenance (origin) -------------------------------------------
+
+/// A directly-requested cite that fails carries `origin == None`: its own
+/// `(prefix, key)` already matches the caller's input, so there is nothing to
+/// attribute it back to.
+#[test]
+fn a_direct_failure_has_no_origin() {
+    let clock = MovableClock::default();
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(ScriptSource::new("s", Answer::Fail, &clock)).unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
+    assert_eq!(report.failures.len(), 1);
+    let f = &report.failures[0];
+    assert_eq!((f.prefix.as_str(), f.key.as_str()), ("s", "k"));
+    assert_eq!(f.origin, None, "a directly-requested failure has no origin");
+}
+
+/// A failure discovered on a chain *target* is reported under the target's
+/// `(prefix, key)` — but `origin` names the originally-requested cite that
+/// pulled it in, so a caller joining `failures` back against its input still
+/// finds the request that failed (instead of concluding it succeeded, only for
+/// `get()` to break on the chain later).
+#[test]
+fn a_chained_target_failure_is_attributed_to_the_request() {
+    let clock = MovableClock::default();
+    // `a:x` chains to `b:x`; the `b` fetch fails.
+    let a = ScriptSource::new("a", Answer::ChainTo("b"), &clock);
+    let b = ScriptSource::new("b", Answer::Fail, &clock);
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(a).unwrap()
+        .register(b).unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("a", "x")]))).unwrap();
+    assert_eq!(report.failures.len(), 1);
+    let f = &report.failures[0];
+    // The failure identifies the *target* that actually failed …
+    assert_eq!((f.prefix.as_str(), f.key.as_str()), ("b", "x"));
+    // … and attributes it back to the requested cite.
+    assert_eq!(f.origin, Some(("a".to_string(), "x".to_string())));
+    // The requested id itself appears nowhere as a failing `(prefix, key)` —
+    // origin is the only way to recover it. And `get` does break on the chain.
+    assert!(
+        !report.failures.iter().any(|f| f.prefix == "a" && f.key == "x"),
+        "the target failure, not the request, is reported directly"
+    );
+    assert!(block_on(mgr.get("a", "x")).is_err());
+}
+
+/// A multi-hop chain attributes a deep failure to the *original* request, not
+/// to the intermediate hop that immediately pointed at the failing target.
+#[test]
+fn a_multi_hop_chain_attributes_back_to_the_original_request() {
+    let clock = MovableClock::default();
+    // a:x -> b:x -> c:x, and the `c` fetch fails.
+    let a = ScriptSource::new("a", Answer::ChainTo("b"), &clock);
+    let b = ScriptSource::new("b", Answer::ChainTo("c"), &clock);
+    let c = ScriptSource::new("c", Answer::Fail, &clock);
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(a).unwrap()
+        .register(b).unwrap()
+        .register(c).unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("a", "x")]))).unwrap();
+    assert_eq!(report.failures.len(), 1);
+    let f = &report.failures[0];
+    assert_eq!((f.prefix.as_str(), f.key.as_str()), ("c", "x"));
+    assert_eq!(
+        f.origin,
+        Some(("a".to_string(), "x".to_string())),
+        "origin must be the original request, not the intermediate hop `b:x`"
+    );
+}
+
+/// The end-to-end guarantee: a caller can recover exactly *which of its
+/// requested cites* failed by mapping each failure to `origin.unwrap_or((prefix,
+/// key))` — whether the failure was direct or on a chained descendant.
+#[test]
+fn every_failed_request_is_recoverable_from_the_report() {
+    let clock = MovableClock::default();
+    // `a:x` chains to `b:x` which fails (indirect); `d:k` fails directly.
+    let a = ScriptSource::new("a", Answer::ChainTo("b"), &clock);
+    let b = ScriptSource::new("b", Answer::Fail, &clock);
+    let d = ScriptSource::new("d", Answer::Fail, &clock);
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(a).unwrap()
+        .register(b).unwrap()
+        .register(d).unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("a", "x"), ("d", "k")]))).unwrap();
+
+    // Re-derive the set of *requested* cites that failed.
+    let mut failed_requests: Vec<(String, String)> = report
+        .failures
+        .iter()
+        .map(|f| {
+            f.origin
+                .clone()
+                .unwrap_or_else(|| (f.prefix.clone(), f.key.clone()))
+        })
+        .collect();
+    failed_requests.sort();
+    assert_eq!(
+        failed_requests,
+        vec![
+            ("a".to_string(), "x".to_string()),
+            ("d".to_string(), "k".to_string()),
+        ],
+        "both requested cites must be recoverable from the report"
+    );
+}
+
 // --- authoritative missing vs. reachability failure ------------------------
 
 /// The `Missing` / `Failed` distinction, pinned side by side over an identical

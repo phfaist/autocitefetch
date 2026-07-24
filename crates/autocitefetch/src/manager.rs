@@ -27,10 +27,30 @@ use crate::store::{CacheStore, Payload};
 /// sources cannot open an unbounded number of connections at once.
 const MAX_CONCURRENT_SOURCES: usize = 8;
 
-/// A citation still to be looked at this retrieval: `(prefix, key, depth)`,
-/// where `depth` is how many chain links away from a *requested* citation it
-/// is (0 for the ones the caller asked for).
-type WorkItem = (String, String, usize);
+/// A citation still to be looked at this retrieval.
+///
+/// `depth` is how many chain links away from a *requested* citation it is (0
+/// for the ones the caller asked for). `origin` is the originally-requested
+/// `(prefix, key)` this item descends from: it *is* `(prefix, key)` for a
+/// directly-requested cite, and stays pinned to the root request as the item is
+/// re-pushed across chain hops — so a failure discovered on any chained target
+/// can be attributed back to the request that pulled it in.
+struct WorkItem {
+    prefix: String,
+    key: String,
+    depth: usize,
+    origin: (String, String),
+}
+
+/// Per-id bookkeeping accumulated in the dedup set: the `depth` and `origin`
+/// (see [`WorkItem`]) of the *first* work item that reached this id. Carried
+/// into `store_resolutions` so a resolution can be re-attributed to the request
+/// that pulled its id in.
+#[derive(Clone)]
+struct ItemMeta {
+    depth: usize,
+    origin: (String, String),
+}
 
 /// What one driven source contributes to a pass: its prefix, the keys it was
 /// asked for, the resolutions it returned, and when its last chunk started.
@@ -46,14 +66,58 @@ struct PassSink<'a> {
 /// A single citation that could not be resolved (and had no usable cached
 /// copy). Retrieval is per-citation tolerant: one failure does not abort the
 /// batch.
+///
+/// `prefix`/`key` identify the citation that *actually* failed — which, for a
+/// failure discovered while following a chain, is the chain *target*, not the
+/// citation the caller requested. `origin` closes that gap:
+///
+/// * `None` when the failed citation is itself one of the requested cites (a
+///   direct failure — its `(prefix, key)` already matches the caller's input);
+/// * `Some((prefix, key))` naming the originally-requested cite when this
+///   failure is on a chained descendant of a *different* request.
+///
+/// So every requested cite that ultimately fails is discoverable in
+/// [`RetrieveReport::failures`] either directly (a failure whose `(prefix, key)`
+/// matches it) or indirectly (a failure whose `origin` is it): a caller joining
+/// the report back against its input `cites` can always tell which of its
+/// requested cites did not resolve, without waiting for
+/// [`get`](CitationManager::get) to break on the chain later.
 #[derive(Clone, Debug)]
 pub struct CiteFailure {
     pub prefix: String,
     pub key: String,
     pub message: String,
+    /// The originally-requested cite this failure is attributed to, or `None`
+    /// when the failed cite *is* the requested one. See the type-level docs.
+    pub origin: Option<(String, String)>,
 }
 
-/// Outcome of a [`CitationManager::retrieve`] call.
+impl CiteFailure {
+    /// Build a failure for the citation `(prefix, key)` that actually failed,
+    /// attributing it to `origin` — the root requested cite the failing item
+    /// descended from. The stored [`CiteFailure::origin`] is `None` when the
+    /// failing cite *is* that request, and `Some(origin)` otherwise, so a caller
+    /// never sees a redundant self-origin.
+    fn new(prefix: &str, key: &str, message: String, origin: &(String, String)) -> Self {
+        let origin = if origin.0 == prefix && origin.1 == key {
+            None
+        } else {
+            Some(origin.clone())
+        };
+        CiteFailure {
+            prefix: prefix.to_string(),
+            key: key.to_string(),
+            message,
+            origin,
+        }
+    }
+}
+
+/// Outcome of a [`CitationManager::retrieve`] call: the citations that could
+/// not be resolved. The guarantee callers rely on is that *every* requested
+/// cite which ultimately fails appears here — directly (a failure whose
+/// `(prefix, key)` is it) or via a chained-target failure whose
+/// [`CiteFailure::origin`] points back to it.
 #[derive(Clone, Debug, Default)]
 pub struct RetrieveReport {
     pub failures: Vec<CiteFailure>,
@@ -198,13 +262,34 @@ where
         cites: &[(String, String)],
         report: &mut RetrieveReport,
     ) -> Result<()> {
-        // id → the chain depth at which it was first requested. Doubles as the
-        // dedup set; the depth is what stops an ill-behaved source from making
-        // `retrieve` walk an unbounded chain.
-        let mut depths: HashMap<String, usize> = HashMap::new();
+        // id → the depth and origin (see `WorkItem`) at which it was first
+        // reached. Doubles as the dedup set; the depth is what stops an
+        // ill-behaved source from making `retrieve` walk an unbounded chain, and
+        // the origin lets a resolution be re-attributed to the request that
+        // pulled its id in. First writer wins — and since every directly-
+        // requested cite is in this initial batch (depth 0, origin itself), it
+        // is always recorded before any chain could reach the same id in a later
+        // pass, so a requested cite is never mis-attributed to another request
+        // that merely chains to it. (A target reached only via chains from two
+        // *different* requests is attributed to whichever request's pass hit it
+        // first.)
+        let mut seen: HashMap<String, ItemMeta> = HashMap::new();
         let mut worklist: Vec<WorkItem> = cites
             .iter()
-            .map(|(p, k)| (p.clone(), k.clone(), 0))
+            .map(|(p, k)| {
+                // Normalize the requested key up front so `origin` matches the
+                // (also-normalized) coordinates a direct failure is reported
+                // under — otherwise a whitespace-bearing requested key would
+                // fail the `origin == (prefix, key)` self-check and be
+                // attributed to itself as if it were a chained descendant.
+                let key = self.normalize_key(p, k.clone());
+                WorkItem {
+                    origin: (p.clone(), key.clone()),
+                    prefix: p.clone(),
+                    key,
+                    depth: 0,
+                }
+            })
             .collect();
         // Per-prefix start time of the most recent chunk. Carried across passes
         // so a source's `min_interval` is not reset every pass (the arXiv→DOI
@@ -221,14 +306,29 @@ where
 
             // Decide, per citation, what needs fetching this pass.
             let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
-            for (prefix, key, depth) in batch {
+            for WorkItem {
+                prefix,
+                key,
+                depth,
+                origin,
+            } in batch
+            {
                 // Trim the key per the routed source's policy *before* anything
                 // keys on it (the id below, `seen`-dedup, bucketing, storage),
                 // so whitespace-only-different requests collapse to one fetch.
                 // Chained targets re-entering the worklist pass through here too.
                 let key = self.normalize_key(&prefix, key);
                 let id = csl::cite_id(&prefix, &key);
-                if depths.insert(id.clone(), depth).is_some() {
+                if seen
+                    .insert(
+                        id.clone(),
+                        ItemMeta {
+                            depth,
+                            origin: origin.clone(),
+                        },
+                    )
+                    .is_some()
+                {
                     continue;
                 }
                 if depth >= self.max_chain_depth {
@@ -240,19 +340,16 @@ where
                         self.max_chain_depth
                     ))
                     .to_string();
-                    report.failures.push(CiteFailure {
-                        prefix,
-                        key,
-                        message,
-                    });
+                    report
+                        .failures
+                        .push(CiteFailure::new(&prefix, &key, message, &origin));
                     continue;
                 }
                 if !self.sources.contains_key(&prefix) {
-                    report.failures.push(CiteFailure {
-                        prefix: prefix.clone(),
-                        key,
-                        message: Error::UnknownPrefix(prefix).to_string(),
-                    });
+                    let message = Error::UnknownPrefix(prefix.clone()).to_string();
+                    report
+                        .failures
+                        .push(CiteFailure::new(&prefix, &key, message, &origin));
                     continue;
                 }
 
@@ -277,8 +374,15 @@ where
                             // A record we are keeping (Fresh, or Stale but the
                             // draw said serve-as-is): a chained pointer we keep
                             // must still pull its target in, or a later `get()`
-                            // breaks on the missing link.
-                            worklist.push((tp.clone(), tk.clone(), depth + 1));
+                            // breaks on the missing link. The target inherits
+                            // this item's origin so a failure on it still points
+                            // back to the same request.
+                            worklist.push(WorkItem {
+                                prefix: tp.clone(),
+                                key: tk.clone(),
+                                depth: depth + 1,
+                                origin,
+                            });
                         }
                     }
                     None => {
@@ -372,7 +476,7 @@ where
                     source.as_ref(),
                     requested,
                     resolutions,
-                    &depths,
+                    &seen,
                     &mut sink,
                 )
                 .await?;
@@ -388,7 +492,7 @@ where
         source: &dyn Source,
         requested: Vec<String>,
         resolutions: Vec<Resolution>,
-        depths: &HashMap<String, usize>,
+        seen: &HashMap<String, ItemMeta>,
         sink: &mut PassSink<'_>,
     ) -> Result<()> {
         let now = self.clock.now();
@@ -402,7 +506,13 @@ where
                 continue;
             }
             let id = csl::cite_id(prefix, &res.key);
-            let depth = depths.get(&id).copied().unwrap_or(0);
+            // Depth and origin (see `WorkItem`) of the request this id descends
+            // from. It is always in `seen` (bucketing inserted it before this
+            // fetch); the self-origin fallback is defensive.
+            let meta = seen.get(&id).cloned().unwrap_or_else(|| ItemMeta {
+                depth: 0,
+                origin: (prefix.to_string(), res.key.clone()),
+            });
 
             match res.outcome {
                 Outcome::Concrete { mut csl, ttl } => {
@@ -413,7 +523,7 @@ where
                         let err = Error::Source(alloc::format!(
                             "source returned a non-object CSL payload for `{id}`"
                         ));
-                        self.note_failure(prefix, &res.key, err, now, depth, sink)
+                        self.note_failure(prefix, &res.key, err, now, &meta, sink)
                             .await?;
                         continue;
                     }
@@ -438,7 +548,7 @@ where
                         // Would otherwise be stored happily and only surface
                         // as "chain too deep" `max_chain_depth` reads later.
                         let err = Error::Chain(alloc::format!("`{id}` chains to itself"));
-                        self.note_failure(prefix, &res.key, err, now, depth, sink)
+                        self.note_failure(prefix, &res.key, err, now, &meta, sink)
                             .await?;
                         continue;
                     }
@@ -451,14 +561,23 @@ where
                         .policy
                         .make_record(payload, now, source.default_ttl(), &id);
                     self.store.put(&id, record).await?;
-                    sink.worklist.push((tp, tk, depth + 1));
+                    // The newly discovered target inherits this item's origin, so
+                    // a failure further down the chain still points back to the
+                    // original request.
+                    sink.worklist.push(WorkItem {
+                        prefix: tp,
+                        key: tk,
+                        depth: meta.depth + 1,
+                        origin: meta.origin,
+                    });
                 }
                 Outcome::Failed(err) => {
-                    self.note_failure(prefix, &res.key, err, now, depth, sink)
+                    self.note_failure(prefix, &res.key, err, now, &meta, sink)
                         .await?;
                 }
                 Outcome::Missing(err) => {
-                    self.note_missing(prefix, &res.key, err, sink).await?;
+                    self.note_missing(prefix, &res.key, err, &meta, sink)
+                        .await?;
                 }
             }
         }
@@ -472,11 +591,14 @@ where
                 continue;
             }
             let id = csl::cite_id(prefix, &key);
-            let depth = depths.get(&id).copied().unwrap_or(0);
+            let meta = seen.get(&id).cloned().unwrap_or_else(|| ItemMeta {
+                depth: 0,
+                origin: (prefix.to_string(), key.clone()),
+            });
             let err = Error::Source(alloc::format!(
                 "source `{prefix}` returned no resolution for key `{key}`"
             ));
-            self.note_failure(prefix, &key, err, now, depth, sink)
+            self.note_failure(prefix, &key, err, now, &meta, sink)
                 .await?;
         }
 
@@ -492,7 +614,7 @@ where
         key: &str,
         err: Error,
         now: Timestamp,
-        depth: usize,
+        meta: &ItemMeta,
         sink: &mut PassSink<'_>,
     ) -> Result<()> {
         let id = csl::cite_id(prefix, key);
@@ -504,7 +626,7 @@ where
             // Keeping a chained pointer alive means its target must be present
             // too, otherwise `get()` breaks on the next link. Nothing else
             // pushes it: the pointer was stale, so it was not pre-pushed during
-            // bucketing.
+            // bucketing. The target inherits this item's depth+origin.
             Some(rec) => {
                 if let Payload::Chained {
                     prefix: tp,
@@ -512,14 +634,20 @@ where
                     ..
                 } = rec.payload
                 {
-                    sink.worklist.push((tp, tk, depth + 1));
+                    sink.worklist.push(WorkItem {
+                        prefix: tp,
+                        key: tk,
+                        depth: meta.depth + 1,
+                        origin: meta.origin.clone(),
+                    });
                 }
             }
-            None => sink.report.failures.push(CiteFailure {
-                prefix: prefix.to_string(),
-                key: key.to_string(),
-                message: err.to_string(),
-            }),
+            None => sink.report.failures.push(CiteFailure::new(
+                prefix,
+                key,
+                err.to_string(),
+                &meta.origin,
+            )),
         }
         Ok(())
     }
@@ -540,15 +668,17 @@ where
         prefix: &str,
         key: &str,
         err: Error,
+        meta: &ItemMeta,
         sink: &mut PassSink<'_>,
     ) -> Result<()> {
         let id = csl::cite_id(prefix, key);
         self.store.remove(&id).await?;
-        sink.report.failures.push(CiteFailure {
-            prefix: prefix.to_string(),
-            key: key.to_string(),
-            message: err.to_string(),
-        });
+        sink.report.failures.push(CiteFailure::new(
+            prefix,
+            key,
+            err.to_string(),
+            &meta.origin,
+        ));
         Ok(())
     }
 
