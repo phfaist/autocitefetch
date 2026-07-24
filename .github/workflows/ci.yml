@@ -12,15 +12,16 @@ env:
   CARGO_NET_RETRY: "3"
 
 jobs:
-  # Build + test on the declared MSRV and on stable. Edition 2024 requires
-  # Rust >= 1.85, which is also the workspace `rust-version`.
+  # Build + test on the declared MSRV and on stable. Edition 2024 needs Rust
+  # >= 1.85, but the `idna` -> `icu_*` chain pulled in by ureq's TLS stack
+  # needs >= 1.86, so the workspace `rust-version` is 1.86.
   test:
     name: test (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        toolchain: ["1.85.0", "stable"]
+        toolchain: ["1.86.0", "stable"]
     steps:
       - uses: actions/checkout@v4
       - name: Install ${{ matrix.toolchain }}

@@ -189,7 +189,7 @@ execution, and the `std` backends including a `ureq`-based HTTP `Fetcher` (with
 verified `no_std` crate), decodes XML entity references, does version resolution,
 and chains to DOI. 180 tests pass; the core builds for `wasm32-unknown-unknown`;
 clippy and rustdoc are warning-free. CI (`.github/workflows/ci.yml`) enforces all
-of these on stable and on the MSRV (1.85).
+of these on stable and on the MSRV (1.86).
 
 **Not yet implemented:**
 
