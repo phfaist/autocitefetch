@@ -5,6 +5,12 @@
 //! verbatim under the extension field `_formatted_text`, bypassing CSL
 //! rendering.
 //!
+//! Because the key *is* the output, this source overrides
+//! [`Source::normalize_key`] with the **identity**: the default policy (trim +
+//! lowercase, right for identifier-shaped keys) would rewrite the citation text
+//! itself. Two manual keys differing only in case or padding stay two distinct
+//! citations.
+//!
 //! Entries carry **TTL 0**, so they are re-resolved on every run and never
 //! served from cache — which is free, since resolving is just copying the key.
 //!
@@ -54,11 +60,13 @@ impl Source for ManualSource {
         Duration::ZERO
     }
 
-    fn trim_key_whitespace(&self) -> bool {
-        // The key *is* the pre-formatted citation text, so leading/trailing
-        // whitespace is significant — never trim it (see the `Source` default,
-        // which every other source keeps).
-        false
+    fn normalize_key(&self, key: &str) -> String {
+        // Identity. The key *is* the pre-formatted citation text, so **both**
+        // its case and its surrounding whitespace are significant: the default
+        // policy (trim + lowercase) would silently rewrite the rendered
+        // citation. Two manual keys differing only in case or padding are
+        // therefore two distinct citations.
+        String::from(key)
     }
 
     fn retrieve_chunk<'a>(

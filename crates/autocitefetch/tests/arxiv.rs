@@ -114,7 +114,8 @@ impl Timer for InstantTimer {
 // --- canned Atom feeds -----------------------------------------------------
 
 // A versionless request whose entry carries an `<arxiv:doi>` (mixed case, to
-// exercise the lowercased chain *cache key* vs. the verbatim CSL `DOI` field).
+// exercise the chain *cache key* — which the manager lowercases via the `doi`
+// source's `normalize_key` — vs. the verbatim CSL `DOI` field).
 // The id is `…v1`; the request is versionless.
 const FEED_CHAINED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
@@ -158,7 +159,11 @@ const FEED_CONCRETE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 #[test]
 fn arxiv_versionless_with_doi_chains_and_merges() {
     let arxiv_url = "https://export.arxiv.org/api/query?id_list=1211.1037&max_results=1";
-    // The DOI is lowercased when chaining, so doi.org is asked for the lower form.
+    // The arXiv source emits the feed's mixed-case DOI as the chain target
+    // verbatim; the manager normalizes that target key through the `doi`
+    // source's `normalize_key` (trim + lowercase) both when storing the pointer
+    // and when `get()` walks it — so doi.org is asked for the lower form and
+    // arXiv itself needs no DOI special-casing.
     let doi_url = "https://doi.org/10.1103/physrevlett.109.170502";
 
     let fetcher = MockFetcher::new()
@@ -189,6 +194,23 @@ fn arxiv_versionless_with_doi_chains_and_merges() {
     // cache id is internal, the CSL field is what the spec governs.
     assert_eq!(item["DOI"], "10.1103/PhysRevLett.109.170502");
     assert_eq!(item.get("doi"), None, "lowercase doi key must not survive");
+
+    // The stored pointer and its target agree on ONE lowercased `doi:` id — if
+    // the chain arm and the target's own storage normalized differently, `get`
+    // above would have broken on a dangling link.
+    let mut ids: Vec<String> = block_on(mgr.store().entries())
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "arxiv:1211.1037".to_string(),
+            "doi:10.1103/physrevlett.109.170502".to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -578,13 +600,67 @@ fn old_style_ids_and_multi_key_chunks_build_the_expected_url() {
     assert_eq!(versioned["arxiv_version_number"], 2);
 }
 
+/// arXiv overrides `Source::normalize_key` to **trim only**, declining the
+/// default's lowercasing: an old-style id's subject class is case-significant
+/// (`math.AG/0601001`). This pins the whole path — the id_list URL sent, the
+/// match against the feed's case-preserved `<id>`, the `arxivid` written into
+/// the CSL, and the cache id — because lowercasing would silently break every
+/// one of them.
+#[test]
+fn old_style_subject_class_case_is_preserved_end_to_end() {
+    // Routing on the exact URL *is* an assertion: a lowercased key would build
+    // `id_list=math.ag%2F0601001`, which the mock 404s.
+    let arxiv_url = "https://export.arxiv.org/api/query?id_list=math.AG%2F0601001&max_results=1";
+    let feed = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <entry>
+    <id>http://arxiv.org/abs/math.AG/0601001v1</id>
+    <published>2006-01-01T00:00:00Z</published>
+    <title>An Algebraic Geometry Preprint</title>
+    <author><name>Ada Lovelace</name></author>
+  </entry>
+</feed>"#;
+
+    let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(ArxivSource::new()).unwrap();
+
+    // Padded, to show trimming still happens — just not case folding.
+    let cites = vec![("arxiv".to_string(), " math.AG/0601001 ".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    let entries = block_on(mgr.store().entries()).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].0, "arxiv:math.AG/0601001",
+        "the cache id keeps the subject class's case"
+    );
+
+    let item = block_on(mgr.get("arxiv", "math.AG/0601001")).unwrap();
+    assert_eq!(item["id"], "arxiv:math.AG/0601001");
+    assert_eq!(item["title"], "An Algebraic Geometry Preprint");
+    // Sliced out of the feed's own `<id>`: `parse_arxiv_id` lowercases only to
+    // locate the `…/abs/` prefix, never the id it returns.
+    assert_eq!(item["arxivid"], "math.AG/0601001");
+    assert_eq!(item["arxiv_version_number"], 1);
+
+    // The lowercased spelling is a different citation, and nothing was stored
+    // for it — the manager did not fold the two together.
+    assert!(
+        block_on(mgr.get("arxiv", "math.ag/0601001")).is_err(),
+        "arXiv keys are not case-folded"
+    );
+}
+
 #[test]
 fn whitespace_padded_arxiv_keys_dedup_to_one_fetch_and_entry() {
     // `\cite{arXiv: 1211.1037}` yields a key with incidental surrounding
-    // whitespace. arXiv keeps the default `trim_key_whitespace` policy, so the
-    // manager trims centrally: `" 1211.1037 "` and `"1211.1037"` requested in
-    // one call must collapse to ONE fetch (the trimmed URL) and ONE cache entry
-    // stored under the canonical, trimmed id — and any padded `get` finds it.
+    // whitespace. arXiv's `Source::normalize_key` trims (it only declines the
+    // default's *lowercasing*), and the manager applies it centrally, so
+    // `" 1211.1037 "` and `"1211.1037"` requested in one call must collapse to
+    // ONE fetch (the trimmed URL) and ONE cache entry stored under the
+    // canonical, trimmed id — and any padded `get` finds it.
     let arxiv_url = "https://export.arxiv.org/api/query?id_list=1211.1037&max_results=1";
     let feed = r#"<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">

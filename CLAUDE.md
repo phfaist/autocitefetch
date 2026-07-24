@@ -15,7 +15,7 @@ port of two prior libraries (see "Reference implementations" below).
 ## Commands
 
 ```sh
-cargo test                                   # all 180 tests (workspace)
+cargo test                                   # all 183 tests (workspace)
 cargo test -p autocitefetch --test arxiv_dois override_map_beats_feed_doi   # one integration test
 cargo test -p autocitefetch --lib filecache::tests::torn_tail_is_tolerated  # one unit test
 cargo doc -p autocitefetch-std --no-deps     # currently warning-free — keep it that way
@@ -63,17 +63,32 @@ holds only shared borrows while driving sources concurrently, so this is require
 
 A worklist loop, not a fixed pipeline:
 
-- **Key whitespace is trimmed centrally, once.** Before an id is built, `manager.normalize_key`
-  trims leading/trailing whitespace off a requested key when the routed source declares
-  `Source::trim_key_whitespace()` (default `true`). This happens at every point a `(prefix, key)`
-  becomes a `cite_id` — the worklist loop head (so routing/`seen`-dedup/bucketing/storage all key on
-  the trimmed form and `" 1211.1037 "` collapses with `"1211.1037"` into one fetch/entry), the
-  `Outcome::Chained` store arm (so a chained target's stored pointer matches the id its target lands
-  under), and both `get`/`get_by_id` and each `get` chain hop (so a padded lookup finds the trimmed
-  entry). `manual` overrides the policy to `false` — its key *is* free-form citation text, kept
-  verbatim. An unknown prefix has no source to consult, so its key is left untrimmed. Sources thus
-  only ever see already-trimmed keys; **do not re-trim inside a source** (arXiv's old URL-only
-  `key.trim()` was removed once this landed).
+- **Keys are normalized centrally, once.** Before an id is built, `manager.normalize_key` runs the
+  requested key through the *routed source's* `Source::normalize_key(&str) -> String`. The trait
+  default is **trim + ASCII-lowercase**; each built-in narrows it as its key space requires:
+
+  | source | policy | why |
+  |---|---|---|
+  | `doi` | default (trim + lowercase) | DOIs are case-insensitive identifiers ⇒ one cache id per DOI |
+  | `arxiv` | **trim only** | old-style ids carry a case-significant subject class (`math.AG/0601001`); the feed `<id>` is matched case-sensitively and `arxivid` is sliced out of it |
+  | `bib` | **trim only** | a bib key is an opaque label matched byte-for-byte against the file's `id`; folding it would silently miss, or collide `Bell`/`bell` |
+  | `manual` | **identity** | the key *is* the formatted citation text — case and whitespace are the payload |
+
+  This happens at every point a `(prefix, key)` becomes a `cite_id` — the worklist loop head (so
+  routing/`seen`-dedup/bucketing/storage all key on the canonical form, and `" 1211.1037 "` /
+  `"1211.1037"` or `10.1103/PhysRevA.86.052329` / `10.1103/physreva.86.052329` collapse into one
+  fetch/entry), the `Outcome::Chained` store arm (normalized by the **target** source's policy, so a
+  chained pointer matches the id its target lands under — this is why `arxiv.rs` emits its DOI chain
+  key verbatim and needs no DOI case handling of its own), and both `get`/`get_by_id` and each `get`
+  chain hop. An unknown prefix has no source to consult, so its key is used verbatim. Sources thus
+  only ever see already-normalized keys; **do not re-normalize inside a source**. Implementations
+  must be idempotent — the manager applies the policy more than once along a chain.
+
+  Consequence: the `id` `get()` rewrites, and a `CiteFailure`'s `prefix`/`key`, are the **normalized**
+  form — `doi:10.1103/physreva.86.052329` even if the caller typed mixed case. Only the cache *id* is
+  folded; CSL payload fields (notably `DOI`) keep their casing. Trimming is `str::trim` only —
+  internal whitespace is deliberately *not* collapsed, so `doi.rs`'s validation can still reject a
+  malformed key instead of it being silently repaired.
 - Per pass: dedup against `seen`, look each id up in the store, and bucket the ones due for a
   (re)fetch by prefix — misses, plus anything `TtlPolicy::should_refetch` returns true for (hard-
   expired always; soft-stale *probabilistically*, see Cache policy). A cached `Payload::Chained`
@@ -116,12 +131,13 @@ last, so a `set_properties` carrying an `id` can never win. Note `Source::chains
 manager does not consume it; chain discovery is dynamic via the worklist.
 
 **The chain key is lowercased; the CSL `DOI` field is not.** `arxiv.rs` emits
-`Outcome::Chained { key: doi.to_ascii_lowercase(), .. }` so two entries whose DOIs differ only in
-case dedup to one `doi:` cache id — that is an *internal identifier*. The CSL field is a separate
-thing: it is the CSL-standard uppercase **`DOI`** key holding the DOI **verbatim** (DOIs display in
-their registered mixed case), written that way by `arxiv.rs`'s `build_csl` and by `doi.rs`'s
-`canonicalize_doi_key`. Don't "unify" the two — lowercasing the field breaks CSL compliance, and
-case-preserving the cache key breaks dedup.
+`Outcome::Chained { key: doi, .. }` **verbatim** — the manager then runs the target key through the
+`doi` source's `normalize_key` (trim + lowercase) both when storing the pointer and when `get()`
+walks it, so two entries whose DOIs differ only in case dedup to one `doi:` cache id. That id is an
+*internal identifier*. The CSL field is a separate thing: it is the CSL-standard uppercase **`DOI`**
+key holding the DOI **verbatim** (DOIs display in their registered mixed case), written that way by
+`arxiv.rs`'s `build_csl` and by `doi.rs`'s `canonicalize_doi_key`. Don't "unify" the two —
+lowercasing the field breaks CSL compliance, and case-preserving the cache key breaks dedup.
 
 ### Cache policy (`cache.rs`)
 
@@ -254,7 +270,8 @@ Tests must not hit the network. Only `examples/resolve.rs` does.
 Implement `Source` in `crates/autocitefetch/src/source/<name>.rs`, re-export it from `source/mod.rs`,
 build the URL with the module-local percent-encoder (see `arxiv.rs`/`doi.rs` — deliberately
 hand-rolled to avoid a `url` dependency), fetch via `ctx.fetcher`, and return one `Resolution` per
-key. Users can also register their own source at runtime; nothing about the built-ins is privileged.
+key. Override `normalize_key` only if the default (trim + lowercase) is wrong for your key space —
+and keep it idempotent. Users can also register their own source at runtime; nothing about the built-ins is privileged.
 
 ## Docs convention
 

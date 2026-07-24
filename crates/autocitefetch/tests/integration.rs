@@ -178,33 +178,47 @@ fn manual_source_stores_verbatim_text() {
 }
 
 #[test]
-fn manual_source_preserves_leading_and_trailing_whitespace() {
-    // `manual` opts OUT of key trimming (`trim_key_whitespace() == false`): the
-    // key IS the formatted citation text, so surrounding whitespace is
-    // significant and must survive verbatim into storage and back out of `get`.
+fn manual_source_preserves_key_case_and_whitespace() {
+    // `manual` overrides `Source::normalize_key` with the IDENTITY: the key IS
+    // the formatted citation text, so both surrounding whitespace and case are
+    // significant and must survive verbatim into storage and back out of `get`
+    // — where every other source would have trimmed, and the default policy
+    // would also have lowercased.
     let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
         .register(ManualSource::new()).unwrap();
 
-    let padded = "  Bohr, N. (1913)  ".to_string();
+    let padded = "  Bohr, N. (1913). ON THE CONSTITUTION of Atoms  ".to_string();
     let cites = vec![("manual".to_string(), padded.clone())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    // Stored under (and retrievable by) the padded id, whitespace intact.
+    // Stored under (and retrievable by) the padded id, whitespace and case intact.
     let item = block_on(mgr.get("manual", &padded)).unwrap();
-    assert_eq!(item["_formatted_text"], padded, "whitespace preserved verbatim");
-    assert_eq!(item["id"], "manual:  Bohr, N. (1913)  ");
-    // The trimmed key is a *different* citation here — nothing was stored for it.
-    assert!(
-        block_on(mgr.get("manual", "Bohr, N. (1913)")).is_err(),
-        "a manual key is not collapsed with its trimmed form"
+    assert_eq!(item["_formatted_text"], padded, "text preserved verbatim");
+    assert_eq!(
+        item["id"],
+        "manual:  Bohr, N. (1913). ON THE CONSTITUTION of Atoms  ",
+        "the echoed id keeps the key's whitespace and case"
     );
+    // Neither the trimmed nor the lowercased key is the same citation here —
+    // nothing was stored for either.
+    for other in [
+        "Bohr, N. (1913). ON THE CONSTITUTION of Atoms",
+        "  bohr, n. (1913). on the constitution of atoms  ",
+    ] {
+        assert!(
+            block_on(mgr.get("manual", other)).is_err(),
+            "a manual key must not collapse with {other:?}"
+        );
+    }
 }
 
 #[test]
 fn doi_source_parses_content_negotiated_csljson() {
+    // `doi` keeps the default `Source::normalize_key` (trim + lowercase), so the
+    // requested mixed-case DOI reaches doi.org — and the cache — lowercased.
     let fetcher = MockFetcher::new().route(
-        "https://doi.org/10.1103/PhysRev.47.777",
+        "https://doi.org/10.1103/physrev.47.777",
         200,
         r#"{"type":"article-journal","title":"Can Quantum-Mechanical Description…","DOI":"10.1103/PhysRev.47.777"}"#,
     );
@@ -216,7 +230,7 @@ fn doi_source_parses_content_negotiated_csljson() {
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
     let item = block_on(mgr.get("doi", "10.1103/PhysRev.47.777")).unwrap();
-    assert_eq!(item["id"], "doi:10.1103/PhysRev.47.777");
+    assert_eq!(item["id"], "doi:10.1103/physrev.47.777", "the cache id is normalized");
     // doi.org already spells the key with the CSL-standard uppercase `DOI`, and
     // the value is stored verbatim — mixed case and all.
     assert_eq!(item["DOI"], "10.1103/PhysRev.47.777");
@@ -230,11 +244,11 @@ fn doi_key_surrounding_whitespace_is_trimmed_centrally() {
     // manager (doi keeps the default policy) *before* it reaches the source — so
     // it resolves normally, and the padded and clean forms dedup to one fetch.
     // Note the doi source itself still rejects a key that *contains* internal
-    // whitespace (see `a_malformed_doi_is_rejected_without_fetching_anything`);
-    // only the surrounding whitespace is stripped here, and only that. Case is
-    // preserved throughout — in the key and in the body's `DOI` value alike.
+    // whitespace (see `a_malformed_doi_is_rejected_without_fetching_anything`):
+    // only *surrounding* whitespace is stripped, internal runs are deliberately
+    // left for validation to reject rather than silently collapsed.
     let fetcher = MockFetcher::new().route(
-        "https://doi.org/10.1103/PhysRev.47.777",
+        "https://doi.org/10.1103/physrev.47.777",
         200,
         r#"{"type":"article-journal","title":"Trimmed DOI","DOI":"10.1103/PhysRev.47.777"}"#,
     );
@@ -243,19 +257,63 @@ fn doi_key_surrounding_whitespace_is_trimmed_centrally() {
         .register(DoiSource::new()).unwrap();
 
     let cites = vec![
-        ("doi".to_string(), "  10.1103/PhysRev.47.777  ".to_string()),
-        ("doi".to_string(), "10.1103/PhysRev.47.777".to_string()),
+        ("doi".to_string(), "  10.1103/physrev.47.777  ".to_string()),
+        ("doi".to_string(), "10.1103/physrev.47.777".to_string()),
     ];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
     // doi's chunk_size is 1, so two undeduped keys would be two fetches.
     assert_eq!(calls.len(), 1, "padded + clean DOI must dedup to one fetch: {:?}", calls.urls());
 
-    // Both forms read the one entry, stored under the trimmed (case-preserved) id.
-    let item = block_on(mgr.get("doi", "  10.1103/PhysRev.47.777  ")).unwrap();
-    assert_eq!(item["id"], "doi:10.1103/PhysRev.47.777", "stored under the trimmed id");
+    // Both forms read the one entry, stored under the trimmed id.
+    let item = block_on(mgr.get("doi", "  10.1103/physrev.47.777  ")).unwrap();
+    assert_eq!(item["id"], "doi:10.1103/physrev.47.777", "stored under the trimmed id");
     assert_eq!(item["title"], "Trimmed DOI");
-    assert_eq!(item["DOI"], "10.1103/PhysRev.47.777", "the DOI value is verbatim");
+    assert_eq!(item["DOI"], "10.1103/PhysRev.47.777", "the DOI *field* is verbatim");
+}
+
+#[test]
+fn mixed_case_doi_keys_dedup_to_one_fetch_and_one_entry() {
+    // DOIs are case-insensitive identifiers, and `doi` keeps the default
+    // `Source::normalize_key` (trim + lowercase). So the registered mixed-case
+    // spelling and the lowercase one are ONE citation: one fetch (of the
+    // lowercased URL), one cache entry, readable through either spelling.
+    const MIXED: &str = "10.1103/PhysRevA.86.052329";
+    const LOWER: &str = "10.1103/physreva.86.052329";
+    let fetcher = MockFetcher::new().route(
+        "https://doi.org/10.1103/physreva.86.052329",
+        200,
+        r#"{"type":"article-journal","title":"Case Folded","DOI":"10.1103/PhysRevA.86.052329"}"#,
+    );
+    let calls = fetcher.calls();
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(DoiSource::new()).unwrap();
+
+    let cites = vec![
+        ("doi".to_string(), MIXED.to_string()),
+        ("doi".to_string(), LOWER.to_string()),
+        // Padding on top of mixed case: still the same citation.
+        ("doi".to_string(), format!("  {MIXED} ")),
+    ];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    // doi's chunk_size is 1, so three undeduped keys would be three fetches.
+    assert_eq!(calls.len(), 1, "case variants must dedup to one fetch: {:?}", calls.urls());
+    assert_eq!(calls.urls(), vec!["https://doi.org/10.1103/physreva.86.052329".to_string()]);
+
+    let entries = block_on(mgr.store().entries()).unwrap();
+    assert_eq!(entries.len(), 1, "one cache entry expected: {entries:?}");
+    assert_eq!(entries[0].0, "doi:10.1103/physreva.86.052329");
+
+    // Either spelling reads that one entry; the echoed id is the normalized one,
+    // while the CSL `DOI` field keeps the DOI's registered mixed case.
+    for k in [MIXED, LOWER, "  10.1103/PHYSREVA.86.052329  "] {
+        let item = block_on(mgr.get("doi", k)).unwrap();
+        assert_eq!(item["id"], "doi:10.1103/physreva.86.052329", "for {k:?}");
+        assert_eq!(item["title"], "Case Folded");
+        assert_eq!(item["DOI"], MIXED, "the CSL DOI field stays verbatim");
+    }
 }
 
 #[test]
@@ -266,16 +324,18 @@ fn doi_source_canonicalizes_doi_key_to_uppercase_keeping_value_verbatim() {
     // nonstandard lowercase `doi` is renamed up to `DOI`, value unchanged.
     // Either way no lowercase `doi` survives, and no other field is touched.
     const MIXED: &str = "10.1103/PhysRevA.86.052329";
+    // The *request* keys are lowercased by the manager, so the routes are the
+    // lowercased URLs; the response *bodies* still carry mixed-case DOI values.
     let fetcher = MockFetcher::new()
         // Already canonical: uppercase key, mixed-case value.
         .route(
-            "https://doi.org/10.1103/PhysRevLett.109.170502",
+            "https://doi.org/10.1103/physrevlett.109.170502",
             200,
             r#"{"type":"article-journal","title":"Mixed Case DOI","DOI":"10.1103/PhysRevLett.109.170502","URL":"https://doi.org/10.1103/PhysRevLett.109.170502"}"#,
         )
         // Nonstandard lowercase key, mixed-case value.
         .route(
-            "https://doi.org/10.1103/PhysRevA.86.052329",
+            "https://doi.org/10.1103/physreva.86.052329",
             200,
             r#"{"type":"article-journal","title":"Lowercase Key","doi":"10.1103/PhysRevA.86.052329"}"#,
         );
@@ -355,8 +415,11 @@ fn response_header_lookup_is_case_insensitive_in_both_directions() {
 #[test]
 fn doi_url_percent_encodes_the_key_but_keeps_slashes() {
     // A real DOI with parentheses, angle brackets, a colon and a semicolon.
+    // Requested in its registered mixed case; the manager lowercases the key, so
+    // the URL encodes the lowercased form (the percent-escapes' hex digits are
+    // the encoder's own and stay uppercase).
     const KEY: &str = "10.1002/(SICI)1096-8628(20000403)91:4<317::AID-AJMG16>3.0.CO;2-9";
-    const URL: &str = "https://doi.org/10.1002/%28SICI%291096-8628%2820000403%2991%3A4%3C317%3A%3AAID-AJMG16%3E3.0.CO%3B2-9";
+    const URL: &str = "https://doi.org/10.1002/%28sici%291096-8628%2820000403%2991%3A4%3C317%3A%3Aaid-ajmg16%3E3.0.co%3B2-9";
 
     let fetcher = MockFetcher::new().route(URL, 200, r#"{"type":"article-journal","title":"Encoded"}"#);
     let calls = fetcher.calls();

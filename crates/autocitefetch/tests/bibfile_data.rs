@@ -288,6 +288,54 @@ fn a_missing_key_is_reported_with_a_readable_message() {
     assert_eq!(failures[0].message, "citation `bib:zz` not found");
 }
 
+/// `bib` overrides `Source::normalize_key` to **trim only**: unlike the default
+/// (trim + lowercase) a bibliography key is an opaque label matched
+/// byte-for-byte against the `id` written in the file, so lookups stay
+/// case-sensitive. Pinned here because the alternative — inheriting the
+/// lowercasing default — would make every `Knuth1984`-style file entry silently
+/// unreachable, and folding the index instead would collide `Bell`/`bell`.
+#[test]
+fn bib_keys_are_case_sensitive_but_still_trimmed() {
+    let url = "https://host.example/refs.json";
+    // Two ids differing ONLY in case: proof they stay two distinct entries.
+    let body = br#"[{"id":"Knuth1984","title":"The TeXbook"},
+                    {"id":"knuth1984","title":"A Different Entry"}]"#;
+    let fetcher = MockFetcher::new().route(url, 200, body);
+    let bib = BibliographyFileSource::new([url.to_string()]);
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
+        .register(bib).unwrap();
+
+    let cites = vec![
+        ("bib".to_string(), "Knuth1984".to_string()),
+        ("bib".to_string(), "knuth1984".to_string()),
+        // Surrounding whitespace is still incidental and trimmed away, so this
+        // is the *same* citation as the first one.
+        ("bib".to_string(), "  Knuth1984 ".to_string()),
+        // Neither case exists in this spelling.
+        ("bib".to_string(), "KNUTH1984".to_string()),
+    ];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert_eq!(report.failures[0].key, "KNUTH1984", "only the unknown casing fails");
+
+    // Each casing resolves to its OWN entry, under its own case-preserved id.
+    let upper = block_on(mgr.get("bib", "Knuth1984")).unwrap();
+    assert_eq!(upper["title"], "The TeXbook");
+    assert_eq!(upper["id"], "bib:Knuth1984", "the key's case is preserved in the id");
+
+    let lower = block_on(mgr.get("bib", "knuth1984")).unwrap();
+    assert_eq!(lower["title"], "A Different Entry");
+    assert_eq!(lower["id"], "bib:knuth1984");
+
+    // The padded form is the trimmed one, not a third entry.
+    let padded = block_on(mgr.get("bib", "  Knuth1984 ")).unwrap();
+    assert_eq!(padded["title"], "The TeXbook");
+    assert_eq!(padded["id"], "bib:Knuth1984");
+
+    let entries = block_on(mgr.store().entries()).unwrap();
+    assert_eq!(entries.len(), 2, "two entries, not one folded or three: {entries:?}");
+}
+
 /// Review item #5: a key that was present and then *removed* from a
 /// successfully-reloaded bibliography must surface in `failures` on the next
 /// `retrieve` — not be silently grace-served for 14 days. A file that loads

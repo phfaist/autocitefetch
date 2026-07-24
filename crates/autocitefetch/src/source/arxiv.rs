@@ -9,12 +9,27 @@
 //! entity handling below is *not* shared with them):
 //! * `GET …/api/query?id_list=<comma-joined, percent-encoded ids>&max_results=<n>`
 //!   for a chunk of ≤100 ids. Keys arrive **already trimmed** of surrounding
-//!   whitespace: the manager applies this source's default
-//!   [`Source::trim_key_whitespace`] policy centrally, so a stray space — as in
-//!   `\cite{arXiv: 1211.1037}`, which would otherwise make arXiv answer 400 for
-//!   the *whole* chunk — is gone before the key is encoded into the URL or
-//!   matched against feed entries. The returned [`Resolution::key`] equals the
-//!   key the manager sent, as the one-resolution-per-key contract requires.
+//!   whitespace: this source's [`Source::normalize_key`] is applied by the
+//!   manager centrally, so a stray space — as in `\cite{arXiv: 1211.1037}`,
+//!   which would otherwise make arXiv answer 400 for the *whole* chunk — is gone
+//!   before the key is encoded into the URL or matched against feed entries. The
+//!   returned [`Resolution::key`] equals the key the manager sent, as the
+//!   one-resolution-per-key contract requires.
+//! * **Keys are trimmed but never lowercased**, i.e. this source narrows the
+//!   [`Source::normalize_key`] default (trim + lowercase) to trim only. An
+//!   arXiv id is *not* case-insensitive: old-style ids carry a subject class
+//!   whose case is part of the identifier (`math.AG/0601001`, `cs.LG/0601001`,
+//!   `astro-ph.CO/…`). Lowercasing would (a) send `math.ag/0601001` to an API
+//!   whose acceptance of that spelling is unverified, and (b) break entry
+//!   matching regardless, because `atom::parse_arxiv_id` lowercases only to
+//!   *locate* the `…/abs/` prefix and returns the id sliced out of the original
+//!   feed text — so the feed's `math.AG/0601001` would no longer equal the
+//!   request. The `arxivid` written into the CSL (and into a chain's
+//!   `set_properties`) is that same case-preserved id, so the citation keeps the
+//!   id as arXiv spells it. The `vN` suffix *is* matched case-insensitively
+//!   (see `split_version`), but is deliberately not folded in the key either:
+//!   `1211.1037V2` therefore resolves correctly while occupying its own cache
+//!   id, which is a far smaller cost than mangling a subject class.
 //! * Parse each `<entry>` for `<id>`, `<title>`, `<author><name>`,
 //!   `<published>`, `<updated>`, and `<arxiv:doi>`. An entry whose `<id>` is not
 //!   an `…/abs/<arxivid>` URL is an arXiv *error entry* and is skipped, so the
@@ -164,6 +179,12 @@ impl Source for ArxivSource {
     fn chains_to(&self) -> &[&'static str] {
         chains_to_slice(self.chain_to_doi)
     }
+    fn normalize_key(&self, key: &str) -> String {
+        // Trim only — deliberately **not** the default's added lowercasing. See
+        // the module docs: an old-style arXiv id's subject class is
+        // case-significant (`math.AG/0601001`).
+        String::from(key.trim())
+    }
     fn retrieve_chunk<'a>(
         &'a self,
         keys: Vec<String>,
@@ -212,8 +233,8 @@ async fn retrieve_impl<'a>(
 
     // Build the id_list query. Ids contain `/` and `.`, so each is
     // percent-encoded; they are joined with a literal comma. The manager has
-    // already trimmed surrounding whitespace from every key (the source's
-    // `trim_key_whitespace` policy), so none is done here — a key like
+    // already trimmed surrounding whitespace from every key (this source's
+    // `Source::normalize_key`), so none is done here — a key like
     // `"1211.1037 "`, which would encode to `1211.1037%20` and make arXiv 400
     // the whole chunk, can no longer reach this point.
     let mut url = String::from("https://export.arxiv.org/api/query?id_list=");
@@ -303,10 +324,11 @@ fn fail_all(keys: Vec<String>, msg: String) -> Vec<Resolution> {
 /// Resolve one requested key against the parsed feed entries and the effective
 /// override map.
 ///
-/// The manager has already trimmed surrounding whitespace (per the source's
-/// `trim_key_whitespace` policy), so the key is matched as-is; every `Resolution`
-/// returned here carries `key` exactly as the manager supplied it, since the
-/// manager pairs resolutions back to requests by that string.
+/// The manager has already trimmed surrounding whitespace (this source's
+/// `Source::normalize_key`) and has *not* changed the key's case, so it is
+/// matched byte-for-byte against the feed's case-preserved `arxivid`; every
+/// `Resolution` returned here carries `key` exactly as the manager supplied it,
+/// since the manager pairs resolutions back to requests by that string.
 fn resolve_key(
     chain_to_doi: bool,
     overrides: &HashMap<String, Option<String>>,
@@ -362,11 +384,15 @@ fn resolve_key(
                 key,
                 outcome: Outcome::Chained {
                     prefix: "doi".to_string(),
-                    // The chain target is an INTERNAL `doi:` cache id, not the
-                    // CSL `DOI` field: lowercase it so two arXiv entries whose
-                    // DOIs differ only in case dedup to one `doi:` fetch. The
-                    // CSL `DOI` field itself (built in `build_csl`) is verbatim.
-                    key: doi.to_ascii_lowercase(),
+                    // Emitted verbatim: the manager runs the *target* source's
+                    // `Source::normalize_key` over this key both when it stores
+                    // the pointer and when `get()` walks it, and the `doi`
+                    // source keeps the default (trim + lowercase) policy — so
+                    // two arXiv entries whose DOIs differ only in case still
+                    // dedup to one `doi:` cache id without this source doing
+                    // anything. (The CSL `DOI` *field* built in `build_csl` is a
+                    // separate thing and stays verbatim.)
+                    key: doi.to_string(),
                     set_properties: CslValue::Object(sp),
                 },
             };
@@ -424,8 +450,9 @@ fn select_best<'e>(entries: &'e [atom::Entry], base: &str) -> Option<&'e atom::E
 /// Map a parsed arXiv entry to a CSL-JSON object (built by hand). `doi` is the
 /// *effective* DOI (override-or-feed); when `Some`, it is written **verbatim**
 /// under the canonical CSL-JSON `DOI` key (DOIs display in their registered
-/// case). Note this is distinct from the lowercased `doi:` chain cache-key used
-/// for case-insensitive dedup in [`resolve_key`].
+/// case). Note this is distinct from the `doi:` chain *cache id*, which the
+/// manager lowercases via the `doi` source's [`Source::normalize_key`] for
+/// case-insensitive dedup.
 fn build_csl(e: &atom::Entry, doi: Option<&str>) -> CslValue {
     let mut obj = serde_json::Map::new();
     obj.insert("type".into(), CslValue::String("article-journal".to_string()));

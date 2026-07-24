@@ -145,30 +145,54 @@ pub trait Source {
         Duration::from_secs(30 * 24 * 60 * 60)
     }
 
-    /// Whether the manager should trim stray leading/trailing whitespace off a
-    /// requested key before it is used.
+    /// Canonicalize a requested key before anything is keyed on it.
     ///
-    /// Default `true`. For nearly every source a key is an *identifier* (an
-    /// arXiv id, a DOI, a bibliography key) where surrounding whitespace is
-    /// incidental — `\cite{arXiv: 1211.1037}` yields the key `" 1211.1037"`.
-    /// When this returns `true` the manager applies [`str::trim`]
-    /// (leading/trailing Unicode whitespace) to the key **once, centrally**,
-    /// before routing, `seen`-dedup, bucketing, storage, *and* lookup — so
-    /// `" 1211.1037 "` and `"1211.1037"` collapse to one cache id and one fetch,
-    /// and a later `get("arxiv", "1211.1037 ")` finds the entry stored under the
-    /// trimmed id. [`retrieve_chunk`](Source::retrieve_chunk) therefore only ever
-    /// sees already-trimmed keys, and the canonical `"prefix:key"` echoed in a
-    /// resolved item's `id` and in a [`CiteFailure`] is the trimmed form.
+    /// **Default: trim surrounding whitespace, then ASCII-lowercase.** For
+    /// nearly every source a key is an *identifier* — an arXiv id, a DOI, a
+    /// bibliography key — where surrounding whitespace is incidental
+    /// (`\cite{arXiv: 1211.1037}` yields `" 1211.1037"`) and, for the
+    /// case-insensitive identifier families, case is not meaningful either
+    /// (`10.1103/PhysRevA.86.052329` and `10.1103/physreva.86.052329` are the
+    /// same DOI). Canonicalizing here means a source never has to special-case
+    /// either: its keys arrive canonical.
     ///
-    /// Override to `false` for a source whose key is **free-form text** where
-    /// surrounding whitespace is significant — notably [`ManualSource`], whose
-    /// key *is* the pre-formatted citation text and must be stored verbatim.
-    /// Such a source's keys are never trimmed, so two keys differing only in
-    /// whitespace stay distinct.
+    /// The manager applies this **once, centrally**, at every point a
+    /// `(prefix, key)` becomes a cache id — before routing, `seen`-dedup,
+    /// bucketing, storage, *and* lookup — so all spellings of a key collapse to
+    /// one cache id and one fetch, and a later
+    /// [`get`](crate::manager::CitationManager::get) with any spelling finds the
+    /// entry. [`retrieve_chunk`](Source::retrieve_chunk) therefore only ever sees
+    /// already-normalized keys (**do not re-normalize inside a source**), and the
+    /// canonical `"prefix:key"` echoed in a resolved item's `id` and in a
+    /// [`CiteFailure`] is the normalized form — so a caller who requested
+    /// `doi:10.1103/PhysRevA.86.052329` reads back
+    /// `"id": "doi:10.1103/physreva.86.052329"`.
+    ///
+    /// Whitespace handling is [`str::trim`] only: *internal* whitespace is left
+    /// alone, since in an identifier it means malformed input that a source's own
+    /// validation should reject (see `doi.rs`) rather than something to silently
+    /// repair. Case folding is ASCII-only: identifier schemes that declare
+    /// themselves case-insensitive (DOI) are ASCII, and full Unicode folding
+    /// would make the cache id locale-surprising for no gain.
+    ///
+    /// Override when a key is **not** a case-insensitive identifier:
+    ///
+    /// * [`ManualSource`] returns the key *unchanged* — it **is** the
+    ///   pre-formatted citation text, so both case and surrounding whitespace are
+    ///   significant.
+    /// * [`ArxivSource`] and [`BibliographyFileSource`] trim but do **not**
+    ///   lowercase — arXiv's old-style ids carry a case-significant subject class
+    ///   (`math.AG/0601001`) and a bibliography key is an opaque label matched
+    ///   byte-for-byte against the file. See their module docs.
+    ///
+    /// Implementations must be **idempotent** (`f(f(k)) == f(k)`): the manager
+    /// applies this more than once along a chain.
     ///
     /// [`CiteFailure`]: crate::manager::CiteFailure
-    fn trim_key_whitespace(&self) -> bool {
-        true
+    fn normalize_key(&self, key: &str) -> String {
+        let mut key = String::from(key.trim());
+        key.make_ascii_lowercase();
+        key
     }
 
     /// Prefixes this source may chain *to* (e.g. arXiv → `["doi"]`).
