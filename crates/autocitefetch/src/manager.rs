@@ -146,6 +146,32 @@ where
         self
     }
 
+    /// Normalize a requested key according to the routed source's whitespace
+    /// policy — applied **once, centrally**, so trimming is consistent across
+    /// routing, `seen`-dedup, bucketing, storage, and lookup.
+    ///
+    /// A source that declares [`Source::trim_key_whitespace`] (the default) has
+    /// stray leading/trailing whitespace stripped here, so `" 1211.1037 "` and
+    /// `"1211.1037"` collapse to one cache id and one fetch. A source that opts
+    /// out (e.g. `manual`, whose key *is* free-form citation text) keeps its key
+    /// verbatim — as does a key whose prefix has no registered source, since
+    /// there is no policy to consult (that unknown-prefix cite is reported
+    /// unchanged).
+    fn normalize_key(&self, prefix: &str, key: String) -> String {
+        match self.sources.get(prefix) {
+            Some(src) if src.trim_key_whitespace() => {
+                let trimmed = key.trim();
+                // Skip the reallocation when nothing was trimmed (the common case).
+                if trimmed.len() == key.len() {
+                    key
+                } else {
+                    trimmed.to_string()
+                }
+            }
+            _ => key,
+        }
+    }
+
     /// Populate the cache for every `(prefix, key)` in `cites` that is missing
     /// or stale, following chained pointers. Returns per-citation failures;
     /// only backend (store) errors abort with `Err`.
@@ -194,6 +220,11 @@ where
             // Decide, per citation, what needs fetching this pass.
             let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
             for (prefix, key, depth) in batch {
+                // Trim the key per the routed source's policy *before* anything
+                // keys on it (the id below, `seen`-dedup, bucketing, storage),
+                // so whitespace-only-different requests collapse to one fetch.
+                // Chained targets re-entering the worklist pass through here too.
+                let key = self.normalize_key(&prefix, key);
                 let id = csl::cite_id(&prefix, &key);
                 if depths.insert(id.clone(), depth).is_some() {
                     continue;
@@ -388,6 +419,12 @@ where
                     key: tk,
                     set_properties,
                 } => {
+                    // Normalize the target key by the *target* source's policy so
+                    // the stored pointer references exactly the id its target
+                    // will land under (the worklist push below trims it again at
+                    // the loop top): a chained `doi` key with incidental
+                    // whitespace must not spawn a duplicate entry.
+                    let tk = self.normalize_key(&tp, tk);
                     if tp == prefix && tk == res.key {
                         // Would otherwise be stored happily and only surface
                         // as "chain too deep" `max_chain_depth` reads later.
@@ -512,7 +549,11 @@ where
     /// request wins). The returned item's `id` is always the originally
     /// requested `"prefix:key"`.
     pub async fn get(&self, prefix: &str, key: &str) -> Result<CslValue> {
-        let requested_id = csl::cite_id(prefix, key);
+        // Trim the key the same way `retrieve` did, so `get("arxiv",
+        // "1211.1037 ")` finds the entry stored under the trimmed id. An unknown
+        // prefix has no policy to consult, so its key is left verbatim.
+        let key = self.normalize_key(prefix, key.to_string());
+        let requested_id = csl::cite_id(prefix, &key);
         let mut current_id = requested_id.clone();
         // Properties accumulated along the chain; earlier (closer to the
         // request) ones take precedence.
@@ -553,6 +594,11 @@ where
                     // in as defaults *under* it. The accumulated whole then
                     // overrides the concrete target at the `Concrete` arm above.
                     csl::merge_defaults(&mut accumulated, &set_properties);
+                    // Normalize the hop the same way it was normalized when
+                    // stored, so a pointer written before this policy existed (or
+                    // by a source that emitted incidental whitespace) still lands
+                    // on the trimmed target id.
+                    let tk = self.normalize_key(&tp, tk);
                     let next_id = csl::cite_id(&tp, &tk);
                     if next_id == current_id {
                         return Err(Error::Chain(alloc::format!(

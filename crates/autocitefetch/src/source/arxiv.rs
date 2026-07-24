@@ -8,11 +8,13 @@
 //! Behaviour (broadly that of the JS/Python references, with fixes — the
 //! entity handling below is *not* shared with them):
 //! * `GET …/api/query?id_list=<comma-joined, percent-encoded ids>&max_results=<n>`
-//!   for a chunk of ≤100 ids. Each requested key is **trimmed** before it is
-//!   encoded into the URL (a stray space, as in `\cite{arXiv: 1211.1037}`, makes
-//!   arXiv answer 400 for the *whole* chunk) and before it is matched against
-//!   feed entries; the returned [`Resolution::key`] is still the caller's key,
-//!   verbatim, as the manager requires.
+//!   for a chunk of ≤100 ids. Keys arrive **already trimmed** of surrounding
+//!   whitespace: the manager applies this source's default
+//!   [`Source::trim_key_whitespace`] policy centrally, so a stray space — as in
+//!   `\cite{arXiv: 1211.1037}`, which would otherwise make arXiv answer 400 for
+//!   the *whole* chunk — is gone before the key is encoded into the URL or
+//!   matched against feed entries. The returned [`Resolution::key`] equals the
+//!   key the manager sent, as the one-resolution-per-key contract requires.
 //! * Parse each `<entry>` for `<id>`, `<title>`, `<author><name>`,
 //!   `<published>`, `<updated>`, and `<arxiv:doi>`. An entry whose `<id>` is not
 //!   an `…/abs/<arxivid>` URL is an arXiv *error entry* and is skipped, so the
@@ -209,17 +211,17 @@ async fn retrieve_impl<'a>(
     }
 
     // Build the id_list query. Ids contain `/` and `.`, so each is
-    // percent-encoded; they are joined with a literal comma. Keys are trimmed
-    // here (and again when matching entries): a key like `"1211.1037 "` would
-    // otherwise encode to `1211.1037%20`, which arXiv rejects with a 400 —
-    // failing every one of the up-to-100 keys in the chunk. Only the *request*
-    // is normalized; the resolutions below still carry the caller's exact key.
+    // percent-encoded; they are joined with a literal comma. The manager has
+    // already trimmed surrounding whitespace from every key (the source's
+    // `trim_key_whitespace` policy), so none is done here — a key like
+    // `"1211.1037 "`, which would encode to `1211.1037%20` and make arXiv 400
+    // the whole chunk, can no longer reach this point.
     let mut url = String::from("https://export.arxiv.org/api/query?id_list=");
     for (i, k) in keys.iter().enumerate() {
         if i > 0 {
             url.push(',');
         }
-        encode_query_into(&mut url, k.trim());
+        encode_query_into(&mut url, k);
     }
     url.push_str("&max_results=");
     url.push_str(&keys.len().to_string());
@@ -301,16 +303,17 @@ fn fail_all(keys: Vec<String>, msg: String) -> Vec<Resolution> {
 /// Resolve one requested key against the parsed feed entries and the effective
 /// override map.
 ///
-/// The key is trimmed for *matching* only: every `Resolution` returned here
-/// carries `key` exactly as the manager supplied it, since the manager pairs
-/// resolutions back to requests by that string.
+/// The manager has already trimmed surrounding whitespace (per the source's
+/// `trim_key_whitespace` policy), so the key is matched as-is; every `Resolution`
+/// returned here carries `key` exactly as the manager supplied it, since the
+/// manager pairs resolutions back to requests by that string.
 fn resolve_key(
     chain_to_doi: bool,
     overrides: &HashMap<String, Option<String>>,
     key: String,
     entries: &[atom::Entry],
 ) -> Resolution {
-    let (base, req_version) = split_version(key.trim());
+    let (base, req_version) = split_version(&key);
 
     // Explicit version requested: select that exact version, emit concrete
     // metadata preserving the version — never chain (a DOI would drop the
@@ -352,7 +355,7 @@ fn resolve_key(
     // skipped and the arXiv metadata is kept.
     if chain_to_doi {
         if let Some(doi) = doi {
-            // `base` == the trimmed key on this (versionless) path.
+            // `base` == the key on this (versionless) path.
             let mut sp = serde_json::Map::new();
             sp.insert("arxivid".into(), CslValue::String(base.to_string()));
             return Resolution {

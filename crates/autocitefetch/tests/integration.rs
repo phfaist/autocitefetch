@@ -178,6 +178,30 @@ fn manual_source_stores_verbatim_text() {
 }
 
 #[test]
+fn manual_source_preserves_leading_and_trailing_whitespace() {
+    // `manual` opts OUT of key trimming (`trim_key_whitespace() == false`): the
+    // key IS the formatted citation text, so surrounding whitespace is
+    // significant and must survive verbatim into storage and back out of `get`.
+    let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
+        .register(ManualSource::new());
+
+    let padded = "  Bohr, N. (1913)  ".to_string();
+    let cites = vec![("manual".to_string(), padded.clone())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    // Stored under (and retrievable by) the padded id, whitespace intact.
+    let item = block_on(mgr.get("manual", &padded)).unwrap();
+    assert_eq!(item["_formatted_text"], padded, "whitespace preserved verbatim");
+    assert_eq!(item["id"], "manual:  Bohr, N. (1913)  ");
+    // The trimmed key is a *different* citation here — nothing was stored for it.
+    assert!(
+        block_on(mgr.get("manual", "Bohr, N. (1913)")).is_err(),
+        "a manual key is not collapsed with its trimmed form"
+    );
+}
+
+#[test]
 fn doi_source_parses_content_negotiated_csljson() {
     let fetcher = MockFetcher::new().route(
         "https://doi.org/10.1103/PhysRev.47.777",
@@ -198,6 +222,40 @@ fn doi_source_parses_content_negotiated_csljson() {
     assert_eq!(item["doi"], "10.1103/physrev.47.777");
     assert_eq!(item.get("DOI"), None, "uppercase DOI key must not survive");
     assert!(item["title"].as_str().unwrap().starts_with("Can Quantum"));
+}
+
+#[test]
+fn doi_key_surrounding_whitespace_is_trimmed_centrally() {
+    // A DOI key arriving with incidental surrounding whitespace is trimmed by the
+    // manager (doi keeps the default policy) *before* it reaches the source — so
+    // it resolves normally, and the padded and clean forms dedup to one fetch.
+    // Note the doi source itself still rejects a key that *contains* internal
+    // whitespace (see `a_malformed_doi_is_rejected_without_fetching_anything`);
+    // only the surrounding whitespace is stripped here, and only that. The key's
+    // own case is preserved (unlike the lowercased `doi` value in the body).
+    let fetcher = MockFetcher::new().route(
+        "https://doi.org/10.1103/PhysRev.47.777",
+        200,
+        r#"{"type":"article-journal","title":"Trimmed DOI","DOI":"10.1103/PhysRev.47.777"}"#,
+    );
+    let calls = fetcher.calls();
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(DoiSource::new());
+
+    let cites = vec![
+        ("doi".to_string(), "  10.1103/PhysRev.47.777  ".to_string()),
+        ("doi".to_string(), "10.1103/PhysRev.47.777".to_string()),
+    ];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+    // doi's chunk_size is 1, so two undeduped keys would be two fetches.
+    assert_eq!(calls.len(), 1, "padded + clean DOI must dedup to one fetch: {:?}", calls.urls());
+
+    // Both forms read the one entry, stored under the trimmed (case-preserved) id.
+    let item = block_on(mgr.get("doi", "  10.1103/PhysRev.47.777  ")).unwrap();
+    assert_eq!(item["id"], "doi:10.1103/PhysRev.47.777", "stored under the trimmed id");
+    assert_eq!(item["title"], "Trimmed DOI");
+    assert_eq!(item["doi"], "10.1103/physrev.47.777", "the DOI value is still lowercased");
 }
 
 #[test]

@@ -55,6 +55,17 @@ holds only shared borrows while driving sources concurrently, so this is require
 
 A worklist loop, not a fixed pipeline:
 
+- **Key whitespace is trimmed centrally, once.** Before an id is built, `manager.normalize_key`
+  trims leading/trailing whitespace off a requested key when the routed source declares
+  `Source::trim_key_whitespace()` (default `true`). This happens at every point a `(prefix, key)`
+  becomes a `cite_id` — the worklist loop head (so routing/`seen`-dedup/bucketing/storage all key on
+  the trimmed form and `" 1211.1037 "` collapses with `"1211.1037"` into one fetch/entry), the
+  `Outcome::Chained` store arm (so a chained target's stored pointer matches the id its target lands
+  under), and both `get`/`get_by_id` and each `get` chain hop (so a padded lookup finds the trimmed
+  entry). `manual` overrides the policy to `false` — its key *is* free-form citation text, kept
+  verbatim. An unknown prefix has no source to consult, so its key is left untrimmed. Sources thus
+  only ever see already-trimmed keys; **do not re-trim inside a source** (arXiv's old URL-only
+  `key.trim()` was removed once this landed).
 - Per pass: dedup against `seen`, look each id up in the store, and bucket the ones due for a
   (re)fetch by prefix — misses, plus anything `TtlPolicy::should_refetch` returns true for (hard-
   expired always; soft-stale *probabilistically*, see Cache policy). A cached `Payload::Chained`

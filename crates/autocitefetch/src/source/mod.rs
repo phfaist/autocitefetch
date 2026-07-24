@@ -145,6 +145,32 @@ pub trait Source {
         Duration::from_secs(30 * 24 * 60 * 60)
     }
 
+    /// Whether the manager should trim stray leading/trailing whitespace off a
+    /// requested key before it is used.
+    ///
+    /// Default `true`. For nearly every source a key is an *identifier* (an
+    /// arXiv id, a DOI, a bibliography key) where surrounding whitespace is
+    /// incidental — `\cite{arXiv: 1211.1037}` yields the key `" 1211.1037"`.
+    /// When this returns `true` the manager applies [`str::trim`]
+    /// (leading/trailing Unicode whitespace) to the key **once, centrally**,
+    /// before routing, `seen`-dedup, bucketing, storage, *and* lookup — so
+    /// `" 1211.1037 "` and `"1211.1037"` collapse to one cache id and one fetch,
+    /// and a later `get("arxiv", "1211.1037 ")` finds the entry stored under the
+    /// trimmed id. [`retrieve_chunk`](Source::retrieve_chunk) therefore only ever
+    /// sees already-trimmed keys, and the canonical `"prefix:key"` echoed in a
+    /// resolved item's `id` and in a [`CiteFailure`] is the trimmed form.
+    ///
+    /// Override to `false` for a source whose key is **free-form text** where
+    /// surrounding whitespace is significant — notably [`ManualSource`], whose
+    /// key *is* the pre-formatted citation text and must be stored verbatim.
+    /// Such a source's keys are never trimmed, so two keys differing only in
+    /// whitespace stay distinct.
+    ///
+    /// [`CiteFailure`]: crate::manager::CiteFailure
+    fn trim_key_whitespace(&self) -> bool {
+        true
+    }
+
     /// Prefixes this source may chain *to* (e.g. arXiv → `["doi"]`).
     ///
     /// **Advisory / introspection only** — the manager does not consult it.

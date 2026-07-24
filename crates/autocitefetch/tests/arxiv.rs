@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap as StdMap;
 use std::future::Future;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use autocitefetch::source::{ArxivSource, DoiSource, Source};
@@ -30,20 +31,25 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 
 struct MockFetcher {
     routes: StdMap<String, (u16, Vec<u8>)>,
-    calls: RefCell<Vec<String>>,
+    calls: Rc<RefCell<Vec<String>>>,
 }
 
 impl MockFetcher {
     fn new() -> Self {
         MockFetcher {
             routes: StdMap::new(),
-            calls: RefCell::new(Vec::new()),
+            calls: Rc::new(RefCell::new(Vec::new())),
         }
     }
     fn route(mut self, url: &str, status: u16, body: &str) -> Self {
         self.routes
             .insert(url.into(), (status, body.as_bytes().to_vec()));
         self
+    }
+    /// A shared handle on the fetch log, taken before the fetcher is moved into
+    /// a manager (so a test can count how many requests actually went out).
+    fn calls(&self) -> Rc<RefCell<Vec<String>>> {
+        self.calls.clone()
     }
 }
 
@@ -546,11 +552,12 @@ fn old_style_ids_and_multi_key_chunks_build_the_expected_url() {
 }
 
 #[test]
-fn requested_keys_are_trimmed_for_the_url_but_returned_verbatim() {
-    // `\cite{arXiv: 1211.1037}` yields a key with a leading space; untrimmed it
-    // encodes to `%201211.1037`, which arXiv answers with 400 — failing every
-    // key in the chunk. Only the trimmed URL is routed. The stored citation is
-    // still keyed by the caller's exact string (the manager matches on it).
+fn whitespace_padded_arxiv_keys_dedup_to_one_fetch_and_entry() {
+    // `\cite{arXiv: 1211.1037}` yields a key with incidental surrounding
+    // whitespace. arXiv keeps the default `trim_key_whitespace` policy, so the
+    // manager trims centrally: `" 1211.1037 "` and `"1211.1037"` requested in
+    // one call must collapse to ONE fetch (the trimmed URL) and ONE cache entry
+    // stored under the canonical, trimmed id — and any padded `get` finds it.
     let arxiv_url = "https://export.arxiv.org/api/query?id_list=1211.1037&max_results=1";
     let feed = r#"<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
@@ -563,18 +570,39 @@ fn requested_keys_are_trimmed_for_the_url_but_returned_verbatim() {
 </feed>"#;
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
+    let calls = fetcher.calls();
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
         .register(ArxivSource::new());
 
-    let cites = vec![("arxiv".to_string(), " 1211.1037 ".to_string())];
+    let cites = vec![
+        ("arxiv".to_string(), " 1211.1037 ".to_string()),
+        ("arxiv".to_string(), "1211.1037".to_string()),
+    ];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", " 1211.1037 ")).unwrap();
-    assert_eq!(item["id"], "arxiv: 1211.1037 ", "key echoed verbatim");
-    assert_eq!(item["title"], "A Padded Request");
-    assert_eq!(item["arxivid"], "1211.1037");
+    // Exactly one request went out (the trimmed URL); had the two keys not
+    // collapsed, the untrimmed one would build a different `id_list` that 404s.
+    assert_eq!(
+        calls.borrow().len(),
+        1,
+        "padded + clean keys must dedup to one fetch: {:?}",
+        calls.borrow()
+    );
+
+    // And exactly one cache entry, keyed by the trimmed id.
+    let entries = block_on(mgr.store().entries()).unwrap();
+    assert_eq!(entries.len(), 1, "one cache entry expected");
+    assert_eq!(entries[0].0, "arxiv:1211.1037", "stored under the trimmed id");
+
+    // Every whitespace variant reads that one entry; the echoed id is canonical.
+    for k in [" 1211.1037 ", "1211.1037", "1211.1037 ", " 1211.1037"] {
+        let item = block_on(mgr.get("arxiv", k)).unwrap();
+        assert_eq!(item["id"], "arxiv:1211.1037", "canonical trimmed id for {k:?}");
+        assert_eq!(item["title"], "A Padded Request");
+        assert_eq!(item["arxivid"], "1211.1037");
+    }
 }
 
 #[test]

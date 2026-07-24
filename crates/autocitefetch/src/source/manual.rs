@@ -54,6 +54,13 @@ impl Source for ManualSource {
         Duration::ZERO
     }
 
+    fn trim_key_whitespace(&self) -> bool {
+        // The key *is* the pre-formatted citation text, so leading/trailing
+        // whitespace is significant — never trim it (see the `Source` default,
+        // which every other source keeps).
+        false
+    }
+
     fn retrieve_chunk<'a>(
         &'a self,
         keys: Vec<String>,
