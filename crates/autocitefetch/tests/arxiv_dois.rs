@@ -532,6 +532,127 @@ fn explicit_version_selects_that_version_and_stays_concrete() {
     assert_eq!(item["doi"], "10.2222/should.not.chain");
 }
 
+#[test]
+fn versionless_highest_version_is_numeric_not_lexicographic() {
+    // v2 then v10 in feed order (no DOI ⇒ concrete). Lexicographically "10" sorts
+    // BEFORE "2", so a string comparison would wrongly keep v2; the numeric
+    // reduction (the JS `current >= best` on integers) must select v10. This is
+    // the discriminating case the existing v1/v11/v2 test does not isolate.
+    let arxiv_url = "https://export.arxiv.org/api/query?id_list=1807.00008&max_results=1";
+    let feed = make_feed(&[("1807.00008v2", None), ("1807.00008v10", None)]);
+
+    let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
+
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(ArxivSource::new());
+
+    let cites = vec![("arxiv".to_string(), "1807.00008".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    let item = block_on(mgr.get("arxiv", "1807.00008")).unwrap();
+    assert_eq!(item["arxiv_version_number"], 10, "10 > 2, numerically");
+    assert_eq!(item["title"], "Title 1807.00008v10");
+}
+
+#[test]
+fn versionless_entry_wins_even_when_seen_before_versioned_ones() {
+    // The versionless feed entry appears FIRST, then a numbered one. It must
+    // still win: in the JS reduce, once `best.arxiv_version_number === null`
+    // every later candidate is ignored. This complements
+    // `versionless_request_prefers_a_versionless_entry` (versionless entry
+    // *second*), pinning the "keep the versionless best" branch too.
+    let arxiv_url = "https://export.arxiv.org/api/query?id_list=1808.00009&max_results=1";
+    let feed = make_feed(&[("1808.00009", None), ("1808.00009v3", None)]);
+
+    let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
+
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(ArxivSource::new());
+
+    let cites = vec![("arxiv".to_string(), "1808.00009".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    let item = block_on(mgr.get("arxiv", "1808.00009")).unwrap();
+    assert_eq!(
+        item["arxiv_version_number"],
+        serde_json::Value::Null,
+        "the versionless entry wins regardless of feed position"
+    );
+    assert_eq!(item["title"], "Title 1808.00009");
+}
+
+#[test]
+fn versionless_ties_take_the_later_seen_entry() {
+    // Two feed entries share the SAME base id AND version number — degenerate,
+    // but it pins the tie rule: the JS reduce's `current >= best` resolves a tie
+    // in favour of the LATER-seen candidate, so FEED ORDER decides. The entries
+    // differ only in their DOI; routing *only* the later DOI means the chain can
+    // succeed iff the later entry won (the earlier DOI is unrouted and would
+    // 404).
+    let arxiv_url = "https://export.arxiv.org/api/query?id_list=1806.00007&max_results=1";
+    let later_doi_url = "https://doi.org/10.2222/later";
+    let feed = make_feed(&[
+        ("1806.00007v2", Some("10.1111/earlier")),
+        ("1806.00007v2", Some("10.2222/later")),
+    ]);
+
+    let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed).route(
+        later_doi_url,
+        200,
+        r#"{"type":"article-journal","title":"Later Entry Won"}"#,
+    );
+
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(ArxivSource::new())
+        .register(DoiSource::new());
+
+    let cites = vec![("arxiv".to_string(), "1806.00007".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(
+        report.is_complete(),
+        "a tie must resolve to the later-seen entry: {:?}",
+        report.failures
+    );
+
+    let item = block_on(mgr.get("arxiv", "1806.00007")).unwrap();
+    assert_eq!(item["title"], "Later Entry Won", "feed order decides the tie");
+    assert_eq!(item["arxivid"], "1806.00007");
+}
+
+#[test]
+fn versionless_no_data_reports_missing_without_substituting_another_id() {
+    // A versionless request whose base id is ABSENT from an otherwise-healthy
+    // feed (the feed carries a valid entry for a *different* paper). JS throws
+    // "No arXiv data found" here; the manager must report the miss and must NOT
+    // substitute the unrelated entry.
+    let arxiv_url = "https://export.arxiv.org/api/query?id_list=1809.00010&max_results=1";
+    let feed = make_feed(&[("1899.99999v1", Some("10.1234/unrelated"))]);
+
+    let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
+
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(ArxivSource::new())
+        .register(DoiSource::new());
+
+    let cites = vec![("arxiv".to_string(), "1809.00010".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].prefix, "arxiv");
+    assert_eq!(report.failures[0].key, "1809.00010");
+    assert!(
+        report.failures[0]
+            .message
+            .contains("no arXiv entry returned"),
+        "unexpected message: {}",
+        report.failures[0].message
+    );
+    assert!(block_on(mgr.get("arxiv", "1809.00010")).is_err());
+    // The unrelated entry must not have leaked in under our requested key.
+    assert!(block_on(mgr.get("arxiv", "1899.99999")).is_err());
+}
+
 // --- Task 1b: DOI suppression (None) ---------------------------------------
 
 #[test]
