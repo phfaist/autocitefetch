@@ -47,8 +47,19 @@ pub fn set_id(item: &mut CslValue, id: &str) -> bool {
 /// Used along a chain to *accumulate* `set_properties` so that a property set
 /// closer to the request wins over one set further away (see [`merge_over`] for
 /// the complementary "overrides win" direction used against the concrete
-/// target). A `null` in `overrides` is treated like any other value: inserted
-/// verbatim only when the key is absent.
+/// target).
+///
+/// Presence, not truthiness, is what "already has a value" means here:
+/// a key present in `target` with **any** value — including an explicit JSON
+/// `null` — counts as present, so its default from `overrides` is **not**
+/// applied. This is intentional. In CSL-JSON one could read `"DOI": null` as an
+/// *absence* and let the default win, but this code treats the `null` as a
+/// deliberate, caller-chosen value and leaves it in place. (Contrast
+/// [`merge_over`], which overwrites such a `null` with the override.)
+///
+/// The value coming from `overrides` gets no special treatment either: a `null`
+/// in `overrides` is inserted verbatim, but only when the key is absent from
+/// `target`, exactly like any other value.
 pub fn merge_defaults(target: &mut CslValue, overrides: &CslValue) {
     let (Some(dst), Some(src)) = (target.as_object_mut(), overrides.as_object()) else {
         return;
@@ -67,14 +78,44 @@ pub fn merge_defaults(target: &mut CslValue, overrides: &CslValue) {
 /// [`merge_defaults`]: use it when a chained citation's accumulated
 /// `set_properties` must take precedence over the concrete target's fields
 /// (matching both reference implementations, which do
-/// `{ ...target, ...set_properties }`). A `null` in `overrides` is treated like
-/// any other value — inserted/overwritten verbatim, exactly as
-/// [`merge_defaults`] copies it.
+/// `{ ...target, ...set_properties }`).
+///
+/// Every key in `overrides` is written unconditionally, so this ignores what
+/// `target` already holds: an existing value in `target` — including an
+/// explicit JSON `null` — is replaced by the corresponding `overrides` value.
+/// This is precisely where it diverges from [`merge_defaults`], which would
+/// *keep* that `null` (it counts a present-but-`null` key as already having a
+/// value). A `null` on the `overrides` side is likewise written verbatim,
+/// overwriting whatever was there.
 pub fn merge_over(target: &mut CslValue, overrides: &CslValue) {
     let (Some(dst), Some(src)) = (target.as_object_mut(), overrides.as_object()) else {
         return;
     };
     for (k, v) in src {
         dst.insert(k.clone(), v.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Pins the intentional "an explicit `null` in `target` blocks the default"
+    /// behavior (review item #15): `merge_defaults` counts a present-but-`null`
+    /// key as already having a value, so the default is *not* applied, whereas
+    /// `merge_over` overwrites the `null`. Do not "fix" this into treating a
+    /// `null` as an absence — it is a deliberate, caller-chosen value.
+    #[test]
+    fn explicit_null_in_target_blocks_default_but_not_override() {
+        // merge_defaults: the `null` already present wins; default is skipped.
+        let mut target = json!({ "DOI": null });
+        merge_defaults(&mut target, &json!({ "DOI": "10.x/y" }));
+        assert_eq!(target, json!({ "DOI": null }));
+
+        // merge_over: the override wins, replacing the `null`.
+        let mut target = json!({ "DOI": null });
+        merge_over(&mut target, &json!({ "DOI": "10.x/y" }));
+        assert_eq!(target, json!({ "DOI": "10.x/y" }));
     }
 }
