@@ -169,8 +169,8 @@ fn arxiv_versionless_with_doi_chains_and_merges() {
         );
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new())
-        .register(DoiSource::new());
+        .register(ArxivSource::new()).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1211.1037".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -195,8 +195,8 @@ fn arxiv_concrete_parses_title_authors_and_issued() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, FEED_CONCRETE);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().chaining(false))
-        .register(DoiSource::new());
+        .register(ArxivSource::new().chaining(false)).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "0905.2794".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -249,7 +249,7 @@ fn issued_falls_back_to_published_when_no_updated() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().chaining(false));
+        .register(ArxivSource::new().chaining(false)).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1601.00007".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -282,8 +282,8 @@ fn versioned_request_uses_that_versions_updated_date() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new())
-        .register(DoiSource::new());
+        .register(ArxivSource::new()).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1211.1037v2".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -316,7 +316,7 @@ fn arxiv_unknown_id_is_reported_not_fatal() {
     );
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "9999.99999".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -351,7 +351,7 @@ fn entity_references_are_decoded_in_titles_and_authors() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "1234.5678".to_string()),
@@ -393,7 +393,7 @@ fn malformed_entity_references_are_left_verbatim() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1234.5680".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -428,7 +428,7 @@ fn cdata_content_stays_raw() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1234.5681".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -477,8 +477,8 @@ fn blank_arxiv_doi_does_not_chain_to_the_empty_doi_key() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new())
-        .register(DoiSource::new());
+        .register(ArxivSource::new()).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "2100.00001".to_string()),
@@ -531,7 +531,7 @@ fn old_style_ids_and_multi_key_chunks_build_the_expected_url() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "math/0309136".to_string()),
@@ -573,7 +573,7 @@ fn whitespace_padded_arxiv_keys_dedup_to_one_fetch_and_entry() {
     let calls = fetcher.calls();
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), " 1211.1037 ".to_string()),
@@ -621,7 +621,7 @@ fn version_suffix_matching_is_case_insensitive() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1211.1037V2".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -641,7 +641,7 @@ fn http_error_status_fails_every_key_in_the_chunk() {
     let fetcher = MockFetcher::new().route(arxiv_url, 400, "id_list is malformed");
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "1234.5678".to_string()),
@@ -665,7 +665,7 @@ fn malformed_xml_fails_every_key_in_the_chunk() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, "<feed><entry><<</entry></feed>");
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "1234.5678".to_string()),

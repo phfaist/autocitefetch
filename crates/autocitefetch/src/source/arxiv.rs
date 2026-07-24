@@ -641,6 +641,9 @@ mod atom {
                 None => false,
             };
             if cap_matches {
+                // Invariant, not input handling: `cap_matches` is true only in
+                // the `Some(_)` arms above, so `capture` is guaranteed present
+                // here regardless of what the feed contains.
                 let cap = self.capture.take().unwrap();
                 let text = core::mem::take(&mut self.buf);
                 if let Some(raw) = &mut self.raw {

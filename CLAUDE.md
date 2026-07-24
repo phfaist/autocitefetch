@@ -43,7 +43,8 @@ Nothing else returns CSL data.
 ### The four injected traits
 
 `Fetcher`, `CacheStore`, `Clock`, `Timer` (in `fetch.rs`, `store.rs`, `env.rs`) are the entire host
-surface, assembled via `CitationManager::new(fetcher, store, clock, timer).register(source)`.
+surface, assembled via `CitationManager::new(fetcher, store, clock, timer).register(source)?`
+(`register` returns `Result` — it rejects an empty or `':'`-containing prefix rather than panicking).
 Every async trait method returns `BoxFuture<'a, T>` (`lib.rs`) — a **`!Send`** boxed future. This is
 deliberate: WASM futures are `!Send`, the core assumes a single cooperative task, and boxing keeps
 the traits object-safe (`&dyn Fetcher`, `Box<dyn Source>`). Do not add `Send`/`Sync` bounds.

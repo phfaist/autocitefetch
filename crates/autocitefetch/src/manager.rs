@@ -105,23 +105,25 @@ where
         }
     }
 
-    /// Register a source under its declared prefix. Builder-style.
+    /// Register a source under its declared prefix. Builder-style, so chains
+    /// compose as `.register(a)?.register(b)?`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// If the source's prefix contains a `':'`. Citation ids are
-    /// `"prefix:key"` and are split on the *first* colon, so such a prefix
-    /// would make ids ambiguous (`("a", "b:c")` and `("a:b", "c")` collide in
-    /// the cache) and break the [`CitationManager::get_by_id`] round-trip.
-    /// This is a construction-time programming error, not a runtime condition.
-    pub fn register(mut self, source: impl Source + 'static) -> Self {
+    /// Returns [`Error::InvalidPrefix`] if the source's prefix is empty or
+    /// contains a `':'`. Citation ids are `"prefix:key"` and are split on the
+    /// *first* colon, so such a prefix would make ids ambiguous (`("a", "b:c")`
+    /// and `("a:b", "c")` collide in the cache) — and an empty prefix produces
+    /// `":key"`, which breaks the [`CitationManager::get_by_id`] round-trip. The
+    /// prefix is host-supplied data, so a bad one is rejected as a runtime error
+    /// rather than panicking.
+    pub fn register(mut self, source: impl Source + 'static) -> Result<Self> {
         let prefix = source.prefix();
-        assert!(
-            !prefix.contains(':'),
-            "source prefix `{prefix}` must not contain ':' — citation ids are `prefix:key`"
-        );
+        if prefix.is_empty() || prefix.contains(':') {
+            return Err(Error::InvalidPrefix(prefix.to_string()));
+        }
         self.sources.insert(prefix.to_string(), Box::new(source));
-        self
+        Ok(self)
     }
 
     /// Override the TTL policy. Builder-style.
@@ -324,6 +326,10 @@ where
             let source_futures = bucket_list.into_iter().map(|(prefix, keys, last)| {
                 let ctx = &ctx;
                 async move {
+                    // Invariant, not input handling: only prefixes that passed
+                    // `self.sources.contains_key` above were bucketed, so the
+                    // lookup cannot miss. (Bad prefixes are rejected in
+                    // `register`; unknown ones were reported and skipped.)
                     let source = self
                         .sources
                         .get(&prefix)
@@ -350,6 +356,9 @@ where
                 if let Some(t) = started {
                     last_start.insert(prefix.clone(), t);
                 }
+                // Invariant, not input handling: `prefix` came from a bucket
+                // built only from registered prefixes, so this lookup is
+                // guaranteed to hit.
                 let source = self
                     .sources
                     .get(&prefix)

@@ -159,8 +159,8 @@ fn override_map_injects_doi_when_feed_has_none() {
     );
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().with_override_dois([kv("2001.00001", "10.9999/override.abc")]))
-        .register(DoiSource::new());
+        .register(ArxivSource::new().with_override_dois([kv("2001.00001", "10.9999/override.abc")])).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "2001.00001".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -192,8 +192,8 @@ fn override_map_beats_feed_doi() {
     );
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().with_override_dois([kv("2002.00002", "10.9999/override.win")]))
-        .register(DoiSource::new());
+        .register(ArxivSource::new().with_override_dois([kv("2002.00002", "10.9999/override.win")])).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "2002.00002".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -226,8 +226,8 @@ fn override_file_entry_drives_chaining() {
         );
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().with_override_dois_file(file_url))
-        .register(DoiSource::new());
+        .register(ArxivSource::new().with_override_dois_file(file_url)).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "4001.00004".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -261,8 +261,8 @@ fn inline_override_beats_file_override() {
             ArxivSource::new()
                 .with_override_dois_file(file_url)
                 .with_override_dois([kv("3001.00003", "10.7777/inline.wins")]),
-        )
-        .register(DoiSource::new());
+        ).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "3001.00003".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -287,8 +287,8 @@ fn override_file_load_failure_fails_keys_gracefully() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().with_override_dois_file(file_url))
-        .register(DoiSource::new());
+        .register(ArxivSource::new().with_override_dois_file(file_url)).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "5001.00005".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -317,7 +317,7 @@ fn override_file_must_be_a_json_object() {
         .route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().with_override_dois_file(file_url));
+        .register(ArxivSource::new().with_override_dois_file(file_url)).unwrap();
 
     let cites = vec![("arxiv".to_string(), "5002.00005".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -340,7 +340,7 @@ fn override_file_values_must_be_string_or_null() {
         .route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().with_override_dois_file(file_url));
+        .register(ArxivSource::new().with_override_dois_file(file_url)).unwrap();
 
     let cites = vec![("arxiv".to_string(), "5003.00005".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -364,7 +364,7 @@ fn versionless_request_selects_highest_version() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1801.00002".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -386,7 +386,7 @@ fn versionless_request_prefers_a_versionless_entry() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1802.00003".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -418,7 +418,7 @@ fn versionless_request_compares_versions_numerically() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1803.00004".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -439,8 +439,8 @@ fn explicit_version_missing_from_the_feed_fails_rather_than_substituting() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new())
-        .register(DoiSource::new());
+        .register(ArxivSource::new()).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1804.00005v2".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -477,8 +477,8 @@ fn versionless_and_versioned_requests_for_one_paper_coexist_in_a_batch() {
     );
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new())
-        .register(DoiSource::new());
+        .register(ArxivSource::new()).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "1805.00006".to_string()),
@@ -513,8 +513,8 @@ fn explicit_version_selects_that_version_and_stays_concrete() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new())
-        .register(DoiSource::new());
+        .register(ArxivSource::new()).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1801.00002v1".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -544,7 +544,7 @@ fn versionless_highest_version_is_numeric_not_lexicographic() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1807.00008".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -568,7 +568,7 @@ fn versionless_entry_wins_even_when_seen_before_versioned_ones() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1808.00009".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -605,8 +605,8 @@ fn versionless_ties_take_the_later_seen_entry() {
     );
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new())
-        .register(DoiSource::new());
+        .register(ArxivSource::new()).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1806.00007".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -633,8 +633,8 @@ fn versionless_no_data_reports_missing_without_substituting_another_id() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new())
-        .register(DoiSource::new());
+        .register(ArxivSource::new()).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1809.00010".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -666,8 +666,8 @@ fn override_none_suppresses_feed_doi() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().with_override_dois([suppress("6001.00006")]))
-        .register(DoiSource::new());
+        .register(ArxivSource::new().with_override_dois([suppress("6001.00006")])).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "6001.00006".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -697,8 +697,8 @@ fn override_file_null_suppresses_doi() {
         .route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().with_override_dois_file(file_url))
-        .register(DoiSource::new());
+        .register(ArxivSource::new().with_override_dois_file(file_url)).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "7001.00007".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -723,8 +723,8 @@ fn empty_string_override_does_not_chain_to_the_empty_doi_key() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().with_override_dois([kv("8001.00008", "")]))
-        .register(DoiSource::new());
+        .register(ArxivSource::new().with_override_dois([kv("8001.00008", "")])).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "8001.00008".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -752,8 +752,8 @@ fn empty_string_in_override_file_does_not_chain_to_the_empty_doi_key() {
         .route(arxiv_url, 200, &feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().with_override_dois_file(file_url))
-        .register(DoiSource::new());
+        .register(ArxivSource::new().with_override_dois_file(file_url)).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "8002.00008".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();

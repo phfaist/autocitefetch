@@ -289,7 +289,7 @@ fn cites(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 fn a_key_the_source_omits_is_reported() {
     let clock = MovableClock::default();
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::OmitOthers, &clock));
+        .register(ScriptSource::new("s", Answer::OmitOthers, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "ok"), ("s", "ghost")]))).unwrap();
     assert!(!report.is_complete(), "the dropped key must be reported");
@@ -313,7 +313,7 @@ fn duplicate_resolutions_for_one_key_are_collapsed() {
     let store = MemStore::default();
     let puts = store.puts.clone();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::Duplicate, &clock));
+        .register(ScriptSource::new("s", Answer::Duplicate, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
@@ -329,7 +329,7 @@ fn a_non_object_concrete_payload_is_reported_not_stubbed() {
     let store = MemStore::default();
     let entries = store.clone();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::NonObject, &clock));
+        .register(ScriptSource::new("s", Answer::NonObject, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert_eq!(report.failures.len(), 1);
@@ -359,7 +359,7 @@ fn chain_discovery_is_bounded_by_max_chain_depth() {
     let log = src.log();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
         .with_max_chain_depth(4)
-        .register(src);
+        .register(src).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("c", "0")]))).unwrap();
 
@@ -387,7 +387,7 @@ fn a_self_chain_is_rejected_at_store_time() {
     let store = MemStore::default();
     let entries = store.clone();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::SelfChain, &clock));
+        .register(ScriptSource::new("s", Answer::SelfChain, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert_eq!(report.failures.len(), 1);
@@ -451,8 +451,8 @@ fn a_stale_pointer_does_not_fetch_its_dead_target() {
     let b = ScriptSource::new("b", Answer::Fail, &clock);
     let b_log = b.log();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(a)
-        .register(b);
+        .register(a).unwrap()
+        .register(b).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("a", "x")]))).unwrap();
     assert!(
@@ -492,8 +492,8 @@ fn a_grace_served_pointer_keeps_its_target() {
     let b = ScriptSource::new("b", Answer::Concrete, &clock);
     let b_log = b.log();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(a)
-        .register(b);
+        .register(a).unwrap()
+        .register(b).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("a", "x")]))).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
@@ -598,7 +598,7 @@ fn missing_is_reported_and_removes_stale_while_failed_is_grace_served() {
     let store = MemStore::default();
     seed(&store);
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::Fail, &clock));
+        .register(ScriptSource::new("s", Answer::Fail, &clock)).unwrap();
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert!(
         report.is_complete(),
@@ -617,7 +617,7 @@ fn missing_is_reported_and_removes_stale_while_failed_is_grace_served() {
     let store = MemStore::default();
     seed(&store);
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::Missing, &clock));
+        .register(ScriptSource::new("s", Answer::Missing, &clock)).unwrap();
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert_eq!(
         report.failures.len(),
@@ -653,8 +653,8 @@ fn pacing_is_start_to_start_and_survives_passes() {
         clock: clock.clone(),
     };
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), timer)
-        .register(a)
-        .register(b);
+        .register(a).unwrap()
+        .register(b).unwrap();
 
     let report =
         block_on(mgr.retrieve(&cites(&[("b", "d1"), ("b", "d2"), ("a", "x")]))).unwrap();
@@ -680,7 +680,7 @@ fn pacing_is_start_to_start_and_survives_passes() {
 fn get_by_id_round_trips_and_rejects_a_missing_colon() {
     let clock = MovableClock::default();
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::Concrete, &clock));
+        .register(ScriptSource::new("s", Answer::Concrete, &clock)).unwrap();
 
     // A key containing a colon still round-trips: ids split on the *first* one.
     block_on(mgr.retrieve(&cites(&[("s", "k"), ("s", "10.1/x:y")]))).unwrap();
@@ -696,11 +696,39 @@ fn get_by_id_round_trips_and_rejects_a_missing_colon() {
 }
 
 /// A prefix containing `':'` would make `prefix:key` ids ambiguous, so it is
-/// refused at registration time rather than silently corrupting the cache.
+/// refused at registration time (with an error, not a panic) rather than
+/// silently corrupting the cache.
 #[test]
-#[should_panic(expected = "must not contain ':'")]
-fn registering_a_prefix_with_a_colon_panics() {
+fn registering_a_prefix_with_a_colon_errors() {
     let clock = MovableClock::default();
-    let _ = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(ScriptSource::new("bad:prefix", Answer::Concrete, &clock));
+    let err = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(ScriptSource::new("bad:prefix", Answer::Concrete, &clock))
+        .err()
+        .expect("a colon-containing prefix must be rejected");
+    assert!(matches!(err, Error::InvalidPrefix(_)), "got {err}");
+    assert!(err.to_string().contains("bad:prefix"), "got: {err}");
+}
+
+/// An empty prefix yields `":key"` ids, which break the `get_by_id` split, so
+/// it is refused the same way.
+#[test]
+fn registering_an_empty_prefix_errors() {
+    let clock = MovableClock::default();
+    let err = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(ScriptSource::new("", Answer::Concrete, &clock))
+        .err()
+        .expect("an empty prefix must be rejected");
+    assert!(matches!(err, Error::InvalidPrefix(_)), "got {err}");
+}
+
+/// The common case: a normal prefix registers fine and returns the manager for
+/// further chaining.
+#[test]
+fn registering_a_normal_prefix_succeeds() {
+    let clock = MovableClock::default();
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(ScriptSource::new("s", Answer::Concrete, &clock))
+        .expect("a colon-free, non-empty prefix must register");
+    let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
 }

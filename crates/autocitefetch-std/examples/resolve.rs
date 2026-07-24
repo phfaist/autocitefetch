@@ -75,8 +75,11 @@ fn main() {
 
     let manager = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
         .register(DoiSource::new())
+        .expect("register doi source")
         .register(ManualSource::new())
-        .register(BibliographyFileSource::new([bib_url]));
+        .expect("register manual source")
+        .register(BibliographyFileSource::new([bib_url]))
+        .expect("register bibliography source");
 
     let cites = vec![
         // Needs network (doi.org content negotiation).

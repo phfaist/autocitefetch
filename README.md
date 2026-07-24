@@ -159,11 +159,13 @@ use autocitefetch::source::{ArxivSource, DoiSource, ManualSource, BibliographyFi
 use autocitefetch_std::{BlockingTimer, SingleFileCacheStore, SystemClock, UreqFetcher};
 
 let store = SingleFileCacheStore::new(".citecache").await?;
+// `register` returns `Result` — it rejects a source whose prefix is empty or
+// contains ':' (which would make `prefix:key` ids ambiguous) — so chain with `?`.
 let mgr = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
-    .register(ArxivSource::new())
-    .register(DoiSource::new())
-    .register(ManualSource::new())
-    .register(BibliographyFileSource::new(["file:refs.json".into()]));
+    .register(ArxivSource::new())?
+    .register(DoiSource::new())?
+    .register(ManualSource::new())?
+    .register(BibliographyFileSource::new(["file:refs.json".into()]))?;
 
 let report = mgr.retrieve(&[("doi".into(), "10.1103/PhysRev.47.777".into())]).await?;
 let item = mgr.get("doi", "10.1103/PhysRev.47.777").await?; // CSL-JSON Value

@@ -148,7 +148,7 @@ fn from_entries_resolves_without_any_fetch() {
         serde_json::json!({"id":"knuth1984","type":"book","title":"The TeXbook"}),
     )]);
     let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock, InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![("bib".to_string(), "knuth1984".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -166,7 +166,7 @@ fn retrieve_bib(
     keys: &[&str],
 ) -> Vec<autocitefetch::manager::CiteFailure> {
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
     let cites: Vec<(String, String)> = keys
         .iter()
         .map(|k| ("bib".to_string(), k.to_string()))
@@ -185,7 +185,7 @@ fn the_object_form_maps_id_to_item() {
     );
     let bib = BibliographyFileSource::new([url.to_string()]);
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![
         ("bib".to_string(), "k1".to_string()),
@@ -213,7 +213,7 @@ fn non_object_entries_in_the_object_form_are_reported_not_silently_emptied() {
     );
     let bib = BibliographyFileSource::new([url.to_string()]);
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites: Vec<(String, String)> = ["k1", "k2", "k3", "k4", "ok"]
         .iter()
@@ -263,7 +263,7 @@ fn later_files_win_on_duplicate_ids() {
         .route(b, 200, br#"[{"id":"dup","title":"From B"}]"#);
     let bib = BibliographyFileSource::new([a.to_string(), b.to_string()]);
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![
         ("bib".to_string(), "dup".to_string()),
@@ -310,7 +310,7 @@ fn a_key_removed_from_a_reloaded_file_is_reported_and_stops_serving_old_data() {
     // old code silently served.
     let bib = BibliographyFileSource::new([url.to_string()]).with_ttl(Duration::from_secs(10));
     let mgr = CitationManager::new(fetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![("bib".to_string(), "k1".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -407,7 +407,7 @@ fn a_file_is_refetched_once_its_entries_hard_expire() {
     // not asserted here — that ramp is covered in `cache_policy.rs`.)
     let bib = BibliographyFileSource::new([url.to_string()]).with_ttl(Duration::from_secs(100));
     let mgr = CitationManager::new(fetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![("bib".to_string(), "k1".to_string())];
     block_on(mgr.retrieve(&cites)).unwrap();
@@ -434,7 +434,7 @@ fn with_ttl_shortens_the_fresh_window() {
     // Same instant as above, but a 1 s TTL: long stale by 60 s.
     let bib = BibliographyFileSource::new([url.to_string()]).with_ttl(Duration::from_secs(1));
     let mgr = CitationManager::new(fetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![("bib".to_string(), "k1".to_string())];
     block_on(mgr.retrieve(&cites)).unwrap();
@@ -450,7 +450,7 @@ fn from_entries_rejects_a_non_object_entry() {
         ("good".to_string(), serde_json::json!({"title":"Fine"})),
     ]);
     let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock, InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![
         ("bib".to_string(), "bad".to_string()),
@@ -475,7 +475,7 @@ fn with_parser_uses_the_injected_parser() {
 
     let bib = BibliographyFileSource::new([file_url.to_string()]).with_parser(parse_custom);
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![("bib".to_string(), "x1".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
