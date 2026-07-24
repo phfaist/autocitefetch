@@ -4,6 +4,18 @@
 //! native CSL-JSON — so there is no per-field mapping to do, we store the
 //! response essentially verbatim. One DOI per request; ~1 req/s.
 //!
+//! **Keys arrive canonical.** This source keeps the default
+//! [`Source::normalize_key`] (trim + ASCII-lowercase), which is exactly right
+//! for DOIs: the DOI Handbook declares them case-insensitive, so
+//! `10.1103/PhysRevA.86.052329` and `10.1103/physreva.86.052329` are one
+//! citation, and the manager folds them to one `doi:` cache id and one request
+//! before this source ever sees them. Nothing here re-cases or re-trims a key —
+//! including keys arriving as an arXiv chain target, which the manager
+//! normalizes with *this* policy on the way in. Note this concerns the cache
+//! *key* only; the CSL `DOI` **field** below is a different thing and keeps its
+//! registered case. (Internal whitespace is deliberately *not* normalized away,
+//! so `resolve_one`'s guard below can still reject a malformed key.)
+//!
 //! The one deliberate touch is the **DOI key**: this workspace emits the
 //! canonical CSL-JSON spelling, uppercase `DOI`, everywhere (the arXiv source
 //! also builds `DOI`). doi.org already returns `DOI`, so this is a no-op on its

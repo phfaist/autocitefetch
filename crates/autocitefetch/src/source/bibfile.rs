@@ -16,6 +16,20 @@
 //! serde deserializer can produce it, and the core depends on no format crate
 //! but serde_json. Alternatively, parse everything host-side and pass the data
 //! directly via [`BibliographyFileSource::from_entries`].
+//!
+//! **Keys are case-sensitive.** This source overrides [`Source::normalize_key`]
+//! to *trim only*, dropping the default policy's lowercasing. A bib key is not a
+//! case-insensitive identifier like a DOI: it is an opaque, user-chosen label
+//! (`Knuth1984`, `bell64`) matched byte-for-byte against the `id` written in the
+//! file — data this source does not own and must not rewrite. Lowercasing the
+//! *request* alone would silently miss (`bib:knuth1984` vs a file saying
+//! `Knuth1984`); lowercasing the *index* too would fold two distinct entries
+//! that differ only in case (`Bell` and `bell` in one file) onto one id, with
+//! whichever loaded last silently winning, and would stop
+//! [`from_entries`](BibliographyFileSource::from_entries) round-tripping the
+//! host's own ids. LaTeX/BibTeX treat citation keys case-sensitively too, so
+//! byte-for-byte matching is also the least surprising. Surrounding whitespace
+//! is still incidental, hence the trim.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -110,6 +124,13 @@ impl Source for BibliographyFileSource {
 
     fn default_ttl(&self) -> Duration {
         self.ttl
+    }
+
+    fn normalize_key(&self, key: &str) -> String {
+        // Trim only — deliberately **not** the default's added lowercasing. See
+        // the module docs: a bib key is an opaque label matched byte-for-byte
+        // against the `id` written in the file, which this source does not own.
+        String::from(key.trim())
     }
 
     fn retrieve_chunk<'a>(

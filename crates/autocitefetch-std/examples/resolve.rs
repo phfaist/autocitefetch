@@ -82,7 +82,10 @@ fn main() {
         .expect("register bibliography source");
 
     let cites = vec![
-        // Needs network (doi.org content negotiation).
+        // Needs network (doi.org content negotiation). Requested in the DOI's
+        // registered mixed case; `doi` uses the default `Source::normalize_key`
+        // (trim + lowercase), so the printed item's `id` comes back lowercased
+        // — the CSL `DOI` *field* keeps doi.org's casing.
         ("doi".to_string(), "10.1103/PhysRev.47.777".to_string()),
         // Offline: the key *is* the pre-formatted text.
         ("manual".to_string(), "Einstein, A. (1935)".to_string()),
