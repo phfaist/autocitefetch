@@ -123,9 +123,6 @@ struct TagSource {
 }
 
 impl Source for TagSource {
-    fn prefix(&self) -> &str {
-        self.prefix
-    }
     fn retrieve_chunk<'a>(
         &'a self,
         keys: Vec<String>,
@@ -156,14 +153,22 @@ impl Source for TagSource {
 fn two_sources_resolve_concurrently_in_one_pass() {
     let events: EventLog = Rc::new(RefCell::new(Vec::new()));
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), FixedClock(0), YieldingTimer)
-        .register(TagSource {
-            prefix: "alpha",
-            events: events.clone(),
-        }).unwrap()
-        .register(TagSource {
-            prefix: "beta",
-            events: events.clone(),
-        }).unwrap();
+        .register(
+            "alpha",
+            TagSource {
+                prefix: "alpha",
+                events: events.clone(),
+            },
+        )
+        .unwrap()
+        .register(
+            "beta",
+            TagSource {
+                prefix: "beta",
+                events: events.clone(),
+            },
+        )
+        .unwrap();
 
     // Both prefixes requested in a single retrieve call => same pass => the
     // two `drive_source` calls run concurrently.

@@ -1,5 +1,10 @@
 //! The `bib` source: look keys up in local/remote bibliography files.
 //!
+//! `bib` is the prefix this is *conventionally* registered under, not one it
+//! declares: the host names it at
+//! [`register`](crate::manager::CitationManager::register) time and may pick any
+//! other. See the [`source`](crate::source) module docs.
+//!
 //! Files are fetched through [`RetrieveCtx::fetcher`] (which resolves `file:`
 //! URLs to local reads) and indexed by each entry's `id`. A file may be either
 //! an array of items (each with an `id`) or an object mapping id → item. In
@@ -110,10 +115,6 @@ impl BibliographyFileSource {
 }
 
 impl Source for BibliographyFileSource {
-    fn prefix(&self) -> &str {
-        "bib"
-    }
-
     fn chunk_size(&self) -> usize {
         usize::MAX
     }
@@ -196,9 +197,13 @@ impl Source for BibliographyFileSource {
                             //
                             // `Error::NotFound`'s Display already renders
                             // "citation `…` not found"; pass it the id, not a
-                            // sentence, or the two nest into gibberish.
+                            // sentence, or the two nest into gibberish. The id
+                            // is built from `ctx.prefix` — the prefix the host
+                            // registered this source under — since the source
+                            // declares none of its own and one bibliography
+                            // source may well be registered as `theses`.
                             None => {
-                                let e = Error::NotFound(crate::csl::cite_id("bib", &k));
+                                let e = Error::NotFound(crate::csl::cite_id(ctx.prefix, &k));
                                 Resolution::missing(k, e)
                             }
                         },

@@ -147,9 +147,6 @@ impl ProbeSource {
 }
 
 impl Source for ProbeSource {
-    fn prefix(&self) -> &str {
-        "probe"
-    }
     fn min_interval(&self) -> Duration {
         Duration::ZERO
     }
@@ -198,9 +195,6 @@ impl RecordingSource {
 }
 
 impl Source for RecordingSource {
-    fn prefix(&self) -> &str {
-        self.prefix
-    }
     fn min_interval(&self) -> Duration {
         Duration::ZERO
     }
@@ -253,7 +247,7 @@ fn fresh_is_not_refetched_expired_is() {
     let calls = src.calls.clone();
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
         .with_policy(no_jitter(Duration::from_secs(60)))
-        .register(src).unwrap();
+        .register("probe", src).unwrap();
 
     block_on(mgr.retrieve(&cites("k"))).unwrap();
     assert_eq!(calls.borrow().len(), 1, "first retrieve must hit the source");
@@ -408,7 +402,7 @@ fn a_stale_batch_is_only_partly_refetched() {
     let calls = src.calls.clone();
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
         .with_policy(no_jitter(Duration::from_secs(600)))
-        .register(src).unwrap();
+        .register("probe", src).unwrap();
 
     let n = 200;
     let batch: Vec<(String, String)> = (0..n)
@@ -443,8 +437,8 @@ fn a_not_refetched_stale_pointer_keeps_its_target() {
     let b_calls = b.calls.clone();
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
         .with_policy(no_jitter(Duration::from_secs(600)))
-        .register(a).unwrap()
-        .register(b).unwrap();
+        .register(a.prefix, a).unwrap()
+        .register(b.prefix, b).unwrap();
 
     // Seed `a:x` as a stale pointer to a `b:t` that is not yet cached.
     // stale_after == now (1000) < expires (2000) ⇒ Stale with f = 0.
@@ -659,7 +653,7 @@ fn expired_entry_within_grace_is_kept_and_not_reported() {
     let down = src.down.clone();
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
         .with_policy(no_jitter(Duration::from_secs(60)))
-        .register(src).unwrap();
+        .register("probe", src).unwrap();
 
     block_on(mgr.retrieve(&cites("k"))).unwrap();
     assert_eq!(block_on(mgr.get("probe", "k")).unwrap()["title"], "item k");
@@ -695,7 +689,7 @@ fn prune_drops_only_entries_past_the_grace_window() {
     let src = ProbeSource::new(Duration::from_millis(1000));
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
         .with_policy(no_jitter(Duration::from_secs(60)))
-        .register(src).unwrap();
+        .register("probe", src).unwrap();
 
     block_on(mgr.retrieve(&cites("old"))).unwrap();
     clock.set(30_000);
@@ -727,7 +721,7 @@ fn store_errors_abort_retrieve_but_still_flush() {
     let src = ProbeSource::new(Duration::from_millis(1000));
     let mgr = CitationManager::new(NoopFetcher, store, MovableClock::new(0), InstantTimer)
         .with_policy(no_jitter(Duration::from_secs(60)))
-        .register(src).unwrap();
+        .register("probe", src).unwrap();
 
     let err = block_on(mgr.retrieve(&cites("k"))).unwrap_err();
     assert!(

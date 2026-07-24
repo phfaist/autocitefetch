@@ -1,5 +1,10 @@
 //! The `doi` source: doi.org content negotiation.
 //!
+//! `doi` is the prefix this is *conventionally* registered under, not one it
+//! declares: the host names it at
+//! [`register`](crate::manager::CitationManager::register) time and may pick any
+//! other. See the [`source`](crate::source) module docs.
+//!
 //! doi.org, asked for `application/vnd.citationstyles.csl+json`, returns
 //! native CSL-JSON — so there is no per-field mapping to do, we store the
 //! response essentially verbatim. One DOI per request; ~1 req/s.
@@ -48,10 +53,6 @@ impl DoiSource {
 }
 
 impl Source for DoiSource {
-    fn prefix(&self) -> &str {
-        "doi"
-    }
-
     fn chunk_size(&self) -> usize {
         1
     }
@@ -120,8 +121,13 @@ async fn resolve_one(doi: &str, ctx: &RetrieveCtx<'_>) -> Resolution {
         // than grace-serving now-wrong metadata. Every other non-2xx (and any
         // 5xx/timeout the retrying fetcher already gave up on) is treated as a
         // transient reachability failure (`Failed`), grace-served if cached.
+        //
+        // The id in the message is built from `ctx.prefix`, never a literal
+        // `"doi"`: this source declares no prefix, so a host that registered it
+        // as `dx` must not read "citation `doi:…` not found" about a citation it
+        // wrote as `dx:…`.
         Ok(resp) if resp.status == 404 => {
-            Resolution::missing(doi, Error::NotFound(crate::csl::cite_id("doi", doi)))
+            Resolution::missing(doi, Error::NotFound(crate::csl::cite_id(ctx.prefix, doi)))
         }
         Ok(resp) => Resolution::failed(
             doi,

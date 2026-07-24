@@ -169,24 +169,52 @@ where
         }
     }
 
-    /// Register a source under its declared prefix. Builder-style, so chains
-    /// compose as `.register(a)?.register(b)?`.
+    /// Bind `source` to `prefix`. Builder-style, so registrations compose as
+    /// `.register("arxiv", a)?.register("doi", b)?`.
+    ///
+    /// **The prefix is the host's choice, not the source's.** A [`Source`]
+    /// declares no prefix, so the same source *type* — even two configurations
+    /// of it — can serve as many prefixes as the host likes:
+    ///
+    /// ```ignore
+    /// let mgr = CitationManager::new(fetcher, store, clock, timer)
+    ///     .register("doi", DoiSource::new())?
+    ///     .register("bib", BibliographyFileSource::new(["file:refs.json".into()]))?
+    ///     .register("theses", BibliographyFileSource::new(["file:theses.json".into()]))?;
+    /// ```
+    ///
+    /// The binding is a map entry: registering a prefix that is already bound
+    /// **replaces** the previous source, which is how a host overrides a
+    /// built-in with its own. Nothing is cached across that swap, so entries
+    /// stored by the old source stay in the cache under the same ids until they
+    /// expire.
+    ///
+    /// A source that chains to another prefix must be *configured* with it (see
+    /// [`ArxivSource::chain_dois_to`]) — it cannot assume the name
+    /// its target was registered under.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidPrefix`] if the source's prefix is empty or
-    /// contains a `':'`. Citation ids are `"prefix:key"` and are split on the
-    /// *first* colon, so such a prefix would make ids ambiguous (`("a", "b:c")`
-    /// and `("a:b", "c")` collide in the cache) — and an empty prefix produces
+    /// Returns [`Error::InvalidPrefix`] if `prefix` is empty or contains a
+    /// `':'`. Citation ids are `"prefix:key"` and are split on the *first*
+    /// colon, so such a prefix would make ids ambiguous (`("a", "b:c")` and
+    /// `("a:b", "c")` collide in the cache) — and an empty prefix produces
     /// `":key"`, which breaks the [`CitationManager::get_by_id`] round-trip. The
     /// prefix is host-supplied data, so a bad one is rejected as a runtime error
     /// rather than panicking.
-    pub fn register(mut self, source: impl Source + 'static) -> Result<Self> {
-        let prefix = source.prefix();
+    ///
+    /// [`ArxivSource::chain_dois_to`]:
+    ///     crate::source::ArxivSource::chain_dois_to
+    pub fn register(
+        mut self,
+        prefix: impl Into<String>,
+        source: impl Source + 'static,
+    ) -> Result<Self> {
+        let prefix = prefix.into();
         if prefix.is_empty() || prefix.contains(':') {
-            return Err(Error::InvalidPrefix(prefix.to_string()));
+            return Err(Error::InvalidPrefix(prefix));
         }
-        self.sources.insert(prefix.to_string(), Box::new(source));
+        self.sources.insert(prefix, Box::new(source));
         Ok(self)
     }
 
@@ -414,21 +442,15 @@ where
             // sources still run one after another. The win is for hosts whose
             // fetcher/timer are genuinely async (WASM `fetch()`/`setTimeout`).
             //
-            // Transparently interpose the retrying fetcher: `retrying` and
-            // `ctx` are locals that outlive the whole `buffer_unordered` pass,
-            // and every source future reaches the network through
-            // `ctx.fetcher` (= `&retrying`) — so retries happen without any
-            // source knowing. All of `retrying`, `ctx`, and the futures hold
-            // only shared borrows of `self`, so they coexist with the
-            // interior-mutable store just like the original shared `ctx` did.
+            // Transparently interpose the retrying fetcher: `retrying` is a
+            // local that outlives the whole `buffer_unordered` pass, and every
+            // source future reaches the network through `ctx.fetcher`
+            // (= `&retrying`) — so retries happen without any source knowing.
+            // Both `retrying` and the futures hold only shared borrows of
+            // `self`, so they coexist with the interior-mutable store.
             let retrying = RetryingFetcher::new(&self.fetcher, &self.timer, self.retry_policy);
-            let ctx = RetrieveCtx {
-                fetcher: &retrying,
-                timer: &self.timer,
-                clock: &self.clock,
-            };
             let source_futures = bucket_list.into_iter().map(|(prefix, keys, last)| {
-                let ctx = &ctx;
+                let retrying = &retrying;
                 async move {
                     // Invariant, not input handling: only prefixes that passed
                     // `self.sources.contains_key` above were bucketed, so the
@@ -438,12 +460,24 @@ where
                         .sources
                         .get(&prefix)
                         .expect("prefix presence checked above");
+                    // The context is built *per bucket* rather than once per
+                    // pass because it names the prefix this source was
+                    // registered under — a source declares no prefix of its own,
+                    // and the same source may be bound to several, so this is
+                    // the only place that binding is known. Everything else in
+                    // it is a shared borrow of the same pass-long locals.
+                    let ctx = RetrieveCtx {
+                        fetcher: retrying,
+                        timer: &self.timer,
+                        clock: &self.clock,
+                        prefix: &prefix,
+                    };
                     // Keep the keys we asked for: a source that silently omits
                     // one must not leave the citation unstored *and*
                     // unreported.
                     let requested = keys.clone();
                     let (resolutions, started) =
-                        drive_source(source.as_ref(), keys, ctx, last).await;
+                        drive_source(source.as_ref(), keys, &ctx, last).await;
                     (prefix, requested, resolutions, started)
                 }
             });

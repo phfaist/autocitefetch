@@ -53,7 +53,7 @@ fn bibliography_file_resolves_offline_through_the_fetcher() {
 
     let store = block_on(SingleFileCacheStore::new(dir.join("cache"))).expect("open cache dir");
     let manager = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
-        .register(BibliographyFileSource::new([bib_url])).unwrap();
+        .register("bib", BibliographyFileSource::new([bib_url])).unwrap();
 
     let cites = vec![("bib".to_string(), "knuth1984".to_string())];
     let report = block_on(manager.retrieve(&cites)).expect("retrieve should not error");
@@ -88,7 +88,7 @@ fn a_directory_instead_of_a_file_fails_without_retrying() {
     std::fs::create_dir_all(&bibdir).expect("create bib dir");
 
     let manager = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
-        .register(BibliographyFileSource::new([bibdir.display().to_string()])).unwrap();
+        .register("bib", BibliographyFileSource::new([bibdir.display().to_string()])).unwrap();
 
     let started = Instant::now();
     let cites = vec![("bib".to_string(), "whatever".to_string())];

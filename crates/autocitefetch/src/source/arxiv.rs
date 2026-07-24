@@ -1,5 +1,10 @@
 //! The `arxiv` source: the arXiv Atom API.
 //!
+//! `arxiv` is the prefix this is *conventionally* registered under, not one it
+//! declares: the host names it at
+//! [`register`](crate::manager::CitationManager::register) time and may pick any
+//! other. See the [`source`](crate::source) module docs.
+//!
 //! Fetches `https://export.arxiv.org/api/query?id_list=…&max_results=…`
 //! through [`RetrieveCtx::fetcher`] (uniform I/O — no bypass), parses the
 //! returned Atom feed with a small `no_std` pull tokenizer (the [`xmlparser`]
@@ -67,9 +72,21 @@
 //!   version — it is never chained. A *versionless* key selects the *best*
 //!   returned entry for its base id — an entry that is itself versionless wins,
 //!   otherwise the one with the highest version number — and, if that entry has
-//!   a DOI (after override) and chaining is enabled, is emitted as
-//!   [`Outcome::Chained`] to the `doi` source with `set_properties = { arxivid }`,
-//!   otherwise as concrete arXiv metadata.
+//!   a DOI (after override) and DOI delegation is enabled, is emitted as
+//!   [`Outcome::Chained`] to the delegate prefix with
+//!   `set_properties = { arxivid }`, otherwise as concrete arXiv metadata.
+//! * **DOI delegation is configured, not assumed.** arXiv metadata is thin, so
+//!   the good path is to hand the DOI to a DOI source and keep only `arxivid`
+//!   here — but *which* prefix that source is registered under is the host's
+//!   choice ([`Source`] declares no prefix). So the target prefix is data:
+//!   [`ArxivSource::chain_dois_to`] takes `Some("doi")` (the
+//!   default), `Some("dx")` if the host registered [`DoiSource`] under that name,
+//!   or `None` to switch delegation off entirely and always emit concrete arXiv
+//!   metadata. Naming a prefix with no registered source is not an error here —
+//!   it surfaces as a failure on the chain target, attributed back to the arXiv
+//!   citation that produced it.
+//!
+//! [`DoiSource`]: crate::source::DoiSource
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -84,7 +101,11 @@ use crate::fetch::Request;
 use crate::source::{Outcome, Resolution, RetrieveCtx, Source};
 use crate::BoxFuture;
 
-const PREFIX: &str = "arxiv";
+/// The prefix DOI lookups are delegated to unless the host says otherwise —
+/// the name [`DoiSource`](crate::source::DoiSource) is conventionally registered
+/// under, and nothing more than a default (see
+/// [`ArxivSource::chain_dois_to`]).
+const DEFAULT_DOI_PREFIX: &str = "doi";
 // 100 ids per query: the arXiv API takes the id list in the *query string* of a
 // GET, and ~100 ids keeps the URL under the ~2000-character limit that proxies
 // and servers commonly enforce (the JS reference documents the same bound).
@@ -95,12 +116,13 @@ const TTL_SECS: u64 = 10 * 24 * 60 * 60;
 
 /// The arXiv Atom API source.
 ///
-/// Carries the `chain_to_doi` switch plus an optional per-id DOI-override map
+/// Carries the DOI chain target plus an optional per-id DOI-override map
 /// and/or file. Configure with the fluent builders, e.g.
-/// `ArxivSource::new().chaining(false).with_override_dois(map)`.
+/// `ArxivSource::new().chain_dois_to(None).with_override_dois(map)`.
 pub struct ArxivSource {
-    /// When true, resolved DOIs are chained to the `doi` source.
-    pub chain_to_doi: bool,
+    /// Prefix to delegate DOI lookups to, or `None` to keep arXiv metadata and
+    /// never chain. Defaults to [`DEFAULT_DOI_PREFIX`].
+    doi_prefix: Option<String>,
     /// Inline arxivid → DOI overrides. `Some(doi)` injects/replaces the DOI;
     /// `None` suppresses it (keep arXiv metadata, don't chain). Takes
     /// precedence over file entries.
@@ -112,7 +134,7 @@ pub struct ArxivSource {
 impl Default for ArxivSource {
     fn default() -> Self {
         ArxivSource {
-            chain_to_doi: true,
+            doi_prefix: Some(DEFAULT_DOI_PREFIX.to_string()),
             override_dois: HashMap::new(),
             override_dois_file: None,
         }
@@ -124,11 +146,34 @@ impl ArxivSource {
         Self::default()
     }
 
-    /// Set whether resolved DOIs are chained to the `doi` source (default
-    /// `true`). Builder-style.
-    pub fn chaining(mut self, yes: bool) -> Self {
-        self.chain_to_doi = yes;
+    /// Choose which prefix an entry's DOI is chained to — or switch DOI
+    /// chaining off. Builder-style; defaults to `Some("doi")`.
+    ///
+    /// * `Some(prefix)` — a versionless entry that has a DOI resolves to
+    ///   [`Outcome::Chained`] at `(prefix, doi)`, carrying `arxivid` in
+    ///   `set_properties`, so the richer DOI metadata is what a reader gets.
+    ///   Name the prefix the DOI source was actually
+    ///   [registered](crate::manager::CitationManager::register) under:
+    ///   `"doi"` by convention, but a host is free to register
+    ///   [`DoiSource`](crate::source::DoiSource) as `"dx"`, or to point this at
+    ///   its own DOI-resolving source under any name. A prefix with no source
+    ///   behind it is not rejected here — the manager reports the dangling
+    ///   target as a failure attributed to the arXiv citation that produced it.
+    /// * `None` — never chain: every resolved entry is emitted as concrete
+    ///   arXiv metadata (with the `DOI` field still filled in when known).
+    ///
+    /// This is per-instance configuration precisely because a source does not
+    /// own a prefix: two `ArxivSource`s in one manager may chain to two
+    /// different DOI sources.
+    pub fn chain_dois_to(mut self, prefix: Option<&str>) -> Self {
+        self.doi_prefix = prefix.map(String::from);
         self
+    }
+
+    /// The prefix DOIs are currently chained to, or `None` when chaining is
+    /// off. The read side of [`Self::chain_dois_to`].
+    pub fn doi_chain_prefix(&self) -> Option<&str> {
+        self.doi_prefix.as_deref()
     }
 
     /// Attach/merge an inline arXiv-id → DOI override map, keyed by *base*
@@ -164,9 +209,6 @@ impl ArxivSource {
 }
 
 impl Source for ArxivSource {
-    fn prefix(&self) -> &str {
-        PREFIX
-    }
     fn chunk_size(&self) -> usize {
         CHUNK_SIZE
     }
@@ -176,8 +218,8 @@ impl Source for ArxivSource {
     fn default_ttl(&self) -> Duration {
         Duration::from_secs(TTL_SECS)
     }
-    fn chains_to(&self) -> &[&'static str] {
-        chains_to_slice(self.chain_to_doi)
+    fn chains_to(&self) -> Vec<&str> {
+        self.doi_prefix.as_deref().into_iter().collect()
     }
     fn normalize_key(&self, key: &str) -> String {
         // Trim only — deliberately **not** the default's added lowercasing. See
@@ -191,7 +233,7 @@ impl Source for ArxivSource {
         ctx: &'a RetrieveCtx<'a>,
     ) -> BoxFuture<'a, Vec<Resolution>> {
         Box::pin(retrieve_impl(
-            self.chain_to_doi,
+            self.doi_prefix.as_deref(),
             &self.override_dois,
             self.override_dois_file.as_deref(),
             keys,
@@ -200,17 +242,10 @@ impl Source for ArxivSource {
     }
 }
 
-fn chains_to_slice(chain_to_doi: bool) -> &'static [&'static str] {
-    if chain_to_doi {
-        &["doi"]
-    } else {
-        &[]
-    }
-}
-
-/// The retrieval body. `inline`/`file` describe the (optional) DOI overrides.
+/// The retrieval body. `doi_prefix` is the prefix to chain a resolved DOI to
+/// (`None` = never chain); `inline`/`file` describe the (optional) DOI overrides.
 async fn retrieve_impl<'a>(
-    chain_to_doi: bool,
+    doi_prefix: Option<&'a str>,
     inline: &'a HashMap<String, Option<String>>,
     file: Option<&'a str>,
     keys: Vec<String>,
@@ -266,7 +301,7 @@ async fn retrieve_impl<'a>(
     };
 
     keys.into_iter()
-        .map(|key| resolve_key(chain_to_doi, &overrides, key, &entries))
+        .map(|key| resolve_key(doi_prefix, &overrides, key, &entries))
         .collect()
 }
 
@@ -330,7 +365,7 @@ fn fail_all(keys: Vec<String>, msg: String) -> Vec<Resolution> {
 /// `Resolution` returned here carries `key` exactly as the manager supplied it,
 /// since the manager pairs resolutions back to requests by that string.
 fn resolve_key(
-    chain_to_doi: bool,
+    doi_prefix: Option<&str>,
     overrides: &HashMap<String, Option<String>>,
     key: String,
     entries: &[atom::Entry],
@@ -372,10 +407,10 @@ fn resolve_key(
 
     let doi = effective_doi(overrides, base, entry.doi.as_deref());
 
-    // Chain to the DOI when we have one (after override) and chaining is on.
-    // A `None` override — or a blank DOI — suppresses it, so chaining is
-    // skipped and the arXiv metadata is kept.
-    if chain_to_doi {
+    // Chain to the DOI when we have one (after override) and a chain target
+    // prefix is configured. A `None` override — or a blank DOI, or chaining
+    // switched off — skips it and the arXiv metadata is kept.
+    if let Some(doi_prefix) = doi_prefix {
         if let Some(doi) = doi {
             // `base` == the key on this (versionless) path.
             let mut sp = serde_json::Map::new();
@@ -383,12 +418,14 @@ fn resolve_key(
             return Resolution {
                 key,
                 outcome: Outcome::Chained {
-                    prefix: "doi".to_string(),
+                    // The host's name for the DOI source, not an assumption —
+                    // see `ArxivSource::chain_dois_to`.
+                    prefix: doi_prefix.to_string(),
                     // Emitted verbatim: the manager runs the *target* source's
                     // `Source::normalize_key` over this key both when it stores
-                    // the pointer and when `get()` walks it, and the `doi`
-                    // source keeps the default (trim + lowercase) policy — so
-                    // two arXiv entries whose DOIs differ only in case still
+                    // the pointer and when `get()` walks it, and whatever source
+                    // sits at `doi_prefix` keeps the default (trim + lowercase)
+                    // policy — so two arXiv entries whose DOIs differ only in case still
                     // dedup to one `doi:` cache id without this source doing
                     // anything. (The CSL `DOI` *field* built in `build_csl` is a
                     // separate thing and stays verbatim.)

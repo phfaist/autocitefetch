@@ -66,11 +66,31 @@ selects a [`Source`]. Retrieval is two-phase:
    following any **chaining** pointers (e.g. arXiv → DOI) and merging their
    `set_properties`, rewriting `id` back to the requested one.
 
+### Prefixes are host-chosen bindings
+
+A `Source` declares **no prefix of its own**. `(prefix, source)` is a binding the
+manager holds, created by `register(prefix, source)`, so the host owns the
+citation vocabulary entirely: register `DoiSource` as `dx`, run two
+`BibliographyFileSource`s over different files as `bib` and `theses`, or shadow a
+built-in by re-registering its prefix with your own source. The prefix has to be
+non-empty and `':'`-free (ids are `prefix:key`, split on the first colon), which
+is the only thing `register` rejects.
+
+Two consequences for source authors:
+
+* A source that needs the prefix it is *currently* answering for — to build an
+  id for an error message, say — reads `ctx.prefix`, never a constant.
+* A source that *points at* another one takes the target prefix as
+  configuration. `ArxivSource::chain_dois_to(Some("doi"))` is the built-in
+  example: `Some(prefix)` names whatever the host registered its DOI source
+  under, and `None` switches chaining off so arXiv metadata is kept as-is.
+
 ### Chaining
 
-When arXiv finds a DOI, it stores a *pointer* (`Payload::Chained`) to the `doi`
-source instead of duplicating metadata. The manager's retrieval loop discovers
-chained targets and fetches them; `get()` walks the chain on read.
+When arXiv finds a DOI, it stores a *pointer* (`Payload::Chained`) to the prefix
+it was configured to chain to (`doi` by default) instead of duplicating
+metadata. The manager's retrieval loop discovers chained targets and fetches
+them; `get()` walks the chain on read.
 
 ### Cache files (std backend)
 
@@ -155,6 +175,11 @@ makes `open()` fail rather than silently dropping the entries it can't read.
   injects/replaces, `None` *suppresses* (keep arXiv metadata, don't chain) — a
   capability the references lack. A JSON file convenience is also provided; other
   formats are parsed host-side and passed as data.
+- **Prefixes are not baked into source types** — both references tie a source
+  class to one hard-coded prefix (and hard-code `'doi'` as arXiv's chain target).
+  Here the host names every source at `register` time and tells arXiv which
+  prefix to chain to (`chain_dois_to`), so one source type can serve several
+  prefixes and no source can dangle a pointer at a name nobody registered.
 - **Host-parses I/O for config** — the library takes overrides as data, and the
   `bib` source's byte→CSL step is a pluggable parser (`with_parser`), so any
   serde format (YAML, TOML, …) works without the `no_std` core depending on it.
@@ -168,13 +193,16 @@ use autocitefetch::source::{ArxivSource, DoiSource, ManualSource, BibliographyFi
 use autocitefetch_std::{BlockingTimer, SingleFileCacheStore, SystemClock, UreqFetcher};
 
 let store = SingleFileCacheStore::new(".citecache").await?;
-// `register` returns `Result` — it rejects a source whose prefix is empty or
-// contains ':' (which would make `prefix:key` ids ambiguous) — so chain with `?`.
+// The prefix is yours to choose — a source declares none. `register` returns
+// `Result` because it rejects an empty or ':'-containing prefix (which would
+// make `prefix:key` ids ambiguous), so chain with `?`.
 let mgr = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
-    .register(ArxivSource::new())?
-    .register(DoiSource::new())?
-    .register(ManualSource::new())?
-    .register(BibliographyFileSource::new(["file:refs.json".into()]))?;
+    .register("arxiv", ArxivSource::new())?
+    .register("doi", DoiSource::new())?
+    .register("manual", ManualSource::new())?
+    .register("bib", BibliographyFileSource::new(["file:refs.json".into()]))?
+    // Same source type, second prefix, different files — nothing special needed.
+    .register("theses", BibliographyFileSource::new(["file:theses.json".into()]))?;
 
 let report = mgr.retrieve(&[("doi".into(), "10.1103/PhysRev.47.777".into())]).await?;
 let item = mgr.get("doi", "10.1103/PhysRev.47.777").await?; // CSL-JSON Value
@@ -238,7 +266,7 @@ four sources (`arxiv`, `doi`, `manual`, `bib`), concurrent within-pass source
 execution, the `std` backends including a `ureq`-based HTTP `Fetcher` (with
 `file:` support), and the `autocitefetch` command-line tool. The arXiv source
 parses the Atom feed with `xmlparser` (a verified `no_std` crate), decodes XML
-entity references, does version resolution, and chains to DOI. 194 tests pass;
+entity references, does version resolution, and chains to DOI. 199 tests pass;
 the core builds for `wasm32-unknown-unknown`; clippy and rustdoc are
 warning-free. CI (`.github/workflows/ci.yml`) enforces all of these on stable
 and on the MSRV (1.86).

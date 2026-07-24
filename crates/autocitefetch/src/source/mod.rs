@@ -1,8 +1,20 @@
 //! The [`Source`] trait and the types a source returns.
 //!
-//! A source is a provider of bibliographic info for one prefix (arXiv, DOI,
-//! …). It implements a single method, [`Source::retrieve_chunk`]; the manager
-//! handles routing, cache lookup, chunking, rate-limiting, and chaining.
+//! A source is a provider of bibliographic info (arXiv, DOI, …). It implements
+//! a single method, [`Source::retrieve_chunk`]; the manager handles routing,
+//! cache lookup, chunking, rate-limiting, and chaining.
+//!
+//! **A source does not own a prefix.** The prefix is chosen by the *host*, at
+//! [`register`](crate::manager::CitationManager::register) time: `(prefix,
+//! source)` is a binding the manager holds, not a property of the source type.
+//! So one source type can serve several prefixes in one manager (two
+//! [`BibliographyFileSource`]s over different files, registered as `bib` and
+//! `theses`), and a prefix that clashes with the host's own naming can simply be
+//! registered under a different one (`DoiSource` as `dx`). A source that needs to
+//! know the prefix it is currently answering for — to build an id for an error
+//! message, say — reads [`RetrieveCtx::prefix`]; one that *points* at another
+//! source ([`Outcome::Chained`]) must be told that target prefix as
+//! configuration, the way [`ArxivSource::chain_dois_to`] does.
 
 pub mod arxiv;
 pub mod bibfile;
@@ -36,6 +48,13 @@ pub enum Outcome {
     /// A pointer to another `(prefix, key)`. `set_properties` is merged into
     /// the resolved target at read time, **overriding** any colliding target
     /// field (e.g. re-attaching `arxivid`).
+    ///
+    /// `prefix` is a prefix in the *host's* namespace, so a source that chains
+    /// must take it as configuration rather than hard-coding one: nothing
+    /// guarantees the target source was registered under the name this source
+    /// would have guessed (see [`ArxivSource::chain_dois_to`]). A
+    /// prefix with no registered source is reported as a failure on the target,
+    /// attributed back to the citation that pulled it in.
     Chained {
         prefix: String,
         key: String,
@@ -120,16 +139,24 @@ pub struct RetrieveCtx<'a> {
     pub fetcher: &'a dyn Fetcher,
     pub timer: &'a dyn Timer,
     pub clock: &'a dyn Clock,
+    /// The prefix this source is currently answering for — the one the host
+    /// bound it to with
+    /// [`register`](crate::manager::CitationManager::register), not anything the
+    /// source declares. Since the same source may be registered under several
+    /// prefixes, this is the only correct way to build a `"prefix:key"` id for a
+    /// message about the keys in *this* batch.
+    pub prefix: &'a str,
 }
 
-/// A provider of bibliographic information for one citation prefix.
+/// A provider of bibliographic information, bound to a citation prefix by the
+/// host at registration time.
 ///
 /// Object-safe: sources live in the manager as `Box<dyn Source>` so users can
 /// register their own at runtime.
+///
+/// The trait carries no prefix. See the [module docs](self) for why, and read
+/// [`RetrieveCtx::prefix`] when a source needs the one it is serving.
 pub trait Source {
-    /// The citation prefix this source answers to (e.g. `"arxiv"`).
-    fn prefix(&self) -> &str;
-
     /// Max number of keys to send in one [`Source::retrieve_chunk`] call.
     fn chunk_size(&self) -> usize {
         512
@@ -195,16 +222,21 @@ pub trait Source {
         key
     }
 
-    /// Prefixes this source may chain *to* (e.g. arXiv → `["doi"]`).
+    /// Prefixes this source may chain *to* (e.g. an [`ArxivSource`] delegating
+    /// DOI lookups to `doi` → `["doi"]`).
     ///
     /// **Advisory / introspection only** — the manager does not consult it.
     /// Chain discovery is dynamic: an [`Outcome::Chained`] resolution pushes
     /// its target onto the retrieval worklist, which is drained in further
     /// passes, so ordering needs no static declaration. Declare it anyway to
-    /// document the source's shape (and so a host can warn about a chain
-    /// target whose prefix has no registered source).
-    fn chains_to(&self) -> &[&'static str] {
-        &[]
+    /// document the source's shape — and so a host can check, up front, that
+    /// every prefix a source will point at actually has a source registered
+    /// under it. That check is the reason this returns *borrowed* prefixes
+    /// rather than `&'static str`s: a chain target is configuration (see
+    /// [`ArxivSource::chain_dois_to`]), so it is generally owned by
+    /// the source instance, not baked into its type.
+    fn chains_to(&self) -> Vec<&str> {
+        Vec::new()
     }
 
     /// Resolve a batch of keys (already stripped of the prefix, and already

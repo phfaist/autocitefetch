@@ -129,13 +129,14 @@ impl Timer for InstantTimer {
 }
 
 /// A stand-in `arxiv` source that always chains to a DOI, attaching `arxivid`.
-struct ChainSource;
+/// The chain target prefix is configuration, as it is for the real
+/// [`ArxivSource`] — a source cannot assume what the host called its DOI source.
+struct ChainSource {
+    doi_prefix: &'static str,
+}
 impl Source for ChainSource {
-    fn prefix(&self) -> &str {
-        "arxiv"
-    }
-    fn chains_to(&self) -> &[&'static str] {
-        &["doi"]
+    fn chains_to(&self) -> Vec<&str> {
+        vec![self.doi_prefix]
     }
     fn retrieve_chunk<'a>(
         &'a self,
@@ -150,7 +151,7 @@ impl Source for ChainSource {
                     Resolution {
                         key: k.clone(),
                         outcome: Outcome::Chained {
-                            prefix: "doi".into(),
+                            prefix: self.doi_prefix.into(),
                             key: format!("10.9999/{k}"),
                             set_properties: CslValue::Object(sp),
                         },
@@ -166,7 +167,7 @@ impl Source for ChainSource {
 #[test]
 fn manual_source_stores_verbatim_text() {
     let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ManualSource::new()).unwrap();
+        .register("manual", ManualSource::new()).unwrap();
 
     let cites = vec![("manual".to_string(), "Bohr, N. (1913)".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -185,7 +186,7 @@ fn manual_source_preserves_key_case_and_whitespace() {
     // — where every other source would have trimmed, and the default policy
     // would also have lowercased.
     let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ManualSource::new()).unwrap();
+        .register("manual", ManualSource::new()).unwrap();
 
     let padded = "  Bohr, N. (1913). ON THE CONSTITUTION of Atoms  ".to_string();
     let cites = vec![("manual".to_string(), padded.clone())];
@@ -223,7 +224,7 @@ fn doi_source_parses_content_negotiated_csljson() {
         r#"{"type":"article-journal","title":"Can Quantum-Mechanical Description…","DOI":"10.1103/PhysRev.47.777"}"#,
     );
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(DoiSource::new()).unwrap();
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), "10.1103/PhysRev.47.777".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -254,7 +255,7 @@ fn doi_key_surrounding_whitespace_is_trimmed_centrally() {
     );
     let calls = fetcher.calls();
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(DoiSource::new()).unwrap();
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![
         ("doi".to_string(), "  10.1103/physrev.47.777  ".to_string()),
@@ -287,7 +288,7 @@ fn mixed_case_doi_keys_dedup_to_one_fetch_and_one_entry() {
     );
     let calls = fetcher.calls();
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(DoiSource::new()).unwrap();
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![
         ("doi".to_string(), MIXED.to_string()),
@@ -340,7 +341,7 @@ fn doi_source_canonicalizes_doi_key_to_uppercase_keeping_value_verbatim() {
             r#"{"type":"article-journal","title":"Lowercase Key","doi":"10.1103/PhysRevA.86.052329"}"#,
         );
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(DoiSource::new()).unwrap();
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![
         ("doi".to_string(), "10.1103/PhysRevLett.109.170502".to_string()),
@@ -372,8 +373,8 @@ fn arxiv_chains_to_doi_and_merges_set_properties() {
         r#"{"type":"article-journal","title":"Chained Title","DOI":"10.9999/1211.1037"}"#,
     );
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ChainSource).unwrap()
-        .register(DoiSource::new()).unwrap();
+        .register("arxiv", ChainSource { doi_prefix: "doi" }).unwrap()
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1211.1037".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -424,7 +425,7 @@ fn doi_url_percent_encodes_the_key_but_keeps_slashes() {
     let fetcher = MockFetcher::new().route(URL, 200, r#"{"type":"article-journal","title":"Encoded"}"#);
     let calls = fetcher.calls();
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(DoiSource::new()).unwrap();
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), KEY.to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -448,7 +449,7 @@ fn doi_requests_carry_the_csl_json_accept_header() {
         MockFetcher::new().route("https://doi.org/10.1/x", 200, r#"{"title":"t"}"#);
     let calls = fetcher.calls();
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(DoiSource::new()).unwrap();
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), "10.1/x".to_string())];
     block_on(mgr.retrieve(&cites)).unwrap();
@@ -469,7 +470,7 @@ fn doi_non_success_status_is_one_reported_failure() {
     // is handled separately — see `doi_404_is_an_authoritative_missing`.
     let fetcher = MockFetcher::new().route("https://doi.org/10.1/forbidden", 403, "Forbidden");
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(DoiSource::new()).unwrap();
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), "10.1/forbidden".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -493,7 +494,7 @@ fn doi_non_success_status_is_one_reported_failure() {
 fn doi_404_is_an_authoritative_missing() {
     let fetcher = MockFetcher::new().route("https://doi.org/10.1/gone", 404, "Not Found");
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(DoiSource::new()).unwrap();
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), "10.1/gone".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -515,7 +516,7 @@ fn doi_body_that_is_not_json_is_a_parse_failure() {
     for body in ["<!DOCTYPE html><html><body>Landing</body></html>", ""] {
         let fetcher = MockFetcher::new().route("https://doi.org/10.1/x", 200, body);
         let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-            .register(DoiSource::new()).unwrap();
+            .register("doi", DoiSource::new()).unwrap();
 
         let cites = vec![("doi".to_string(), "10.1/x".to_string())];
         let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -536,7 +537,7 @@ fn doi_200_with_json_that_is_not_a_csl_object_is_a_failure() {
     for body in ["null", "[]", "\"nope\"", "123", "{}"] {
         let fetcher = MockFetcher::new().route("https://doi.org/10.1/x", 200, body);
         let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-            .register(DoiSource::new()).unwrap();
+            .register("doi", DoiSource::new()).unwrap();
 
         let cites = vec![("doi".to_string(), "10.1/x".to_string())];
         let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -556,7 +557,7 @@ fn a_malformed_doi_is_rejected_without_fetching_anything() {
         let fetcher = MockFetcher::new();
         let calls = fetcher.calls();
         let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-            .register(DoiSource::new()).unwrap();
+            .register("doi", DoiSource::new()).unwrap();
 
         let cites = vec![("doi".to_string(), key.to_string())];
         let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -568,7 +569,7 @@ fn a_malformed_doi_is_rejected_without_fetching_anything() {
 #[test]
 fn unknown_prefix_is_reported_not_fatal() {
     let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ManualSource::new()).unwrap();
+        .register("manual", ManualSource::new()).unwrap();
 
     let cites = vec![
         ("nope".to_string(), "x".to_string()),

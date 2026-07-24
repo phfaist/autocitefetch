@@ -175,8 +175,8 @@ fn arxiv_versionless_with_doi_chains_and_merges() {
         );
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new()).unwrap()
-        .register(DoiSource::new()).unwrap();
+        .register("arxiv", ArxivSource::new()).unwrap()
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1211.1037".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -224,7 +224,7 @@ fn arxiv_built_csl_uses_uppercase_doi_key_with_verbatim_value() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, FEED_CHAINED);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().chaining(false)).unwrap();
+        .register("arxiv", ArxivSource::new().chain_dois_to(None)).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1211.1037".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -243,8 +243,8 @@ fn arxiv_concrete_parses_title_authors_and_issued() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, FEED_CONCRETE);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().chaining(false)).unwrap()
-        .register(DoiSource::new()).unwrap();
+        .register("arxiv", ArxivSource::new().chain_dois_to(None)).unwrap()
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "0905.2794".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -297,7 +297,7 @@ fn issued_falls_back_to_published_when_no_updated() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().chaining(false)).unwrap();
+        .register("arxiv", ArxivSource::new().chain_dois_to(None)).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1601.00007".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -330,8 +330,8 @@ fn versioned_request_uses_that_versions_updated_date() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new()).unwrap()
-        .register(DoiSource::new()).unwrap();
+        .register("arxiv", ArxivSource::new()).unwrap()
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1211.1037v2".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -364,7 +364,7 @@ fn arxiv_unknown_id_is_reported_not_fatal() {
     );
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new()).unwrap();
+        .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "9999.99999".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -399,7 +399,7 @@ fn entity_references_are_decoded_in_titles_and_authors() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new()).unwrap();
+        .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "1234.5678".to_string()),
@@ -441,7 +441,7 @@ fn malformed_entity_references_are_left_verbatim() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new()).unwrap();
+        .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1234.5680".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -476,7 +476,7 @@ fn cdata_content_stays_raw() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new()).unwrap();
+        .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1234.5681".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -525,8 +525,8 @@ fn blank_arxiv_doi_does_not_chain_to_the_empty_doi_key() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new()).unwrap()
-        .register(DoiSource::new()).unwrap();
+        .register("arxiv", ArxivSource::new()).unwrap()
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "2100.00001".to_string()),
@@ -580,7 +580,7 @@ fn old_style_ids_and_multi_key_chunks_build_the_expected_url() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new()).unwrap();
+        .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "math/0309136".to_string()),
@@ -623,7 +623,7 @@ fn old_style_subject_class_case_is_preserved_end_to_end() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new()).unwrap();
+        .register("arxiv", ArxivSource::new()).unwrap();
 
     // Padded, to show trimming still happens — just not case folding.
     let cites = vec![("arxiv".to_string(), " math.AG/0601001 ".to_string())];
@@ -676,7 +676,7 @@ fn whitespace_padded_arxiv_keys_dedup_to_one_fetch_and_entry() {
     let calls = fetcher.calls();
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new()).unwrap();
+        .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), " 1211.1037 ".to_string()),
@@ -724,7 +724,7 @@ fn version_suffix_matching_is_case_insensitive() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new()).unwrap();
+        .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1211.1037V2".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -744,7 +744,7 @@ fn http_error_status_fails_every_key_in_the_chunk() {
     let fetcher = MockFetcher::new().route(arxiv_url, 400, "id_list is malformed");
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new()).unwrap();
+        .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "1234.5678".to_string()),
@@ -768,7 +768,7 @@ fn malformed_xml_fails_every_key_in_the_chunk() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, "<feed><entry><<</entry></feed>");
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new()).unwrap();
+        .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "1234.5678".to_string()),
@@ -790,7 +790,6 @@ fn malformed_xml_fails_every_key_in_the_chunk() {
 #[test]
 fn arxiv_source_declares_its_rate_limits_and_chaining() {
     let src = ArxivSource::new();
-    assert_eq!(src.prefix(), "arxiv");
     // ~100 ids keeps the GET URL under the usual ~2000-character limit.
     assert_eq!(src.chunk_size(), 100);
     // arXiv asks for no more than one request every ~3 seconds.
@@ -799,8 +798,95 @@ fn arxiv_source_declares_its_rate_limits_and_chaining() {
         src.default_ttl(),
         core::time::Duration::from_secs(10 * 24 * 60 * 60)
     );
-    assert_eq!(src.chains_to(), ["doi"].as_slice());
+    // DOI chaining defaults to the conventional `doi` prefix, and both the
+    // introspection hook and the reader agree with it.
+    assert_eq!(src.chains_to(), ["doi"]);
+    assert_eq!(src.doi_chain_prefix(), Some("doi"));
 
-    let no_chain = ArxivSource::new().chaining(false);
+    // …but it is only a default: the target is whatever the host registered its
+    // DOI source under, and `None` switches chaining off entirely.
+    let renamed = ArxivSource::new().chain_dois_to(Some("dx"));
+    assert_eq!(renamed.chains_to(), ["dx"]);
+    assert_eq!(renamed.doi_chain_prefix(), Some("dx"));
+
+    let no_chain = ArxivSource::new().chain_dois_to(None);
     assert!(no_chain.chains_to().is_empty());
+    assert_eq!(no_chain.doi_chain_prefix(), None);
+}
+
+// --- DOI chaining targets a host-chosen prefix ------------------------------
+
+/// `chain_dois_to` is what binds the two ends of the arXiv → DOI chain, and
+/// neither end is baked in: here the whole vocabulary is renamed — the arXiv
+/// source is registered as `preprint`, the DOI source as `dx` — and the chain
+/// still resolves end to end. A source hard-coding `"doi"` as its chain target
+/// (or its own prefix) would leave a dangling pointer.
+#[test]
+fn arxiv_chains_to_the_doi_prefix_it_was_configured_with() {
+    let arxiv_url = "https://export.arxiv.org/api/query?id_list=1211.1037&max_results=1";
+    let doi_url = "https://doi.org/10.1103/physrevlett.109.170502";
+
+    let fetcher = MockFetcher::new()
+        .route(arxiv_url, 200, FEED_CHAINED)
+        .route(
+            doi_url,
+            200,
+            r#"{"type":"article-journal","title":"Resolved via DOI","DOI":"10.1103/PhysRevLett.109.170502"}"#,
+        );
+
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register("preprint", ArxivSource::new().chain_dois_to(Some("dx")))
+        .unwrap()
+        .register("dx", DoiSource::new())
+        .unwrap();
+
+    let cites = vec![("preprint".to_string(), "1211.1037".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    let item = block_on(mgr.get("preprint", "1211.1037")).unwrap();
+    assert_eq!(item["id"], "preprint:1211.1037", "the id echoes the host's prefix");
+    assert_eq!(item["title"], "Resolved via DOI", "the chain was followed");
+    assert_eq!(item["arxivid"], "1211.1037", "chained set_properties merged in");
+
+    // Both entries are stored under the host's names, and the pointer's target
+    // id matches the one the DOI source landed under.
+    let mut ids: Vec<String> = block_on(mgr.store().entries())
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "dx:10.1103/physrevlett.109.170502".to_string(),
+            "preprint:1211.1037".to_string(),
+        ]
+    );
+}
+
+/// Naming a chain target the host never registered is not silently swallowed:
+/// the dangling target is reported as a failure, attributed back to the arXiv
+/// citation that produced it.
+#[test]
+fn chaining_to_an_unregistered_prefix_is_reported_against_the_requested_cite() {
+    let arxiv_url = "https://export.arxiv.org/api/query?id_list=1211.1037&max_results=1";
+    let fetcher = MockFetcher::new().route(arxiv_url, 200, FEED_CHAINED);
+
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register("arxiv", ArxivSource::new().chain_dois_to(Some("nowhere")))
+        .unwrap();
+
+    let cites = vec![("arxiv".to_string(), "1211.1037".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+
+    assert_eq!(report.failures.len(), 1, "failures: {:?}", report.failures);
+    let f = &report.failures[0];
+    assert_eq!(f.prefix, "nowhere", "the failing citation is the chain target");
+    assert_eq!(
+        f.origin,
+        Some(("arxiv".to_string(), "1211.1037".to_string())),
+        "…attributed to the arXiv cite that pulled it in"
+    );
 }

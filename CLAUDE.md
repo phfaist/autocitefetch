@@ -18,7 +18,7 @@ port of two prior libraries (see "Reference implementations" below).
 ## Commands
 
 ```sh
-cargo test                                   # all 194 tests (workspace)
+cargo test                                   # all 199 tests (workspace)
 cargo test -p autocitefetch --test arxiv_dois override_map_beats_feed_doi   # one integration test
 cargo test -p autocitefetch --lib filecache::tests::torn_tail_is_tolerated  # one unit test
 cargo doc --workspace --no-deps              # currently warning-free — keep it that way
@@ -54,7 +54,7 @@ Nothing else returns CSL data.
 ### The four injected traits
 
 `Fetcher`, `CacheStore`, `Clock`, `Timer` (in `fetch.rs`, `store.rs`, `env.rs`) are the entire host
-surface, assembled via `CitationManager::new(fetcher, store, clock, timer).register(source)?`
+surface, assembled via `CitationManager::new(fetcher, store, clock, timer).register(prefix, source)?`
 (`register` returns `Result` — it rejects an empty or `':'`-containing prefix rather than panicking).
 Every async trait method returns `BoxFuture<'a, T>` (`lib.rs`) — a **`!Send`** boxed future. This is
 deliberate: WASM futures are `!Send`, the core assumes a single cooperative task, and boxing keeps
@@ -62,6 +62,27 @@ the traits object-safe (`&dyn Fetcher`, `Box<dyn Source>`). Do not add `Send`/`S
 
 `CacheStore` methods take `&self`; implementations use interior mutability (`RefCell`). The manager
 holds only shared borrows while driving sources concurrently, so this is required, not incidental.
+
+### Prefixes are host-chosen bindings
+
+A `Source` has **no `prefix()` method**. `(prefix, source)` is a binding the manager owns, made by
+`register(prefix, source)`, so one source type — even one configuration of it — can back several
+prefixes (`bib` and `theses`, both `BibliographyFileSource`), a built-in can be registered under any
+name (`DoiSource` as `dx`), and re-registering a bound prefix replaces the source behind it. The only
+rejection is an empty or `':'`-containing prefix.
+
+Two rules follow, and both are load-bearing:
+
+- **A source reads `ctx.prefix`, never a constant**, when it needs the prefix it is currently
+  answering for. `doi.rs` and `bibfile.rs` build their `Error::NotFound` ids that way; a literal
+  `"doi"` there would report `doi:…` for a citation the user wrote as `dx:…`. `RetrieveCtx` is
+  therefore built **per bucket** in `run_passes`, not once per pass — that is the only reason it is
+  constructed inside the per-source future.
+- **A chain target prefix is configuration, not an assumption.** `ArxivSource::chain_dois_to(Some(p))`
+  names the prefix to emit in `Outcome::Chained` (`None` disables chaining); the CLI passes
+  `SourceKind::Doi.prefix()` so both ends of the chain are named in one place. Pointing at an
+  unregistered prefix is not an error at build time — it surfaces as a failure on the chain target,
+  attributed via `origin` to the citation that produced it.
 
 ### The retrieval loop (`manager.rs`)
 
@@ -131,8 +152,10 @@ a pointer. `get()` walks up to `max_chain_depth` (16) links, accumulating `set_p
 a `Payload::Concrete`. At the concrete node the accumulated `set_properties` are applied with
 `csl::merge_over`, so they **override** the concrete target's colliding fields (matching both
 reference implementations' `{ ...target, ...set_properties }`); the requested `id` is then forced
-last, so a `set_properties` carrying an `id` can never win. Note `Source::chains_to()` exists but the
-manager does not consume it; chain discovery is dynamic via the worklist.
+last, so a `set_properties` carrying an `id` can never win. Note `Source::chains_to() -> Vec<&str>`
+exists but the manager does not consume it; chain discovery is dynamic via the worklist. It returns
+borrowed (not `'static`) prefixes because a chain target is *configuration* — see the prefix-binding
+section — so a host can still check up front that every prefix a source will point at is registered.
 
 **The chain key is lowercased; the CSL `DOI` field is not.** `arxiv.rs` emits
 `Outcome::Chained { key: doi, .. }` **verbatim** — the manager then runs the target key through the
@@ -170,7 +193,8 @@ together doesn't expire together.
 
 ### Sources (`source/`)
 
-Each `Source` declares `prefix`, `chunk_size`, `min_interval`, `default_ttl`, and implements
+Each `Source` declares `chunk_size`, `min_interval`, `default_ttl` (but **not** a prefix — see
+"Prefixes are host-chosen bindings" above), and implements
 `retrieve_chunk`. `driver.rs` does the chunking and paces requests **start→start**: it sleeps
 `min_interval - elapsed_since_previous_request`, and the manager threads that per-prefix timestamp
 across passes, so the second pass of an arXiv→DOI chain cannot hit doi.org with 0 ms spacing.
@@ -178,14 +202,15 @@ across passes, so the second pass of an arXiv→DOI chain cannot hit doi.org wit
 
 | prefix | chunk / interval / TTL | notes |
 |---|---|---|
-| `arxiv` | 100 / 3100 ms / 10 d | Atom feed parsed with `xmlparser`; version resolution; chains to `doi` |
+| `arxiv` | 100 / 3100 ms / 10 d | Atom feed parsed with `xmlparser`; version resolution; chains to the prefix set by `chain_dois_to` (default `Some("doi")`) |
 | `doi` | 1 / 1100 ms / 360 d | doi.org content negotiation returns CSL-JSON stored verbatim, values included — the only touch is `canonicalize_doi_key`, which renames a nonstandard lowercase `doi` key up to the CSL-standard uppercase `DOI` (doi.org already sends `DOI`, so it is normally a no-op) |
 | `manual` | ∞ / 0 / **0** | key *is* the formatted text, stored under `_formatted_text`; TTL 0 ⇒ ephemeral (kept in the store's in-memory view for the run, **never persisted** to `citations.jsonl` or a sidecar, gone on restart — enforced by `FileCacheStore`, keyed on `stale_after == expires`, not on the prefix) |
 | `bib` | ∞ / 0 / 60 s | file(s) fetched through the `Fetcher` (`file:` URLs), indexed by `id` |
 
 arXiv version resolution: an explicitly-versioned key (`1211.1037v2`) resolves to that exact version
 and is emitted **concrete, never chained**; a versionless key picks the best returned entry (a
-versionless entry wins, else the highest `vN`) and chains to its DOI. DOI overrides are data
+versionless entry wins, else the highest `vN`) and chains to its DOI at the `chain_dois_to` prefix
+(`None` disables chaining entirely — the old `chaining(false)`). DOI overrides are data
 (`with_override_dois`): `Some(doi)` injects/replaces, `None` *suppresses* (keep arXiv metadata,
 don't chain).
 
@@ -306,7 +331,9 @@ Implement `Source` in `crates/autocitefetch/src/source/<name>.rs`, re-export it 
 build the URL with the module-local percent-encoder (see `arxiv.rs`/`doi.rs` — deliberately
 hand-rolled to avoid a `url` dependency), fetch via `ctx.fetcher`, and return one `Resolution` per
 key. Override `normalize_key` only if the default (trim + lowercase) is wrong for your key space —
-and keep it idempotent. Users can also register their own source at runtime; nothing about the built-ins is privileged.
+and keep it idempotent. **Do not hard-code a prefix**: read `ctx.prefix` for the one this batch is
+being answered under, and take any chain *target* prefix as configuration (`chain_dois_to`). Users
+can also register their own source at runtime; nothing about the built-ins is privileged.
 
 ## Docs convention
 

@@ -193,18 +193,23 @@ fn build_manager(
         None => UreqFetcher::new(),
     };
 
+    // A prefix is a *binding* the manager holds, not something a source
+    // declares, so this is where the CLI's fixed `arxiv:`/`doi:`/`bib:`/
+    // `manual:` vocabulary is decided — `SourceKind::prefix` is the whole of it.
     let mut manager = CitationManager::new(fetcher, store, SystemClock, BlockingTimer);
     for kind in sources {
+        let prefix = kind.prefix();
         manager = match kind {
-            SourceKind::Arxiv => manager.register(build_arxiv(cli)?),
-            SourceKind::Doi => manager.register(DoiSource::new()),
+            SourceKind::Arxiv => manager.register(prefix, build_arxiv(cli)?),
+            SourceKind::Doi => manager.register(prefix, DoiSource::new()),
             SourceKind::Bib => manager.register(
+                prefix,
                 BibliographyFileSource::new(cli.bib.iter().cloned())
                     .with_parser(formats::parser_for(cli.bib_format)),
             ),
-            SourceKind::Manual => manager.register(ManualSource::new()),
+            SourceKind::Manual => manager.register(prefix, ManualSource::new()),
         }
-        .map_err(|e| format!("registering the `{}` source: {e}", kind.prefix()))?;
+        .map_err(|e| format!("registering the `{prefix}` source: {e}"))?;
     }
     Ok(manager)
 }
@@ -212,8 +217,13 @@ fn build_manager(
 /// The `arxiv` source, with `--no-arxiv-chaining` and `--arxiv-doi-overrides`
 /// applied. The override file is parsed *here* and passed as data, which is
 /// what lets it be YAML — see [`formats`].
+///
+/// DOI chaining targets `SourceKind::Doi`'s prefix explicitly: the source has
+/// no way to guess what the host called its DOI source, so the two ends of the
+/// chain are named in one place.
 fn build_arxiv(cli: &Cli) -> Result<ArxivSource, String> {
-    let mut source = ArxivSource::new().chaining(!cli.no_arxiv_chaining);
+    let doi_prefix = (!cli.no_arxiv_chaining).then(|| SourceKind::Doi.prefix());
+    let mut source = ArxivSource::new().chain_dois_to(doi_prefix);
     if let Some(path) = &cli.arxiv_doi_overrides {
         source = source.with_override_dois(formats::load_doi_overrides(path)?);
     }

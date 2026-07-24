@@ -189,9 +189,6 @@ fn item(title: &str) -> CslValue {
 }
 
 impl Source for ScriptSource {
-    fn prefix(&self) -> &str {
-        self.prefix
-    }
     fn chunk_size(&self) -> usize {
         self.chunk
     }
@@ -289,7 +286,7 @@ fn cites(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 fn a_key_the_source_omits_is_reported() {
     let clock = MovableClock::default();
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::OmitOthers, &clock)).unwrap();
+        .register("s", ScriptSource::new("s", Answer::OmitOthers, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "ok"), ("s", "ghost")]))).unwrap();
     assert!(!report.is_complete(), "the dropped key must be reported");
@@ -313,7 +310,7 @@ fn duplicate_resolutions_for_one_key_are_collapsed() {
     let store = MemStore::default();
     let puts = store.puts.clone();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::Duplicate, &clock)).unwrap();
+        .register("s", ScriptSource::new("s", Answer::Duplicate, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
@@ -329,7 +326,7 @@ fn a_non_object_concrete_payload_is_reported_not_stubbed() {
     let store = MemStore::default();
     let entries = store.clone();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::NonObject, &clock)).unwrap();
+        .register("s", ScriptSource::new("s", Answer::NonObject, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert_eq!(report.failures.len(), 1);
@@ -359,7 +356,7 @@ fn chain_discovery_is_bounded_by_max_chain_depth() {
     let log = src.log();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
         .with_max_chain_depth(4)
-        .register(src).unwrap();
+        .register(src.prefix, src).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("c", "0")]))).unwrap();
 
@@ -387,7 +384,7 @@ fn a_self_chain_is_rejected_at_store_time() {
     let store = MemStore::default();
     let entries = store.clone();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::SelfChain, &clock)).unwrap();
+        .register("s", ScriptSource::new("s", Answer::SelfChain, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert_eq!(report.failures.len(), 1);
@@ -451,8 +448,8 @@ fn a_stale_pointer_does_not_fetch_its_dead_target() {
     let b = ScriptSource::new("b", Answer::Fail, &clock);
     let b_log = b.log();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(a).unwrap()
-        .register(b).unwrap();
+        .register(a.prefix, a).unwrap()
+        .register(b.prefix, b).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("a", "x")]))).unwrap();
     assert!(
@@ -492,8 +489,8 @@ fn a_grace_served_pointer_keeps_its_target() {
     let b = ScriptSource::new("b", Answer::Concrete, &clock);
     let b_log = b.log();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(a).unwrap()
-        .register(b).unwrap();
+        .register(a.prefix, a).unwrap()
+        .register(b.prefix, b).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("a", "x")]))).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
@@ -578,7 +575,7 @@ fn a_set_properties_id_cannot_override_the_requested_id() {
 fn a_direct_failure_has_no_origin() {
     let clock = MovableClock::default();
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::Fail, &clock)).unwrap();
+        .register("s", ScriptSource::new("s", Answer::Fail, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert_eq!(report.failures.len(), 1);
@@ -599,8 +596,8 @@ fn a_chained_target_failure_is_attributed_to_the_request() {
     let a = ScriptSource::new("a", Answer::ChainTo("b"), &clock);
     let b = ScriptSource::new("b", Answer::Fail, &clock);
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(a).unwrap()
-        .register(b).unwrap();
+        .register(a.prefix, a).unwrap()
+        .register(b.prefix, b).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("a", "x")]))).unwrap();
     assert_eq!(report.failures.len(), 1);
@@ -628,9 +625,9 @@ fn a_multi_hop_chain_attributes_back_to_the_original_request() {
     let b = ScriptSource::new("b", Answer::ChainTo("c"), &clock);
     let c = ScriptSource::new("c", Answer::Fail, &clock);
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(a).unwrap()
-        .register(b).unwrap()
-        .register(c).unwrap();
+        .register(a.prefix, a).unwrap()
+        .register(b.prefix, b).unwrap()
+        .register(c.prefix, c).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("a", "x")]))).unwrap();
     assert_eq!(report.failures.len(), 1);
@@ -654,9 +651,9 @@ fn every_failed_request_is_recoverable_from_the_report() {
     let b = ScriptSource::new("b", Answer::Fail, &clock);
     let d = ScriptSource::new("d", Answer::Fail, &clock);
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(a).unwrap()
-        .register(b).unwrap()
-        .register(d).unwrap();
+        .register(a.prefix, a).unwrap()
+        .register(b.prefix, b).unwrap()
+        .register(d.prefix, d).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("a", "x"), ("d", "k")]))).unwrap();
 
@@ -710,7 +707,7 @@ fn missing_is_reported_and_removes_stale_while_failed_is_grace_served() {
     let store = MemStore::default();
     seed(&store);
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::Fail, &clock)).unwrap();
+        .register("s", ScriptSource::new("s", Answer::Fail, &clock)).unwrap();
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert!(
         report.is_complete(),
@@ -729,7 +726,7 @@ fn missing_is_reported_and_removes_stale_while_failed_is_grace_served() {
     let store = MemStore::default();
     seed(&store);
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::Missing, &clock)).unwrap();
+        .register("s", ScriptSource::new("s", Answer::Missing, &clock)).unwrap();
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert_eq!(
         report.failures.len(),
@@ -765,8 +762,8 @@ fn pacing_is_start_to_start_and_survives_passes() {
         clock: clock.clone(),
     };
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), timer)
-        .register(a).unwrap()
-        .register(b).unwrap();
+        .register(a.prefix, a).unwrap()
+        .register(b.prefix, b).unwrap();
 
     let report =
         block_on(mgr.retrieve(&cites(&[("b", "d1"), ("b", "d2"), ("a", "x")]))).unwrap();
@@ -792,7 +789,7 @@ fn pacing_is_start_to_start_and_survives_passes() {
 fn get_by_id_round_trips_and_rejects_a_missing_colon() {
     let clock = MovableClock::default();
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::Concrete, &clock)).unwrap();
+        .register("s", ScriptSource::new("s", Answer::Concrete, &clock)).unwrap();
 
     // A key containing a colon still round-trips: ids split on the *first* one.
     block_on(mgr.retrieve(&cites(&[("s", "k"), ("s", "10.1/x:y")]))).unwrap();
@@ -814,7 +811,7 @@ fn get_by_id_round_trips_and_rejects_a_missing_colon() {
 fn registering_a_prefix_with_a_colon_errors() {
     let clock = MovableClock::default();
     let err = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(ScriptSource::new("bad:prefix", Answer::Concrete, &clock))
+        .register("bad:prefix", ScriptSource::new("bad:prefix", Answer::Concrete, &clock))
         .err()
         .expect("a colon-containing prefix must be rejected");
     assert!(matches!(err, Error::InvalidPrefix(_)), "got {err}");
@@ -827,7 +824,7 @@ fn registering_a_prefix_with_a_colon_errors() {
 fn registering_an_empty_prefix_errors() {
     let clock = MovableClock::default();
     let err = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(ScriptSource::new("", Answer::Concrete, &clock))
+        .register("", ScriptSource::new("", Answer::Concrete, &clock))
         .err()
         .expect("an empty prefix must be rejected");
     assert!(matches!(err, Error::InvalidPrefix(_)), "got {err}");
@@ -839,8 +836,114 @@ fn registering_an_empty_prefix_errors() {
 fn registering_a_normal_prefix_succeeds() {
     let clock = MovableClock::default();
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::Concrete, &clock))
+        .register("s", ScriptSource::new("s", Answer::Concrete, &clock))
         .expect("a colon-free, non-empty prefix must register");
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
+}
+
+// --- prefixes are host-chosen bindings, not source properties --------------
+
+/// A source that declares no prefix and simply echoes back the one it was
+/// *registered* under (`ctx.prefix`), so a test can tell which binding
+/// answered. `missing` flips it to the authoritative-miss path — the one where
+/// a source has to build a `"prefix:key"` id for its own error message and so
+/// must not assume a prefix.
+struct EchoSource {
+    missing: bool,
+}
+
+impl Source for EchoSource {
+    fn min_interval(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn default_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn retrieve_chunk<'a>(
+        &'a self,
+        keys: Vec<String>,
+        ctx: &'a RetrieveCtx<'a>,
+    ) -> BoxFuture<'a, Vec<Resolution>> {
+        Box::pin(async move {
+            keys.into_iter()
+                .map(|k| {
+                    let id = format!("{}:{k}", ctx.prefix);
+                    if self.missing {
+                        Resolution::missing(k, Error::NotFound(id))
+                    } else {
+                        Resolution::concrete(k, item(&id))
+                    }
+                })
+                .collect()
+        })
+    }
+}
+
+/// One source *type* — here even one identical configuration of it — can back
+/// as many prefixes as the host wants, because the prefix lives in the
+/// manager's binding and not in the source. Each registration keeps its own
+/// cache ids, and each learns its own prefix from `ctx.prefix`.
+#[test]
+fn one_source_type_serves_several_host_chosen_prefixes() {
+    let clock = MovableClock::default();
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register("alpha", EchoSource { missing: false })
+        .unwrap()
+        .register("beta", EchoSource { missing: false })
+        .unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("alpha", "k"), ("beta", "k")]))).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    // Same key, two prefixes, two independent entries — and each source saw the
+    // prefix it was bound to, not one baked into its type.
+    let a = block_on(mgr.get("alpha", "k")).unwrap();
+    assert_eq!(a["id"], "alpha:k");
+    assert_eq!(a["title"], "alpha:k", "the source must see its own prefix");
+
+    let b = block_on(mgr.get("beta", "k")).unwrap();
+    assert_eq!(b["id"], "beta:k");
+    assert_eq!(b["title"], "beta:k", "the source must see its own prefix");
+}
+
+/// A built-in registered under a non-default name behaves identically, and the
+/// id it builds for its own diagnostics follows the host's naming — a source
+/// hard-coding its prefix would report `doi:…` for a citation the user wrote as
+/// `dx:…`.
+#[test]
+fn a_sources_error_message_uses_the_prefix_it_was_registered_under() {
+    let clock = MovableClock::default();
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register("dx", EchoSource { missing: true })
+        .unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("dx", "10.1/x")]))).unwrap();
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].prefix, "dx");
+    assert!(
+        report.failures[0].message.contains("dx:10.1/x"),
+        "the message must name the host's prefix, not one the source assumed: {}",
+        report.failures[0].message
+    );
+}
+
+/// Registering an already-bound prefix replaces the source behind it — the
+/// binding is a map entry, which is how a host swaps a built-in for its own.
+#[test]
+fn re_registering_a_prefix_replaces_the_source() {
+    let clock = MovableClock::default();
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register("s", ScriptSource::new("s", Answer::Fail, &clock))
+        .unwrap()
+        .register("s", EchoSource { missing: false })
+        .unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
+    assert!(
+        report.is_complete(),
+        "the replacement source should have answered, not the failing one: {:?}",
+        report.failures
+    );
+    assert_eq!(block_on(mgr.get("s", "k")).unwrap()["title"], "s:k");
 }

@@ -1,5 +1,10 @@
 //! The `manual` source: the key *is* the pre-formatted citation text.
 //!
+//! `manual` is the prefix this is *conventionally* registered under, not one it
+//! declares: the host names it at
+//! [`register`](crate::manager::CitationManager::register) time and may pick any
+//! other. See the [`source`](crate::source) module docs.
+//!
 //! This is the escape hatch for citations that have no online source — the
 //! consumer passes the already-formatted text as the key and it is stored
 //! verbatim under the extension field `_formatted_text`, bypassing CSL
@@ -44,10 +49,6 @@ impl ManualSource {
 }
 
 impl Source for ManualSource {
-    fn prefix(&self) -> &str {
-        "manual"
-    }
-
     fn chunk_size(&self) -> usize {
         usize::MAX
     }

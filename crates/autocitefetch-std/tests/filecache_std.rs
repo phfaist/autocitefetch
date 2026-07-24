@@ -719,7 +719,7 @@ fn manual_citation_is_usable_in_run_but_never_persisted() {
     {
         let store = block_on(SingleFileCacheStore::new(&dir)).expect("open");
         let mgr = CitationManager::new(NoFetch, store, FixedClock(1_000), InstantTimer)
-            .register(ManualSource::new()).unwrap();
+            .register("manual", ManualSource::new()).unwrap();
 
         let cites = vec![("manual".to_string(), text.to_string())];
         let report = block_on(mgr.retrieve(&cites)).expect("retrieve");

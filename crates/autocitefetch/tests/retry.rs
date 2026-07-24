@@ -243,7 +243,7 @@ fn retryable_503_is_retried_until_it_succeeds() {
     let sleeps = timer.clone();
     let fetcher = FlakyFetcher::new(DOI_URL, K, FailMode::Status(503), BODY);
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), timer)
-        .register(DoiSource::new()).unwrap();
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), DOI.to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -276,7 +276,7 @@ fn retryable_transport_error_is_retried_until_it_succeeds() {
     let sleeps = timer.clone();
     let fetcher = FlakyFetcher::new(DOI_URL, K, FailMode::Transport, BODY);
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), timer)
-        .register(DoiSource::new()).unwrap();
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), DOI.to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -295,7 +295,7 @@ fn non_retryable_404_is_not_retried() {
     let sleeps = timer.clone();
     let fetcher = FlakyFetcher::new(DOI_URL, 99, FailMode::Status(404), BODY);
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), timer)
-        .register(DoiSource::new()).unwrap();
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), DOI.to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -318,7 +318,7 @@ fn retry_after_reaches_the_wrapper_through_a_source() {
     let fetcher =
         FlakyFetcher::new(DOI_URL, 1, FailMode::Status(429), BODY).with_retry_after("3");
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), timer)
-        .register(DoiSource::new()).unwrap();
+        .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), DOI.to_string())];
     assert!(block_on(mgr.retrieve(&cites)).unwrap().is_complete());

@@ -74,11 +74,11 @@ fn main() {
     let store = block_on(SingleFileCacheStore::new(&cache_dir)).expect("open cache dir");
 
     let manager = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
-        .register(DoiSource::new())
+        .register("doi", DoiSource::new())
         .expect("register doi source")
-        .register(ManualSource::new())
+        .register("manual", ManualSource::new())
         .expect("register manual source")
-        .register(BibliographyFileSource::new([bib_url]))
+        .register("bib", BibliographyFileSource::new([bib_url]))
         .expect("register bibliography source");
 
     let cites = vec![
