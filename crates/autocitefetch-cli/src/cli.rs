@@ -134,6 +134,15 @@ pub struct Cli {
     #[arg(long)]
     pub no_arxiv_chaining: bool,
 
+    /// Drop this top-level CSL field from every entry. Repeatable.
+    ///
+    /// Applied before an entry is cached, so bulky fields nobody cites —
+    /// `reference` (doi.org returns the paper's entire bibliography) or
+    /// `abstract` — stay out of both the output and `.citations.jsonl`.
+    /// Entries already cached keep their fields until they are refetched.
+    #[arg(long = "drop-field", value_name = "FIELD")]
+    pub drop_field: Vec<String>,
+
     /// Directory holding the cache files.
     #[arg(long, value_name = "DIR", default_value = ".")]
     pub cache_dir: PathBuf,

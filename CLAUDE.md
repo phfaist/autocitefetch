@@ -18,7 +18,7 @@ port of two prior libraries (see "Reference implementations" below).
 ## Commands
 
 ```sh
-cargo test                                   # all 199 tests (workspace)
+cargo test                                   # all 203 tests (workspace)
 cargo test -p autocitefetch --test arxiv_dois override_map_beats_feed_doi   # one integration test
 cargo test -p autocitefetch --lib filecache::tests::torn_tail_is_tolerated  # one unit test
 cargo doc --workspace --no-deps              # currently warning-free — keep it that way
@@ -135,6 +135,13 @@ A worklist loop, not a fixed pipeline:
   then applied to the store **serially** to keep writes/worklist/report updates simple.
 - New chained targets discovered during a pass feed the next pass; the loop runs until the worklist
   drains, then calls `store.flush()`.
+- `with_dropped_csl_fields(["reference", …])` (default: empty) removes those **top-level** CSL keys
+  on the way from a source's `Outcome` into `store.put` — doi.org's `reference` array (a paper's
+  whole bibliography) is the motivating case. Applied in `store_resolutions` to a `Concrete` item
+  *before* `set_id`, so listing `"id"` cannot strip the id the entry is keyed on, **and** to a
+  `Chained` pointer's `set_properties`, which would otherwise re-introduce a dropped field when it
+  overrides the target at read time. Store-time only: entries already cached keep their fields until
+  they are refetched.
 
 ### Retry is interposed, not implemented per source
 
@@ -295,6 +302,10 @@ anywhere**, still). Things worth keeping straight:
 - `input.rs` splits a line at its **first** colon and trims only the prefix — a `manual:` key is the
   citation text, so its interior is payload. Keys are *not* normalized here; the manager does that
   per-source.
+- `--drop-field` (repeatable) is passed straight through to `with_dropped_csl_fields`, so a dropped
+  field is absent from the output **and** from `.citations.jsonl`. `--drop-field id` is a no-op by
+  construction (the manager stamps the id on after dropping); `warn_about_unusable_options` says so
+  rather than letting it look like it worked.
 - Exit status is part of the contract: `0` all resolved, `1` some unresolved (the rest are still
   written), `2` fatal. A citation that will not fetch is never `2`.
 

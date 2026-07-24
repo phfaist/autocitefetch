@@ -139,6 +139,13 @@ enum Answer {
     Missing,
     /// Resolve concretely, but with a JSON array instead of an object.
     NonObject,
+    /// Resolve concretely to a *bulky* item — a `reference` list and an
+    /// `abstract`, the way doi.org answers — plus a nested `reference` that a
+    /// top-level-only drop must leave alone.
+    Fat,
+    /// Chain key `k` to `(target, k)` with `set_properties` carrying both a
+    /// droppable field and one that must survive.
+    ChainFatTo(&'static str),
     /// Answer only the key `"ok"`, silently dropping every other key.
     OmitOthers,
     /// Return *two* resolutions for every key.
@@ -254,6 +261,26 @@ impl Source for ScriptSource {
                         k,
                         CslValue::Array(vec![CslValue::String("not a CSL item".into())]),
                     )),
+                    Answer::Fat => out.push(Resolution::concrete(
+                        k.clone(),
+                        serde_json::json!({
+                            "title": format!("{}:{k}", self.prefix),
+                            "abstract": "a long abstract",
+                            "reference": [{"key": "r1"}, {"key": "r2"}],
+                            "keep": {"reference": "nested, not top level"},
+                        }),
+                    )),
+                    Answer::ChainFatTo(target) => out.push(Resolution {
+                        key: k.clone(),
+                        outcome: Outcome::Chained {
+                            prefix: target.into(),
+                            key: k,
+                            set_properties: serde_json::json!({
+                                "reference": ["from the pointer"],
+                                "arxivid": "1211.1037",
+                            }),
+                        },
+                    }),
                     Answer::OmitOthers => {
                         if k == "ok" {
                             out.push(Resolution::concrete(k, item("ok")));
@@ -564,6 +591,96 @@ fn a_set_properties_id_cannot_override_the_requested_id() {
     assert_eq!(item["id"], "a:y", "the requested id must win over set_properties.id");
     assert_eq!(item["note"], "n", "other set_properties still apply");
     assert_eq!(item["title"], "T", "target field with no override is kept");
+}
+
+// --- dropped CSL fields ----------------------------------------------------
+
+/// `with_dropped_csl_fields` strips the listed top-level fields *before* the
+/// item is stored, so they are absent from the cache record itself — not merely
+/// filtered on the way out — while nested occurrences and unlisted fields stay.
+#[test]
+fn dropped_fields_never_reach_the_store() {
+    let clock = MovableClock::default();
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .with_dropped_csl_fields(["reference", "abstract"])
+        .register("s", ScriptSource::new("s", Answer::Fat, &clock))
+        .unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("s", "x")]))).unwrap();
+    assert!(report.is_complete(), "{:?}", report.failures);
+
+    let rec = block_on(mgr.store().get("s:x")).unwrap().expect("stored");
+    let Payload::Concrete(stored) = rec.payload else {
+        panic!("expected a concrete payload");
+    };
+    assert!(stored.get("reference").is_none(), "dropped before storage");
+    assert!(stored.get("abstract").is_none(), "dropped before storage");
+    assert_eq!(stored["title"], "s:x", "unlisted fields are untouched");
+    assert_eq!(
+        stored["keep"]["reference"], "nested, not top level",
+        "only top-level keys are dropped"
+    );
+
+    let item = block_on(mgr.get("s", "x")).unwrap();
+    assert!(item.get("reference").is_none());
+    assert_eq!(item["id"], "s:x");
+}
+
+/// A chained pointer's `set_properties` are stripped too. They *override* the
+/// concrete target at read time, so a dropped field left in the pointer would
+/// walk straight back out of `get` — a field dropped from the arXiv side
+/// re-appearing on the DOI item it chains to.
+#[test]
+fn dropped_fields_are_stripped_from_chained_set_properties() {
+    let clock = MovableClock::default();
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .with_dropped_csl_fields(["reference"])
+        .register("a", ScriptSource::new("a", Answer::ChainFatTo("b"), &clock))
+        .unwrap()
+        .register("b", ScriptSource::new("b", Answer::Fat, &clock))
+        .unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("a", "x")]))).unwrap();
+    assert!(report.is_complete(), "{:?}", report.failures);
+
+    let rec = block_on(mgr.store().get("a:x")).unwrap().expect("stored");
+    let Payload::Chained { set_properties, .. } = rec.payload else {
+        panic!("expected a chained payload");
+    };
+    assert!(
+        set_properties.get("reference").is_none(),
+        "the pointer must not smuggle a dropped field back in"
+    );
+    assert_eq!(set_properties["arxivid"], "1211.1037", "other properties survive");
+
+    let item = block_on(mgr.get("a", "x")).unwrap();
+    assert!(item.get("reference").is_none(), "neither hop reintroduces it");
+    assert_eq!(item["arxivid"], "1211.1037");
+    assert_eq!(item["title"], "b:x", "the chain still resolves to its target");
+    assert_eq!(item["id"], "a:x");
+}
+
+/// Fields are dropped *before* the `id` is stamped on, so a host that lists
+/// `"id"` — deliberately or by copy-paste — cannot strip the id the entry is
+/// keyed on and echoed under.
+#[test]
+fn dropping_id_cannot_strip_the_entrys_id() {
+    let clock = MovableClock::default();
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .with_dropped_csl_fields(["id", "reference"])
+        .register("s", ScriptSource::new("s", Answer::Fat, &clock))
+        .unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("s", "x")]))).unwrap();
+    assert!(report.is_complete(), "{:?}", report.failures);
+
+    let rec = block_on(mgr.store().get("s:x")).unwrap().expect("stored");
+    let Payload::Concrete(stored) = rec.payload else {
+        panic!("expected a concrete payload");
+    };
+    assert_eq!(stored["id"], "s:x", "the id survives being listed");
+    assert!(stored.get("reference").is_none());
+    assert_eq!(block_on(mgr.get("s", "x")).unwrap()["id"], "s:x");
 }
 
 // --- failure provenance (origin) -------------------------------------------

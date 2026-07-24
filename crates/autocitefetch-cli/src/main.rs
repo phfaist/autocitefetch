@@ -196,7 +196,10 @@ fn build_manager(
     // A prefix is a *binding* the manager holds, not something a source
     // declares, so this is where the CLI's fixed `arxiv:`/`doi:`/`bib:`/
     // `manual:` vocabulary is decided — `SourceKind::prefix` is the whole of it.
-    let mut manager = CitationManager::new(fetcher, store, SystemClock, BlockingTimer);
+    let mut manager = CitationManager::new(fetcher, store, SystemClock, BlockingTimer)
+        // `--drop-field`: stripped on the way into the cache, so a dropped
+        // field never reaches `.citations.jsonl` either.
+        .with_dropped_csl_fields(cli.drop_field.iter().cloned());
     for kind in sources {
         let prefix = kind.prefix();
         manager = match kind {
@@ -246,6 +249,12 @@ fn warn_about_unusable_options(cli: &Cli, cites: &[(String, String)], sources: &
         && (cli.arxiv_doi_overrides.is_some() || cli.no_arxiv_chaining)
     {
         warn("the `arxiv` source is disabled; its options will be ignored");
+    }
+    if cli.drop_field.iter().any(|f| f == "id") {
+        // Harmless — the manager stamps the id on *after* dropping — but say so
+        // rather than let it look like it worked: nothing can be emitted
+        // without an `id`.
+        warn("--drop-field id is ignored: every entry is keyed on its `id`");
     }
     for prefix in requested {
         if !sources.iter().any(|s| s.prefix() == prefix) {

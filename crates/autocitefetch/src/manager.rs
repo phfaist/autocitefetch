@@ -145,6 +145,9 @@ pub struct CitationManager<F, S, C, T> {
     /// [`CitationManager::get`] and while *discovering* one in
     /// [`CitationManager::retrieve`].
     max_chain_depth: usize,
+    /// Top-level CSL fields stripped from every item on its way into the store
+    /// — see [`CitationManager::with_dropped_csl_fields`]. Empty by default.
+    dropped_csl_fields: Vec<String>,
 }
 
 impl<F, S, C, T> CitationManager<F, S, C, T>
@@ -166,6 +169,7 @@ where
             policy: TtlPolicy::default(),
             retry_policy: RetryPolicy::default(),
             max_chain_depth: 16,
+            dropped_csl_fields: Vec::new(),
         }
     }
 
@@ -237,6 +241,47 @@ where
     /// to *fetch* a link this crate's `get` could never *reach*.
     pub fn with_max_chain_depth(mut self, depth: usize) -> Self {
         self.max_chain_depth = depth;
+        self
+    }
+
+    /// Drop these **top-level** CSL fields from every item before it is stored.
+    /// Builder-style; empty by default (nothing is dropped).
+    ///
+    /// ```ignore
+    /// let mgr = CitationManager::new(fetcher, store, clock, timer)
+    ///     .with_dropped_csl_fields(["reference", "abstract"])
+    ///     .register("doi", DoiSource::new())?;
+    /// ```
+    ///
+    /// Sources hand back whatever their upstream returned, verbatim — doi.org's
+    /// CSL-JSON in particular often carries a `reference` array holding the
+    /// paper's *entire* bibliography, dwarfing the metadata anyone actually
+    /// cites. This is the one place to throw such fields away.
+    ///
+    /// Two things are worth being precise about:
+    ///
+    /// * **When.** The fields are removed inside `retrieve`, on the way from a
+    ///   source's [`Outcome`] into [`CacheStore::put`] — so they reach neither
+    ///   the store's in-memory view nor its persisted file, and never come back
+    ///   from `get`. Removal happens *before* the `id` is stamped on, so listing
+    ///   `"id"` here cannot strip the id the entry is keyed on and echoed under.
+    /// * **What.** Only top-level keys of the item, and — equally — of a chained
+    ///   pointer's `set_properties`, which would otherwise re-introduce a
+    ///   dropped field when it is merged over the target at read time. Nested
+    ///   occurrences are untouched, as is anything a source does *internally*
+    ///   with the field before returning (arXiv's DOI extraction, say).
+    ///
+    /// This only affects entries written from here on. Items already in a
+    /// persistent cache keep their fields until they expire and are refetched;
+    /// clear the cache if that matters.
+    ///
+    /// [`Outcome`]: crate::source::Outcome
+    pub fn with_dropped_csl_fields<I, K>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        self.dropped_csl_fields = fields.into_iter().map(Into::into).collect();
         self
     }
 
@@ -550,6 +595,12 @@ where
 
             match res.outcome {
                 Outcome::Concrete { mut csl, ttl } => {
+                    // Strip the host's unwanted fields (`reference`, …) here, so
+                    // they never reach the store — see
+                    // `with_dropped_csl_fields`. Deliberately *before* `set_id`:
+                    // a host that lists `"id"` must not be able to remove the id
+                    // this entry is keyed on.
+                    csl::remove_fields(&mut csl, &self.dropped_csl_fields);
                     if !csl::set_id(&mut csl, &id) {
                         // A bare array/string/number/null is not a CSL item.
                         // Storing it used to silently replace the payload with
@@ -570,7 +621,7 @@ where
                 Outcome::Chained {
                     prefix: tp,
                     key: tk,
-                    set_properties,
+                    mut set_properties,
                 } => {
                     // Normalize the target key by the *target* source's policy so
                     // the stored pointer references exactly the id its target
@@ -589,6 +640,10 @@ where
                             .await?;
                         continue;
                     }
+                    // A pointer's `set_properties` override the concrete target
+                    // at read time, so a dropped field left in here would come
+                    // straight back out of `get`.
+                    csl::remove_fields(&mut set_properties, &self.dropped_csl_fields);
                     let payload = Payload::Chained {
                         prefix: tp.clone(),
                         key: tk.clone(),

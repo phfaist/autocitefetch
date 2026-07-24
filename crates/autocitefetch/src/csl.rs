@@ -42,6 +42,33 @@ pub fn set_id(item: &mut CslValue, id: &str) -> bool {
     }
 }
 
+/// Remove the given **top-level** keys from a CSL object, in place.
+///
+/// Used by [`CitationManager::with_dropped_csl_fields`] to strip bulky fields a
+/// host has no use for — `reference` (a paper's whole reference list, routinely
+/// the largest field doi.org returns), `abstract`, `relation` — *before* the
+/// item is stored, so neither the in-memory view nor the persisted cache ever
+/// carries them.
+///
+/// Only the top level is touched: a `reference` nested inside some other field
+/// is left alone. A key that is not present is silently ignored, and a
+/// non-object value (which is not a CSL item to begin with) is left untouched,
+/// matching [`set_id`]'s tolerance.
+///
+/// [`CitationManager::with_dropped_csl_fields`]:
+///     crate::manager::CitationManager::with_dropped_csl_fields
+pub fn remove_fields(item: &mut CslValue, fields: &[String]) {
+    if fields.is_empty() {
+        return;
+    }
+    let Some(obj) = item.as_object_mut() else {
+        return;
+    };
+    for field in fields {
+        obj.remove(field.as_str());
+    }
+}
+
 /// Shallow-merge `overrides` (a JSON object) into `target`, **without**
 /// clobbering keys that `target` already has — `target` wins on a collision.
 /// Used along a chain to *accumulate* `set_properties` so that a property set
@@ -100,6 +127,30 @@ pub fn merge_over(target: &mut CslValue, overrides: &CslValue) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `remove_fields` is top-level-only, tolerant of absent keys, and a no-op
+    /// on anything that is not an object.
+    #[test]
+    fn remove_fields_drops_only_top_level_keys() {
+        let mut item = json!({
+            "id": "doi:10.x/y",
+            "reference": [{"key": "r1"}],
+            "container": {"reference": "nested"},
+        });
+        remove_fields(
+            &mut item,
+            &["reference".into(), "abstract".into()], // "abstract" is absent
+        );
+        assert_eq!(
+            item,
+            json!({"id": "doi:10.x/y", "container": {"reference": "nested"}})
+        );
+
+        // Not an object: left untouched rather than mangled (cf. `set_id`).
+        let mut arr = json!(["not a CSL item"]);
+        remove_fields(&mut arr, &["reference".into()]);
+        assert_eq!(arr, json!(["not a CSL item"]));
+    }
 
     /// Pins the intentional "an explicit `null` in `target` blocks the default"
     /// behavior (review item #15): `merge_defaults` counts a present-but-`null`
