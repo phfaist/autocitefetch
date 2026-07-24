@@ -135,6 +135,13 @@ versionless entry wins, else the highest `vN`) and chains to its DOI. DOI overri
 (`with_override_dois`): `Some(doi)` injects/replaces, `None` *suppresses* (keep arXiv metadata,
 don't chain).
 
+The CSL `issued` date is the entry's **`<updated>`** (last-revision date), falling back to
+`<published>` when `<updated>` is absent — matching feedparser's `.date` alias and the **JS**
+reference. This diverges from the Python reference, which uses the original `<published>` submission
+date, so a paper's citation *year* may differ from Python's output. For a versioned request `issued`
+is that specific version's date, not v1's. Only the per-entry `<updated>` is read (the feed-level
+`<updated>` is ignored).
+
 ### Single-file cache (`filecache.rs` + `autocitefetch-std/src/store.rs`)
 
 `FileCacheStore<Fs: CacheFs>` lives in the **core** crate (generic over an injected `CacheFs`); the
