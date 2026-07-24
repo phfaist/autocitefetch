@@ -113,6 +113,11 @@ makes `open()` fail rather than silently dropping the entries it can't read.
 
 - **Stale-while-revalidate**: soft + hard expiry with a grace window — mildly
   outdated entries are still served when a source is unreachable.
+- **Probabilistic stale revalidation** — in the soft-stale window an entry is
+  refetched only with a probability that ramps from ~0 at the soft expiry to ~1
+  at the hard expiry (a deterministic FNV-1a draw over `(id, now)`, no RNG). The
+  soft tier thus does real work: the effective TTL is close to the full nominal
+  TTL instead of `stale_percent`% of it, and revalidation is spread out.
 - **TTL jitter** (deterministic, seeded by entry id) — avoids a thundering herd
   when many entries expire together.
 - **Per-citation error tolerance** — failures are reported, not fatal. The

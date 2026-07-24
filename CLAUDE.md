@@ -55,12 +55,14 @@ holds only shared borrows while driving sources concurrently, so this is require
 
 A worklist loop, not a fixed pipeline:
 
-- Per pass: dedup against `seen`, look each id up in the store, classify freshness, and bucket the
-  misses/stale by prefix. A **fresh** cached `Payload::Chained` entry pushes its target onto the
-  worklist so the target is guaranteed present; a stale/expired one does *not* (it is about to be
-  refetched, and pre-pushing a superseded pointer would fetch — and report a failure for — a
-  citation nobody requested). When a refetch fails and the grace window keeps the old chained
-  record, the target is pushed from the failure path instead.
+- Per pass: dedup against `seen`, look each id up in the store, and bucket the ones due for a
+  (re)fetch by prefix — misses, plus anything `TtlPolicy::should_refetch` returns true for (hard-
+  expired always; soft-stale *probabilistically*, see Cache policy). A cached `Payload::Chained`
+  entry we are **keeping** (fresh, or stale but the probabilistic draw said serve-as-is) pushes its
+  target onto the worklist so the target is guaranteed present; one we are **refetching** does *not*
+  (it is about to be replaced, and pre-pushing a superseded pointer would fetch — and report a
+  failure for — a citation nobody requested). When a refetch fails and the grace window keeps the
+  old chained record, the target is pushed from the failure path instead.
 - Worklist items carry a **depth**; `max_chain_depth` (default 16, `with_max_chain_depth`) bounds
   `retrieve` as well as `get`, so retrieval never fetches links `get()` could not reach.
 - Buckets are driven concurrently with `buffer_unordered(MAX_CONCURRENT_SOURCES = 8)`; results are
@@ -89,9 +91,20 @@ manager does not consume it; chain discovery is dynamic via the worklist.
 
 ### Cache policy (`cache.rs`)
 
-Two-tier expiry per record: `stale_after` (soft, `stale_percent` = 80% of TTL) and `expires` (hard),
-plus a `grace` window (14 days) during which a hard-expired entry is still served **if the source is
-currently unreachable** (stale-while-revalidate — see `store_resolutions`' `Outcome::Failed` arm →
+Two-tier expiry per record: `stale_after` (soft, `stale_percent` = 80% of TTL) and `expires` (hard).
+The tiers are **not** a hard cutoff. `TtlPolicy::should_refetch` — the sole refetch decision the
+manager consumes — is: `Fresh` (now < `stale_after`) never refetch, `Expired` (now ≥ `expires`)
+always, and in the stale window `[stale_after, expires)` refetch only **probabilistically**, with a
+probability that ramps from ~0 at `stale_after` to ~1 as `now` nears `expires`. The draw is a
+deterministic FNV-1a hash of `(id, now)` (the same jitter family — no RNG, no ambient clock);
+mixing `now` in re-rolls each `retrieve`, so an entry left alone now grows likelier to refetch as it
+drifts toward `expires`. Consequence: an entry's **effective TTL is close to its full nominal TTL**
+(arXiv's 10 d now really refetches near 10 d, not ~8.9 d), and a batch fetched together revalidates
+spread out rather than all at once. `classify` (Fresh/Stale/Expired) is unchanged and still used by
+`usable_within_grace`, `prune`, and the chained-target freshness check; only the refetch decision
+went probabilistic. On top of that a `grace` window (14 days) during which a hard-expired entry is
+still served **if the source is currently unreachable** (stale-while-revalidate — see `store_resolutions`'
+`Outcome::Failed` arm →
 `note_failure`). Grace applies **only to `Outcome::Failed`** (transport/5xx/unloadable-file — "try
 again later"). An `Outcome::Missing` — a *reachable* source that authoritatively has no such key (an
 id absent from a file that loaded fine or from a 200 API response, a doi.org 404) — is the opposite:
@@ -221,4 +234,5 @@ This is a port of two libraries with the same architecture, useful for behavior 
 
 Known reference bugs deliberately **not** reproduced here: the JS `sleep` no-op that defeated
 backoff, the JS dead arXiv TTL, Python's `fetch_url` dropping headers, Python's silent drop of
-explicitly-versioned arXiv requests. Neither reference has TTL jitter or stale-while-revalidate.
+explicitly-versioned arXiv requests. Neither reference has TTL jitter, stale-while-revalidate, or
+probabilistic stale revalidation (both refetch every entry the instant it goes soft-stale).

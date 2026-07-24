@@ -395,14 +395,16 @@ fn a_body_that_is_neither_an_array_nor_an_object_is_rejected() {
 }
 
 #[test]
-fn a_file_is_refetched_only_once_its_entries_go_stale() {
+fn a_file_is_refetched_once_its_entries_hard_expire() {
     let url = "https://host.example/refs.json";
     let fetcher = MockFetcher::new().route(url, 200, br#"[{"id":"k1","title":"T"}]"#);
     let calls = fetcher.calls();
     let clock = MovableClock::default();
     // TTL 100 s ⇒ hard expiry is jittered into [85 s, 115 s] and soft expiry is
-    // 80% of that, i.e. [68 s, 92 s]. So 60 s is unambiguously fresh and 95 s
-    // unambiguously not, whatever the id's jitter seed works out to.
+    // 80% of that, i.e. [68 s, 92 s]. So 60 s is unambiguously fresh and 200 s
+    // unambiguously hard-expired, whatever the id's jitter seed works out to.
+    // (In the stale window `[68 s, 115 s)` the reload is probabilistic, so it is
+    // not asserted here — that ramp is covered in `cache_policy.rs`.)
     let bib = BibliographyFileSource::new([url.to_string()]).with_ttl(Duration::from_secs(100));
     let mgr = CitationManager::new(fetcher, MemStore::default(), clock.clone(), InstantTimer)
         .register(bib);
@@ -418,9 +420,9 @@ fn a_file_is_refetched_only_once_its_entries_go_stale() {
     block_on(mgr.retrieve(&cites)).unwrap();
     assert_eq!(calls.get(), 1, "still inside the fresh window");
 
-    clock.set_secs(95);
+    clock.set_secs(200);
     block_on(mgr.retrieve(&cites)).unwrap();
-    assert_eq!(calls.get(), 2, "a stale entry triggers a reload");
+    assert_eq!(calls.get(), 2, "a hard-expired entry triggers a reload");
 }
 
 #[test]

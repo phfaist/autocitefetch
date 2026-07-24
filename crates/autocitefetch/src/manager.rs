@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use futures_util::stream::{StreamExt, iter};
 use hashbrown::{HashMap, HashSet};
 
-use crate::cache::{Freshness, TtlPolicy};
+use crate::cache::TtlPolicy;
 use crate::csl::{self, CslValue};
 use crate::driver::drive_source;
 use crate::env::{Clock, Timer, Timestamp};
@@ -224,27 +224,30 @@ where
                 }
 
                 match self.store.get(&id).await? {
-                    Some(rec) => match self.policy.classify(&rec, now) {
-                        Freshness::Fresh => {
-                            // Only a record we are *not* about to refetch needs
-                            // its target pulled in from here. Pre-pushing the
-                            // target of a stale pointer would fetch a link the
-                            // refetch is about to replace — and report a
-                            // failure for a citation nobody asked for if that
-                            // dead target 404s.
-                            if let Payload::Chained {
-                                prefix: tp,
-                                key: tk,
-                                ..
-                            } = &rec.payload
-                            {
-                                worklist.push((tp.clone(), tk.clone(), depth + 1));
-                            }
-                        }
-                        Freshness::Stale | Freshness::Expired => {
+                    Some(rec) => {
+                        if self.policy.should_refetch(&rec, now, &id) {
+                            // Expired, or stale-and-the-draw-said-refetch: bucket
+                            // it. Do *not* pre-push a chained pointer's target
+                            // here — the refetch may replace the pointer (a
+                            // retracted or override-suppressed DOI), and fetching
+                            // the old target would waste a rate-limited request
+                            // and report a failure for a citation nobody asked
+                            // for if that dead target 404s. `store_resolutions`
+                            // pushes the *new* target when it stores the pointer.
                             buckets.entry(prefix).or_default().push(key);
+                        } else if let Payload::Chained {
+                            prefix: tp,
+                            key: tk,
+                            ..
+                        } = &rec.payload
+                        {
+                            // A record we are keeping (Fresh, or Stale but the
+                            // draw said serve-as-is): a chained pointer we keep
+                            // must still pull its target in, or a later `get()`
+                            // breaks on the missing link.
+                            worklist.push((tp.clone(), tk.clone(), depth + 1));
                         }
-                    },
+                    }
                     None => {
                         buckets.entry(prefix).or_default().push(key);
                     }
