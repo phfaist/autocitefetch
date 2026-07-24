@@ -1,0 +1,39 @@
+[package]
+name = "autocitefetch-cli"
+description = "Command-line front end for autocitefetch: turn a list of `prefix:key` citations into CSL-JSON."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "autocitefetch"
+path = "src/main.rs"
+# The binary is deliberately named after the library it fronts, which makes
+# `cargo doc --workspace` want to write `target/doc/autocitefetch/` twice — once
+# for the core lib, once for this bin — and warn about the collision. A binary
+# has no public API worth publishing (its docs are all `//!` notes for whoever
+# reads the source), so drop it from the doc build rather than rename it.
+doc = false
+
+[dependencies]
+autocitefetch = { workspace = true }
+# Default features on: the CLI needs the `http` feature's `UreqFetcher`.
+autocitefetch-std = { workspace = true }
+# Deliberately the workspace (alloc-only, no-default-features) serde_json rather
+# than a std-enabled one: under resolver v2 features unify across the workspace
+# build, and turning on `serde_json/std` here would compile the `#![no_std]` core
+# against the exact configuration it promises never to use. The alloc API
+# (`from_slice`, `to_string_pretty`) is all this binary needs.
+serde_json = { workspace = true }
+clap = { version = "4.6", features = ["derive", "wrap_help"] }
+# YAML for `--bib` files and `--arxiv-doi-overrides`. A maintained fork of the
+# archived `serde_yaml`; it deserializes straight into `serde_json::Value`
+# because `CslValue` is a plain serde `Deserialize` type. Kept *here* and not in
+# the core, per the host-parses-config principle.
+serde_yaml_ng = "0.10"
+
+[dev-dependencies]
+# Test-only: scratch directories for the file-reading tests, as in the std crate.
+tempfile = "3"
