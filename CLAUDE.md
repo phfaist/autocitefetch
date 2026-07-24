@@ -15,7 +15,7 @@ port of two prior libraries (see "Reference implementations" below).
 ## Commands
 
 ```sh
-cargo test                                   # all 137 tests (workspace)
+cargo test                                   # all 179 tests (workspace)
 cargo test -p autocitefetch --test arxiv_dois override_map_beats_feed_doi   # one integration test
 cargo test -p autocitefetch --lib filecache::tests::torn_tail_is_tolerated  # one unit test
 cargo doc -p autocitefetch-std --no-deps     # currently warning-free — keep it that way
@@ -36,14 +36,22 @@ only what you touch (or leave formatting alone) rather than running it workspace
 Nothing else returns CSL data.
 
 1. `manager.retrieve(&[(prefix, key), …])` → `RetrieveReport { failures }`. Per-citation tolerant:
-   one bad citation never aborts the batch, and only *store* errors produce `Err`.
+   one bad citation never aborts the batch, and only *store* errors produce `Err`. Each
+   `CiteFailure` carries `prefix`/`key` (the citation that *actually* failed — the chain **target**
+   when the failure is on a chained descendant) plus `origin: Option<(String,String)>`: `None` for a
+   directly-requested cite, `Some(requested)` naming the request a chained-target failure descends
+   from. Guarantee: every requested cite that ultimately fails is discoverable in `failures` either
+   directly (matching `(prefix,key)`) or via a failure whose `origin` is it — so a caller joining the
+   report against its input `cites` never wrongly concludes a cite succeeded (only for `get()` to
+   later break on the chain). `origin.unwrap_or((prefix,key))` recovers the failed request.
 2. `manager.get(prefix, key)` → `CslValue`. Walks chain pointers, merges `set_properties`, and
    rewrites `id` back to the originally requested `"prefix:key"`.
 
 ### The four injected traits
 
 `Fetcher`, `CacheStore`, `Clock`, `Timer` (in `fetch.rs`, `store.rs`, `env.rs`) are the entire host
-surface, assembled via `CitationManager::new(fetcher, store, clock, timer).register(source)`.
+surface, assembled via `CitationManager::new(fetcher, store, clock, timer).register(source)?`
+(`register` returns `Result` — it rejects an empty or `':'`-containing prefix rather than panicking).
 Every async trait method returns `BoxFuture<'a, T>` (`lib.rs`) — a **`!Send`** boxed future. This is
 deliberate: WASM futures are `!Send`, the core assumes a single cooperative task, and boxing keeps
 the traits object-safe (`&dyn Fetcher`, `Box<dyn Source>`). Do not add `Send`/`Sync` bounds.
@@ -55,14 +63,34 @@ holds only shared borrows while driving sources concurrently, so this is require
 
 A worklist loop, not a fixed pipeline:
 
-- Per pass: dedup against `seen`, look each id up in the store, classify freshness, and bucket the
-  misses/stale by prefix. A **fresh** cached `Payload::Chained` entry pushes its target onto the
-  worklist so the target is guaranteed present; a stale/expired one does *not* (it is about to be
-  refetched, and pre-pushing a superseded pointer would fetch — and report a failure for — a
-  citation nobody requested). When a refetch fails and the grace window keeps the old chained
-  record, the target is pushed from the failure path instead.
+- **Key whitespace is trimmed centrally, once.** Before an id is built, `manager.normalize_key`
+  trims leading/trailing whitespace off a requested key when the routed source declares
+  `Source::trim_key_whitespace()` (default `true`). This happens at every point a `(prefix, key)`
+  becomes a `cite_id` — the worklist loop head (so routing/`seen`-dedup/bucketing/storage all key on
+  the trimmed form and `" 1211.1037 "` collapses with `"1211.1037"` into one fetch/entry), the
+  `Outcome::Chained` store arm (so a chained target's stored pointer matches the id its target lands
+  under), and both `get`/`get_by_id` and each `get` chain hop (so a padded lookup finds the trimmed
+  entry). `manual` overrides the policy to `false` — its key *is* free-form citation text, kept
+  verbatim. An unknown prefix has no source to consult, so its key is left untrimmed. Sources thus
+  only ever see already-trimmed keys; **do not re-trim inside a source** (arXiv's old URL-only
+  `key.trim()` was removed once this landed).
+- Per pass: dedup against `seen`, look each id up in the store, and bucket the ones due for a
+  (re)fetch by prefix — misses, plus anything `TtlPolicy::should_refetch` returns true for (hard-
+  expired always; soft-stale *probabilistically*, see Cache policy). A cached `Payload::Chained`
+  entry we are **keeping** (fresh, or stale but the probabilistic draw said serve-as-is) pushes its
+  target onto the worklist so the target is guaranteed present; one we are **refetching** does *not*
+  (it is about to be replaced, and pre-pushing a superseded pointer would fetch — and report a
+  failure for — a citation nobody requested). When a refetch fails and the grace window keeps the
+  old chained record, the target is pushed from the failure path instead.
 - Worklist items carry a **depth**; `max_chain_depth` (default 16, `with_max_chain_depth`) bounds
   `retrieve` as well as `get`, so retrieval never fetches links `get()` could not reach.
+- Worklist items also carry an **origin** — the originally-requested `(prefix, key)` the item
+  descends from (itself for a requested cite). Every push of a chain target (kept-pointer during
+  bucketing, `Outcome::Chained` store arm, grace-served pointer in `note_failure`) inherits the
+  current item's origin, so a multi-hop chain still points back to the root request. The dedup set
+  (`seen`) records `(depth, origin)` per id; `store_resolutions` reads it back so any `CiteFailure`
+  it builds is attributed correctly. First-writer-wins: a directly-requested cite is in the initial
+  batch, so it is recorded before any chain could reach the same id — it is never mis-attributed.
 - Buckets are driven concurrently with `buffer_unordered(MAX_CONCURRENT_SOURCES = 8)`; results are
   then applied to the store **serially** to keep writes/worklist/report updates simple.
 - New chained targets discovered during a pass feed the next pass; the loop runs until the worklist
@@ -80,15 +108,35 @@ back off exponentially (`RetryPolicy`: 5 retries, 500 ms base, 30 s cap).
 
 arXiv doesn't duplicate DOI metadata: it stores `Outcome::Chained { prefix, key, set_properties }`,
 a pointer. `get()` walks up to `max_chain_depth` (16) links, accumulating `set_properties` with
-`csl::merge_defaults` — **properties closer to the request win** — until it hits a
-`Payload::Concrete`. Note `Source::chains_to()` exists but the manager does not consume it; chain
-discovery is dynamic via the worklist.
+`csl::merge_defaults` — **properties closer to the request win** during accumulation — until it hits
+a `Payload::Concrete`. At the concrete node the accumulated `set_properties` are applied with
+`csl::merge_over`, so they **override** the concrete target's colliding fields (matching both
+reference implementations' `{ ...target, ...set_properties }`); the requested `id` is then forced
+last, so a `set_properties` carrying an `id` can never win. Note `Source::chains_to()` exists but the
+manager does not consume it; chain discovery is dynamic via the worklist.
 
 ### Cache policy (`cache.rs`)
 
-Two-tier expiry per record: `stale_after` (soft, `stale_percent` = 80% of TTL) and `expires` (hard),
-plus a `grace` window (14 days) during which a hard-expired entry is still served **if the source is
-currently unreachable** (stale-while-revalidate — see `store_resolutions`' `Outcome::Failed` arm).
+Two-tier expiry per record: `stale_after` (soft, `stale_percent` = 80% of TTL) and `expires` (hard).
+The tiers are **not** a hard cutoff. `TtlPolicy::should_refetch` — the sole refetch decision the
+manager consumes — is: `Fresh` (now < `stale_after`) never refetch, `Expired` (now ≥ `expires`)
+always, and in the stale window `[stale_after, expires)` refetch only **probabilistically**, with a
+probability that ramps from ~0 at `stale_after` to ~1 as `now` nears `expires`. The draw is a
+deterministic FNV-1a hash of `(id, now)` (the same jitter family — no RNG, no ambient clock);
+mixing `now` in re-rolls each `retrieve`, so an entry left alone now grows likelier to refetch as it
+drifts toward `expires`. Consequence: an entry's **effective TTL is close to its full nominal TTL**
+(arXiv's 10 d now really refetches near 10 d, not ~8.9 d), and a batch fetched together revalidates
+spread out rather than all at once. `classify` (Fresh/Stale/Expired) is unchanged and still used by
+`usable_within_grace`, `prune`, and the chained-target freshness check; only the refetch decision
+went probabilistic. On top of that a `grace` window (14 days) during which a hard-expired entry is
+still served **if the source is currently unreachable** (stale-while-revalidate — see `store_resolutions`'
+`Outcome::Failed` arm →
+`note_failure`). Grace applies **only to `Outcome::Failed`** (transport/5xx/unloadable-file — "try
+again later"). An `Outcome::Missing` — a *reachable* source that authoritatively has no such key (an
+id absent from a file that loaded fine or from a 200 API response, a doi.org 404) — is the opposite:
+`note_missing` **always** reports it, never consults grace, and **removes** the stale cached entry so
+`get()` stops serving now-known-wrong data (a removed entry may be some other citation's chain
+target, whose `get()` then fails on the dead link — correct, the target really no longer resolves).
 Hard TTL gets ±15% deterministic jitter seeded by FNV-1a over the entry id, so a batch fetched
 together doesn't expire together.
 
@@ -103,8 +151,8 @@ across passes, so the second pass of an arXiv→DOI chain cannot hit doi.org wit
 | prefix | chunk / interval / TTL | notes |
 |---|---|---|
 | `arxiv` | 100 / 3100 ms / 10 d | Atom feed parsed with `xmlparser`; version resolution; chains to `doi` |
-| `doi` | 1 / 1100 ms / 360 d | doi.org content negotiation returns CSL-JSON verbatim — no field mapping |
-| `manual` | ∞ / 0 / **0** | key *is* the formatted text, stored under `_formatted_text`; TTL 0 ⇒ ephemeral |
+| `doi` | 1 / 1100 ms / 360 d | doi.org content negotiation returns CSL-JSON stored verbatim — **one exception:** the CSL-spec uppercase `DOI` key is normalized on ingest to a lowercase `doi` key with a lowercased value (uniform lowercase `doi` everywhere; see `normalize_doi_key`) |
+| `manual` | ∞ / 0 / **0** | key *is* the formatted text, stored under `_formatted_text`; TTL 0 ⇒ ephemeral (kept in the store's in-memory view for the run, **never persisted** to `citations.jsonl` or a sidecar, gone on restart — enforced by `FileCacheStore`, keyed on `stale_after == expires`, not on the prefix) |
 | `bib` | ∞ / 0 / 60 s | file(s) fetched through the `Fetcher` (`file:` URLs), indexed by `id` |
 
 arXiv version resolution: an explicitly-versioned key (`1211.1037v2`) resolves to that exact version
@@ -113,6 +161,13 @@ versionless entry wins, else the highest `vN`) and chains to its DOI. DOI overri
 (`with_override_dois`): `Some(doi)` injects/replaces, `None` *suppresses* (keep arXiv metadata,
 don't chain).
 
+The CSL `issued` date is the entry's **`<updated>`** (last-revision date), falling back to
+`<published>` when `<updated>` is absent — matching feedparser's `.date` alias and the **JS**
+reference. This diverges from the Python reference, which uses the original `<published>` submission
+date, so a paper's citation *year* may differ from Python's output. For a versioned request `issued`
+is that specific version's date, not v1's. Only the per-entry `<updated>` is read (the feed-level
+`<updated>` is ignored).
+
 ### Single-file cache (`filecache.rs` + `autocitefetch-std/src/store.rs`)
 
 `FileCacheStore<Fs: CacheFs>` lives in the **core** crate (generic over an injected `CacheFs`); the
@@ -120,25 +175,54 @@ std crate supplies only real filesystem ops (`StdCacheFs`) and the `SingleFileCa
 Layout in one directory: `citations.jsonl` (header line 0 + one sorted entry per line — the only
 file worth committing), per-writer `citations.<pid>-<nanos>.log` append logs (lock-free writes), and
 `citations.lock`. `flush()` is the *only* operation that locks or rewrites the whole file: it folds
-main + all sidecars, atomically replaces the main file, and then deletes **only its own** sidecar.
-It must not delete a peer's: the lock serializes compaction against *compaction*, never against the
-lock-free `append`, so unlinking a peer's log destroys any write that landed after the fold read it
-(measured: ~300 of 400 acknowledged puts lost). The cost of that fix is that a **crashed** writer's
-sidecar is never reaped — reaping it needs a `CacheFs::try_lock_exclusive` that does not exist yet.
+main + all sidecars, atomically replaces the main file, then reaps its own sidecar **plus any
+crashed peer's**. It must never delete a *live* peer's: the compaction lock serializes compaction
+against *compaction*, never against the lock-free `append`, so unlinking a live peer's log destroys
+any write that landed after the fold read it (measured: ~300 of 400 acknowledged puts lost).
 
-Merge rules, all exercised by unit tests: max-`expires` wins on duplicate ids; a record beats a
-tombstone unless the id was never re-added. Torn-line tolerance applies to **sidecars only** — the
-main file is written via fsync+rename and so can never be legitimately torn, so an unparseable line
-or an unknown `{"schema":N}` header there is a hard `Err` rather than a silent skip (silently
-skipping then rewriting turned recoverable corruption into permanent loss).
+Live-vs-crashed is told apart by an **OS-advisory liveness lock**. On `open` a writer takes and
+holds — for the store's whole lifetime — an exclusive `CacheFs::try_lock_exclusive` on a companion
+file `citations.<writer>.log.lock` next to its sidecar; the kernel releases it if the process
+crashes. When `flush` folds a peer's sidecar it tries that peer's companion lock: **held** (`Ok(None)`)
+⇒ owner alive ⇒ fold read-only, never delete; **acquired** (`Ok(Some)`) ⇒ owner gone ⇒ delete the
+log and its orphaned companion (the fold already captured its lines). The companion is a *separate*
+file from the `.log` so reaping our own sidecar each flush never orphans the lock we hold — a writer
+never `try_lock`s its own companion (self-deadlock) and deletes its own `.log` unconditionally. A
+foreign `citations.*.log` with no companion is folded but never reaped, same as round 1. The stored
+guard is `CacheFs::Guard` (an associated type, not `Box<dyn CacheGuard>`) so `FileCacheStore<StdCacheFs>`
+stays `Send` — the concurrent regression test still moves stores across threads. A failed unlink
+never fails the flush.
+
+Merge rule (all exercised by unit tests): **last write wins over a deterministic total fold order** —
+the main file first (the baseline written at the last compaction), then each sidecar in sorted name
+order, and within a sidecar in line order (append order == that writer's time order). An entry line
+inserts, a tombstone removes. So `put;remove` removes, a re-fetch with a *smaller* `expires` wins
+(it is the newer write — the store does **not** keep the max-`expires` copy, which used to pin the
+entry `Expired` forever), and a sidecar always beats the committed main-file copy. The one thing this
+order cannot make exact is a **cross-writer** race — two live writers writing the same id
+concurrently are ordered only by sidecar name — an accepted known limitation; each writer's own
+sequence of ops is honored exactly. Torn-line tolerance applies to **sidecars only** — the main file
+is written via fsync+rename and so can never be legitimately torn, so an unparseable line or an
+unknown `{"schema":N}` header there is a hard `Err` rather than a silent skip (silently skipping then
+rewriting turned recoverable corruption into permanent loss).
+
+**Ephemeral (TTL-0) records are memory-only.** A record with no fresh window (`stale_after == expires`,
+what a zero TTL produces — `is_ephemeral`) is kept in `mem` so a same-run `get` works, but is never
+appended to a sidecar, never written into `citations.jsonl` (`serialize_main` skips it and `flush`
+carries the in-memory copies forward across its own disk reload), and dropped rather than resurrected
+when read back off an older on-disk file. This keeps `manual`-source citation text out of the
+committed file while preserving the two-phase `retrieve`→`get` flow within a run. Keyed on the
+timestamps, not the prefix.
 
 ## Invariants when editing
 
 - **All I/O goes through `Fetcher`** — including local file reads (bib files, the arXiv DOI-override
   JSON). Sources must never touch the filesystem or network directly.
-- **`retrieve_chunk` must return exactly one `Resolution` per requested key**, using
-  `Outcome::Failed` for misses. The manager matches by `res.key`; an omitted key is silently neither
-  stored nor reported.
+- **`retrieve_chunk` must return exactly one `Resolution` per requested key**. Pick the miss outcome
+  by *why*: `Outcome::Failed` when the source was unreachable/erroring (grace-served if cached),
+  `Outcome::Missing` when it is reachable and authoritatively lacks the key (always reported, drops
+  the stale copy). The manager matches by `res.key`; an omitted key is silently neither stored nor
+  reported.
 - **No RNG, no ambient clock, no `std`** in the core. Jitter is FNV-1a over a stable seed (id, or
   url+attempt); time only ever comes from the injected `Clock`. `Timestamp` is `i64` ms since epoch.
   Use `hashbrown::HashMap`, `core::error::Error`, `alloc::format!`.
@@ -183,4 +267,5 @@ This is a port of two libraries with the same architecture, useful for behavior 
 
 Known reference bugs deliberately **not** reproduced here: the JS `sleep` no-op that defeated
 backoff, the JS dead arXiv TTL, Python's `fetch_url` dropping headers, Python's silent drop of
-explicitly-versioned arXiv requests. Neither reference has TTL jitter or stale-while-revalidate.
+explicitly-versioned arXiv requests. Neither reference has TTL jitter, stale-while-revalidate, or
+probabilistic stale revalidation (both refetch every entry the instant it goes soft-stale).

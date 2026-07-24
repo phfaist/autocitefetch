@@ -166,7 +166,7 @@ impl Source for ChainSource {
 #[test]
 fn manual_source_stores_verbatim_text() {
     let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ManualSource::new());
+        .register(ManualSource::new()).unwrap();
 
     let cites = vec![("manual".to_string(), "Bohr, N. (1913)".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -178,6 +178,30 @@ fn manual_source_stores_verbatim_text() {
 }
 
 #[test]
+fn manual_source_preserves_leading_and_trailing_whitespace() {
+    // `manual` opts OUT of key trimming (`trim_key_whitespace() == false`): the
+    // key IS the formatted citation text, so surrounding whitespace is
+    // significant and must survive verbatim into storage and back out of `get`.
+    let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
+        .register(ManualSource::new()).unwrap();
+
+    let padded = "  Bohr, N. (1913)  ".to_string();
+    let cites = vec![("manual".to_string(), padded.clone())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    // Stored under (and retrievable by) the padded id, whitespace intact.
+    let item = block_on(mgr.get("manual", &padded)).unwrap();
+    assert_eq!(item["_formatted_text"], padded, "whitespace preserved verbatim");
+    assert_eq!(item["id"], "manual:  Bohr, N. (1913)  ");
+    // The trimmed key is a *different* citation here — nothing was stored for it.
+    assert!(
+        block_on(mgr.get("manual", "Bohr, N. (1913)")).is_err(),
+        "a manual key is not collapsed with its trimmed form"
+    );
+}
+
+#[test]
 fn doi_source_parses_content_negotiated_csljson() {
     let fetcher = MockFetcher::new().route(
         "https://doi.org/10.1103/PhysRev.47.777",
@@ -185,7 +209,7 @@ fn doi_source_parses_content_negotiated_csljson() {
         r#"{"type":"article-journal","title":"Can Quantum-Mechanical Description…","DOI":"10.1103/PhysRev.47.777"}"#,
     );
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(DoiSource::new());
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), "10.1103/PhysRev.47.777".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -193,8 +217,70 @@ fn doi_source_parses_content_negotiated_csljson() {
 
     let item = block_on(mgr.get("doi", "10.1103/PhysRev.47.777")).unwrap();
     assert_eq!(item["id"], "doi:10.1103/PhysRev.47.777");
-    assert_eq!(item["DOI"], "10.1103/PhysRev.47.777");
+    // doi.org's canonical uppercase `DOI` is normalized on ingest to a lowercase
+    // `doi` key with a lowercased value; the uppercase key does not survive.
+    assert_eq!(item["doi"], "10.1103/physrev.47.777");
+    assert_eq!(item.get("DOI"), None, "uppercase DOI key must not survive");
     assert!(item["title"].as_str().unwrap().starts_with("Can Quantum"));
+}
+
+#[test]
+fn doi_key_surrounding_whitespace_is_trimmed_centrally() {
+    // A DOI key arriving with incidental surrounding whitespace is trimmed by the
+    // manager (doi keeps the default policy) *before* it reaches the source — so
+    // it resolves normally, and the padded and clean forms dedup to one fetch.
+    // Note the doi source itself still rejects a key that *contains* internal
+    // whitespace (see `a_malformed_doi_is_rejected_without_fetching_anything`);
+    // only the surrounding whitespace is stripped here, and only that. The key's
+    // own case is preserved (unlike the lowercased `doi` value in the body).
+    let fetcher = MockFetcher::new().route(
+        "https://doi.org/10.1103/PhysRev.47.777",
+        200,
+        r#"{"type":"article-journal","title":"Trimmed DOI","DOI":"10.1103/PhysRev.47.777"}"#,
+    );
+    let calls = fetcher.calls();
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(DoiSource::new()).unwrap();
+
+    let cites = vec![
+        ("doi".to_string(), "  10.1103/PhysRev.47.777  ".to_string()),
+        ("doi".to_string(), "10.1103/PhysRev.47.777".to_string()),
+    ];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+    // doi's chunk_size is 1, so two undeduped keys would be two fetches.
+    assert_eq!(calls.len(), 1, "padded + clean DOI must dedup to one fetch: {:?}", calls.urls());
+
+    // Both forms read the one entry, stored under the trimmed (case-preserved) id.
+    let item = block_on(mgr.get("doi", "  10.1103/PhysRev.47.777  ")).unwrap();
+    assert_eq!(item["id"], "doi:10.1103/PhysRev.47.777", "stored under the trimmed id");
+    assert_eq!(item["title"], "Trimmed DOI");
+    assert_eq!(item["doi"], "10.1103/physrev.47.777", "the DOI value is still lowercased");
+}
+
+#[test]
+fn doi_source_normalizes_uppercase_doi_key_and_lowercases_value() {
+    // doi.org returns the CSL-spec uppercase `DOI` key, often with a mixed-case
+    // value. Ingest must fold it to a lowercase `doi` key with a lowercased
+    // value, leaving no uppercase key behind. Every other field is untouched.
+    let fetcher = MockFetcher::new().route(
+        "https://doi.org/10.1103/PhysRevLett.109.170502",
+        200,
+        r#"{"type":"article-journal","title":"Mixed Case DOI","DOI":"10.1103/PhysRevLett.109.170502","URL":"https://doi.org/10.1103/PhysRevLett.109.170502"}"#,
+    );
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(DoiSource::new()).unwrap();
+
+    let cites = vec![("doi".to_string(), "10.1103/PhysRevLett.109.170502".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    let item = block_on(mgr.get("doi", "10.1103/PhysRevLett.109.170502")).unwrap();
+    assert_eq!(item["doi"], "10.1103/physrevlett.109.170502", "value lowercased");
+    assert_eq!(item.get("DOI"), None, "uppercase DOI key must not survive");
+    // Only the DOI key is normalized; other verbatim fields keep their casing.
+    assert_eq!(item["title"], "Mixed Case DOI");
+    assert_eq!(item["URL"], "https://doi.org/10.1103/PhysRevLett.109.170502");
 }
 
 #[test]
@@ -205,8 +291,8 @@ fn arxiv_chains_to_doi_and_merges_set_properties() {
         r#"{"type":"article-journal","title":"Chained Title","DOI":"10.9999/1211.1037"}"#,
     );
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ChainSource)
-        .register(DoiSource::new());
+        .register(ChainSource).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1211.1037".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -218,7 +304,10 @@ fn arxiv_chains_to_doi_and_merges_set_properties() {
     assert_eq!(item["id"], "arxiv:1211.1037");
     assert_eq!(item["title"], "Chained Title");
     assert_eq!(item["arxivid"], "1211.1037", "set_properties should be merged in");
-    assert_eq!(item["DOI"], "10.9999/1211.1037");
+    // Chained through the doi source, so the uppercase `DOI` is normalized to a
+    // lowercase `doi` key on ingest (this value has no letters to lowercase).
+    assert_eq!(item["doi"], "10.9999/1211.1037");
+    assert_eq!(item.get("DOI"), None, "uppercase DOI key must not survive");
 }
 
 #[test]
@@ -251,7 +340,7 @@ fn doi_url_percent_encodes_the_key_but_keeps_slashes() {
     let fetcher = MockFetcher::new().route(URL, 200, r#"{"type":"article-journal","title":"Encoded"}"#);
     let calls = fetcher.calls();
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(DoiSource::new());
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), KEY.to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -275,7 +364,7 @@ fn doi_requests_carry_the_csl_json_accept_header() {
         MockFetcher::new().route("https://doi.org/10.1/x", 200, r#"{"title":"t"}"#);
     let calls = fetcher.calls();
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(DoiSource::new());
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), "10.1/x".to_string())];
     block_on(mgr.retrieve(&cites)).unwrap();
@@ -291,22 +380,49 @@ fn doi_requests_carry_the_csl_json_accept_header() {
 
 #[test]
 fn doi_non_success_status_is_one_reported_failure() {
-    let fetcher = MockFetcher::new().route("https://doi.org/10.1/missing", 404, "Not Found");
+    // A non-404 non-success status (e.g. a 403 the retrying fetcher does not
+    // retry) is a reachability `Failed`, reported with the status named. A 404
+    // is handled separately — see `doi_404_is_an_authoritative_missing`.
+    let fetcher = MockFetcher::new().route("https://doi.org/10.1/forbidden", 403, "Forbidden");
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(DoiSource::new());
+        .register(DoiSource::new()).unwrap();
 
-    let cites = vec![("doi".to_string(), "10.1/missing".to_string())];
+    let cites = vec![("doi".to_string(), "10.1/forbidden".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
     assert_eq!(report.failures[0].prefix, "doi");
-    assert_eq!(report.failures[0].key, "10.1/missing");
+    assert_eq!(report.failures[0].key, "10.1/forbidden");
     assert!(
-        report.failures[0].message.contains("404"),
+        report.failures[0].message.contains("403"),
         "message should name the status: {}",
         report.failures[0].message
     );
     // Nothing was cached, so reading it back fails too.
-    assert!(block_on(mgr.get("doi", "10.1/missing")).is_err());
+    assert!(block_on(mgr.get("doi", "10.1/forbidden")).is_err());
+}
+
+/// A doi.org 404 is authoritative "no such DOI" (`Outcome::Missing`), so it is
+/// always reported and nothing is cached — distinct from a 5xx/403 reachability
+/// `Failed`. (That a `Missing` also *removes* a stale grace-window copy is
+/// pinned generically in `manager_contract::missing_is_reported_and_removes_...`.)
+#[test]
+fn doi_404_is_an_authoritative_missing() {
+    let fetcher = MockFetcher::new().route("https://doi.org/10.1/gone", 404, "Not Found");
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(DoiSource::new()).unwrap();
+
+    let cites = vec![("doi".to_string(), "10.1/gone".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert_eq!(report.failures[0].key, "10.1/gone");
+    // The message is the authoritative "not found", not a bare status line.
+    assert!(
+        report.failures[0].message.contains("not found"),
+        "a 404 should read as authoritative not-found: {}",
+        report.failures[0].message
+    );
+    // Nothing was cached.
+    assert!(block_on(mgr.get("doi", "10.1/gone")).is_err());
 }
 
 #[test]
@@ -315,7 +431,7 @@ fn doi_body_that_is_not_json_is_a_parse_failure() {
     for body in ["<!DOCTYPE html><html><body>Landing</body></html>", ""] {
         let fetcher = MockFetcher::new().route("https://doi.org/10.1/x", 200, body);
         let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-            .register(DoiSource::new());
+            .register(DoiSource::new()).unwrap();
 
         let cites = vec![("doi".to_string(), "10.1/x".to_string())];
         let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -336,7 +452,7 @@ fn doi_200_with_json_that_is_not_a_csl_object_is_a_failure() {
     for body in ["null", "[]", "\"nope\"", "123", "{}"] {
         let fetcher = MockFetcher::new().route("https://doi.org/10.1/x", 200, body);
         let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-            .register(DoiSource::new());
+            .register(DoiSource::new()).unwrap();
 
         let cites = vec![("doi".to_string(), "10.1/x".to_string())];
         let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -356,7 +472,7 @@ fn a_malformed_doi_is_rejected_without_fetching_anything() {
         let fetcher = MockFetcher::new();
         let calls = fetcher.calls();
         let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-            .register(DoiSource::new());
+            .register(DoiSource::new()).unwrap();
 
         let cites = vec![("doi".to_string(), key.to_string())];
         let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -368,7 +484,7 @@ fn a_malformed_doi_is_rejected_without_fetching_anything() {
 #[test]
 fn unknown_prefix_is_reported_not_fatal() {
     let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ManualSource::new());
+        .register(ManualSource::new()).unwrap();
 
     let cites = vec![
         ("nope".to_string(), "x".to_string()),

@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the committed Cargo.lock authoritative in CI.
+  CARGO_NET_RETRY: "3"
+
+jobs:
+  # Build + test on the declared MSRV and on stable. Edition 2024 requires
+  # Rust >= 1.85, which is also the workspace `rust-version`.
+  test:
+    name: test (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.85.0", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace
+        run: cargo build --workspace --locked
+      - name: Test workspace (all 179 tests)
+        run: cargo test --workspace --locked
+      - name: Core builds for wasm32 (no_std)
+        run: cargo build --locked -p autocitefetch --target wasm32-unknown-unknown
+      - name: std backends build without ureq/TLS
+        run: cargo build --locked -p autocitefetch-std --no-default-features
+      - name: std backends type-check without http, all targets
+        run: cargo check --locked -p autocitefetch-std --no-default-features --all-targets
+
+  # Lints and docs on stable only (clippy/rustdoc diagnostics vary by version).
+  lint:
+    name: clippy + rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Rustdoc (deny warnings)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --locked

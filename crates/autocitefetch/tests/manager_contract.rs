@@ -133,8 +133,10 @@ enum Answer {
     ChainToSuccessor,
     /// Chain every key to itself.
     SelfChain,
-    /// Fail every key.
+    /// Fail every key (reachability failure → grace-served if cached).
     Fail,
+    /// Report every key as authoritatively absent (reachable, no such key).
+    Missing,
     /// Resolve concretely, but with a JSON array instead of an object.
     NonObject,
     /// Answer only the key `"ok"`, silently dropping every other key.
@@ -247,6 +249,10 @@ impl Source for ScriptSource {
                     Answer::Fail => {
                         out.push(Resolution::failed(k, Error::Source("source down".into())))
                     }
+                    Answer::Missing => {
+                        let id = format!("{}:{k}", self.prefix);
+                        out.push(Resolution::missing(k, Error::NotFound(id)))
+                    }
                     Answer::NonObject => out.push(Resolution::concrete(
                         k,
                         CslValue::Array(vec![CslValue::String("not a CSL item".into())]),
@@ -283,7 +289,7 @@ fn cites(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 fn a_key_the_source_omits_is_reported() {
     let clock = MovableClock::default();
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::OmitOthers, &clock));
+        .register(ScriptSource::new("s", Answer::OmitOthers, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "ok"), ("s", "ghost")]))).unwrap();
     assert!(!report.is_complete(), "the dropped key must be reported");
@@ -307,7 +313,7 @@ fn duplicate_resolutions_for_one_key_are_collapsed() {
     let store = MemStore::default();
     let puts = store.puts.clone();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::Duplicate, &clock));
+        .register(ScriptSource::new("s", Answer::Duplicate, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
@@ -323,7 +329,7 @@ fn a_non_object_concrete_payload_is_reported_not_stubbed() {
     let store = MemStore::default();
     let entries = store.clone();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::NonObject, &clock));
+        .register(ScriptSource::new("s", Answer::NonObject, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert_eq!(report.failures.len(), 1);
@@ -353,7 +359,7 @@ fn chain_discovery_is_bounded_by_max_chain_depth() {
     let log = src.log();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
         .with_max_chain_depth(4)
-        .register(src);
+        .register(src).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("c", "0")]))).unwrap();
 
@@ -381,7 +387,7 @@ fn a_self_chain_is_rejected_at_store_time() {
     let store = MemStore::default();
     let entries = store.clone();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::SelfChain, &clock));
+        .register(ScriptSource::new("s", Answer::SelfChain, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert_eq!(report.failures.len(), 1);
@@ -445,8 +451,8 @@ fn a_stale_pointer_does_not_fetch_its_dead_target() {
     let b = ScriptSource::new("b", Answer::Fail, &clock);
     let b_log = b.log();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(a)
-        .register(b);
+        .register(a).unwrap()
+        .register(b).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("a", "x")]))).unwrap();
     assert!(
@@ -486,8 +492,8 @@ fn a_grace_served_pointer_keeps_its_target() {
     let b = ScriptSource::new("b", Answer::Concrete, &clock);
     let b_log = b.log();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
-        .register(a)
-        .register(b);
+        .register(a).unwrap()
+        .register(b).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("a", "x")]))).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
@@ -498,6 +504,243 @@ fn a_grace_served_pointer_keeps_its_target() {
         b_log.borrow()
     );
     assert_eq!(block_on(mgr.get("a", "x")).unwrap()["title"], "b:t");
+}
+
+/// A chain's `set_properties` **override** the concrete target's colliding
+/// fields (both reference impls do `{ ...target, ...set_properties }`). Here the
+/// chain carries `title:"FROM CHAIN"` and the target has `title:"FROM TARGET"`;
+/// the chain must win.
+#[test]
+fn chained_set_properties_override_the_target() {
+    let clock = MovableClock::default();
+    let store = MemStore::default();
+    store.seed(
+        "a:x",
+        Payload::Chained {
+            prefix: "b".into(),
+            key: "t".into(),
+            set_properties: serde_json::json!({"title": "FROM CHAIN", "extra": "kept"}),
+        },
+        10_000,
+        10_000,
+    );
+    store.seed(
+        "b:t",
+        Payload::Concrete(serde_json::json!({"id": "b:t", "title": "FROM TARGET", "year": 1935})),
+        10_000,
+        10_000,
+    );
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer);
+
+    let item = block_on(mgr.get("a", "x")).unwrap();
+    assert_eq!(item["title"], "FROM CHAIN", "the chain must override the target");
+    assert_eq!(item["extra"], "kept", "chain-only field is attached");
+    assert_eq!(item["year"], 1935, "target-only field is preserved");
+    assert_eq!(item["id"], "a:x", "id is rewritten to the requested one");
+}
+
+/// The requested `id` is forced last, so a `set_properties` carrying its own
+/// `id` can never override it — even though `set_properties` otherwise win.
+#[test]
+fn a_set_properties_id_cannot_override_the_requested_id() {
+    let clock = MovableClock::default();
+    let store = MemStore::default();
+    store.seed(
+        "a:y",
+        Payload::Chained {
+            prefix: "b".into(),
+            key: "u".into(),
+            set_properties: serde_json::json!({"id": "HACKED", "note": "n"}),
+        },
+        10_000,
+        10_000,
+    );
+    store.seed(
+        "b:u",
+        Payload::Concrete(serde_json::json!({"id": "b:u", "title": "T"})),
+        10_000,
+        10_000,
+    );
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer);
+
+    let item = block_on(mgr.get("a", "y")).unwrap();
+    assert_eq!(item["id"], "a:y", "the requested id must win over set_properties.id");
+    assert_eq!(item["note"], "n", "other set_properties still apply");
+    assert_eq!(item["title"], "T", "target field with no override is kept");
+}
+
+// --- failure provenance (origin) -------------------------------------------
+
+/// A directly-requested cite that fails carries `origin == None`: its own
+/// `(prefix, key)` already matches the caller's input, so there is nothing to
+/// attribute it back to.
+#[test]
+fn a_direct_failure_has_no_origin() {
+    let clock = MovableClock::default();
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(ScriptSource::new("s", Answer::Fail, &clock)).unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
+    assert_eq!(report.failures.len(), 1);
+    let f = &report.failures[0];
+    assert_eq!((f.prefix.as_str(), f.key.as_str()), ("s", "k"));
+    assert_eq!(f.origin, None, "a directly-requested failure has no origin");
+}
+
+/// A failure discovered on a chain *target* is reported under the target's
+/// `(prefix, key)` — but `origin` names the originally-requested cite that
+/// pulled it in, so a caller joining `failures` back against its input still
+/// finds the request that failed (instead of concluding it succeeded, only for
+/// `get()` to break on the chain later).
+#[test]
+fn a_chained_target_failure_is_attributed_to_the_request() {
+    let clock = MovableClock::default();
+    // `a:x` chains to `b:x`; the `b` fetch fails.
+    let a = ScriptSource::new("a", Answer::ChainTo("b"), &clock);
+    let b = ScriptSource::new("b", Answer::Fail, &clock);
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(a).unwrap()
+        .register(b).unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("a", "x")]))).unwrap();
+    assert_eq!(report.failures.len(), 1);
+    let f = &report.failures[0];
+    // The failure identifies the *target* that actually failed …
+    assert_eq!((f.prefix.as_str(), f.key.as_str()), ("b", "x"));
+    // … and attributes it back to the requested cite.
+    assert_eq!(f.origin, Some(("a".to_string(), "x".to_string())));
+    // The requested id itself appears nowhere as a failing `(prefix, key)` —
+    // origin is the only way to recover it. And `get` does break on the chain.
+    assert!(
+        !report.failures.iter().any(|f| f.prefix == "a" && f.key == "x"),
+        "the target failure, not the request, is reported directly"
+    );
+    assert!(block_on(mgr.get("a", "x")).is_err());
+}
+
+/// A multi-hop chain attributes a deep failure to the *original* request, not
+/// to the intermediate hop that immediately pointed at the failing target.
+#[test]
+fn a_multi_hop_chain_attributes_back_to_the_original_request() {
+    let clock = MovableClock::default();
+    // a:x -> b:x -> c:x, and the `c` fetch fails.
+    let a = ScriptSource::new("a", Answer::ChainTo("b"), &clock);
+    let b = ScriptSource::new("b", Answer::ChainTo("c"), &clock);
+    let c = ScriptSource::new("c", Answer::Fail, &clock);
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(a).unwrap()
+        .register(b).unwrap()
+        .register(c).unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("a", "x")]))).unwrap();
+    assert_eq!(report.failures.len(), 1);
+    let f = &report.failures[0];
+    assert_eq!((f.prefix.as_str(), f.key.as_str()), ("c", "x"));
+    assert_eq!(
+        f.origin,
+        Some(("a".to_string(), "x".to_string())),
+        "origin must be the original request, not the intermediate hop `b:x`"
+    );
+}
+
+/// The end-to-end guarantee: a caller can recover exactly *which of its
+/// requested cites* failed by mapping each failure to `origin.unwrap_or((prefix,
+/// key))` — whether the failure was direct or on a chained descendant.
+#[test]
+fn every_failed_request_is_recoverable_from_the_report() {
+    let clock = MovableClock::default();
+    // `a:x` chains to `b:x` which fails (indirect); `d:k` fails directly.
+    let a = ScriptSource::new("a", Answer::ChainTo("b"), &clock);
+    let b = ScriptSource::new("b", Answer::Fail, &clock);
+    let d = ScriptSource::new("d", Answer::Fail, &clock);
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(a).unwrap()
+        .register(b).unwrap()
+        .register(d).unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("a", "x"), ("d", "k")]))).unwrap();
+
+    // Re-derive the set of *requested* cites that failed.
+    let mut failed_requests: Vec<(String, String)> = report
+        .failures
+        .iter()
+        .map(|f| {
+            f.origin
+                .clone()
+                .unwrap_or_else(|| (f.prefix.clone(), f.key.clone()))
+        })
+        .collect();
+    failed_requests.sort();
+    assert_eq!(
+        failed_requests,
+        vec![
+            ("a".to_string(), "x".to_string()),
+            ("d".to_string(), "k".to_string()),
+        ],
+        "both requested cites must be recoverable from the report"
+    );
+}
+
+// --- authoritative missing vs. reachability failure ------------------------
+
+/// The `Missing` / `Failed` distinction, pinned side by side over an identical
+/// hard-expired-but-within-grace cached copy.
+///
+/// * `Outcome::Failed` (source unreachable) is grace-served: no failure is
+///   reported and the stale copy keeps being served (stale-while-revalidate).
+/// * `Outcome::Missing` (source reachable, key authoritatively gone) is
+///   **always** reported *and* removes the stale copy, so a later `get()` errors
+///   instead of serving now-known-wrong data for the whole grace window.
+#[test]
+fn missing_is_reported_and_removes_stale_while_failed_is_grace_served() {
+    // A cached concrete copy, hard-expired at t=1000 but well within the
+    // default 14-day grace at the t=30_000 we read at.
+    let seed = |store: &MemStore| {
+        store.seed(
+            "s:k",
+            Payload::Concrete(serde_json::json!({"id": "s:k", "title": "OLD"})),
+            0,
+            1000,
+        );
+    };
+
+    // Failed → grace-served, not reported, old data still served.
+    let clock = MovableClock::default();
+    clock.advance(30_000);
+    let store = MemStore::default();
+    seed(&store);
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
+        .register(ScriptSource::new("s", Answer::Fail, &clock)).unwrap();
+    let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
+    assert!(
+        report.is_complete(),
+        "a within-grace Failed must not be reported: {:?}",
+        report.failures
+    );
+    assert_eq!(
+        block_on(mgr.get("s", "k")).unwrap()["title"],
+        "OLD",
+        "the stale copy must still be served on a reachability failure"
+    );
+
+    // Missing → reported even within grace, and the stale copy is removed.
+    let clock = MovableClock::default();
+    clock.advance(30_000);
+    let store = MemStore::default();
+    seed(&store);
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
+        .register(ScriptSource::new("s", Answer::Missing, &clock)).unwrap();
+    let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
+    assert_eq!(
+        report.failures.len(),
+        1,
+        "an authoritative Missing must be reported even within grace"
+    );
+    assert_eq!(report.failures[0].key, "k");
+    assert!(
+        block_on(mgr.get("s", "k")).is_err(),
+        "the now-known-wrong stale copy must be removed, not served"
+    );
 }
 
 // --- chunking and rate limiting --------------------------------------------
@@ -522,8 +765,8 @@ fn pacing_is_start_to_start_and_survives_passes() {
         clock: clock.clone(),
     };
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), timer)
-        .register(a)
-        .register(b);
+        .register(a).unwrap()
+        .register(b).unwrap();
 
     let report =
         block_on(mgr.retrieve(&cites(&[("b", "d1"), ("b", "d2"), ("a", "x")]))).unwrap();
@@ -549,7 +792,7 @@ fn pacing_is_start_to_start_and_survives_passes() {
 fn get_by_id_round_trips_and_rejects_a_missing_colon() {
     let clock = MovableClock::default();
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(ScriptSource::new("s", Answer::Concrete, &clock));
+        .register(ScriptSource::new("s", Answer::Concrete, &clock)).unwrap();
 
     // A key containing a colon still round-trips: ids split on the *first* one.
     block_on(mgr.retrieve(&cites(&[("s", "k"), ("s", "10.1/x:y")]))).unwrap();
@@ -565,11 +808,39 @@ fn get_by_id_round_trips_and_rejects_a_missing_colon() {
 }
 
 /// A prefix containing `':'` would make `prefix:key` ids ambiguous, so it is
-/// refused at registration time rather than silently corrupting the cache.
+/// refused at registration time (with an error, not a panic) rather than
+/// silently corrupting the cache.
 #[test]
-#[should_panic(expected = "must not contain ':'")]
-fn registering_a_prefix_with_a_colon_panics() {
+fn registering_a_prefix_with_a_colon_errors() {
     let clock = MovableClock::default();
-    let _ = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(ScriptSource::new("bad:prefix", Answer::Concrete, &clock));
+    let err = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(ScriptSource::new("bad:prefix", Answer::Concrete, &clock))
+        .err()
+        .expect("a colon-containing prefix must be rejected");
+    assert!(matches!(err, Error::InvalidPrefix(_)), "got {err}");
+    assert!(err.to_string().contains("bad:prefix"), "got: {err}");
+}
+
+/// An empty prefix yields `":key"` ids, which break the `get_by_id` split, so
+/// it is refused the same way.
+#[test]
+fn registering_an_empty_prefix_errors() {
+    let clock = MovableClock::default();
+    let err = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(ScriptSource::new("", Answer::Concrete, &clock))
+        .err()
+        .expect("an empty prefix must be rejected");
+    assert!(matches!(err, Error::InvalidPrefix(_)), "got {err}");
+}
+
+/// The common case: a normal prefix registers fine and returns the manager for
+/// further chaining.
+#[test]
+fn registering_a_normal_prefix_succeeds() {
+    let clock = MovableClock::default();
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(ScriptSource::new("s", Answer::Concrete, &clock))
+        .expect("a colon-free, non-empty prefix must register");
+    let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
 }

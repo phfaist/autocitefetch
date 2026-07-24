@@ -8,15 +8,22 @@
 //! Behaviour (broadly that of the JS/Python references, with fixes — the
 //! entity handling below is *not* shared with them):
 //! * `GET …/api/query?id_list=<comma-joined, percent-encoded ids>&max_results=<n>`
-//!   for a chunk of ≤100 ids. Each requested key is **trimmed** before it is
-//!   encoded into the URL (a stray space, as in `\cite{arXiv: 1211.1037}`, makes
-//!   arXiv answer 400 for the *whole* chunk) and before it is matched against
-//!   feed entries; the returned [`Resolution::key`] is still the caller's key,
-//!   verbatim, as the manager requires.
+//!   for a chunk of ≤100 ids. Keys arrive **already trimmed** of surrounding
+//!   whitespace: the manager applies this source's default
+//!   [`Source::trim_key_whitespace`] policy centrally, so a stray space — as in
+//!   `\cite{arXiv: 1211.1037}`, which would otherwise make arXiv answer 400 for
+//!   the *whole* chunk — is gone before the key is encoded into the URL or
+//!   matched against feed entries. The returned [`Resolution::key`] equals the
+//!   key the manager sent, as the one-resolution-per-key contract requires.
 //! * Parse each `<entry>` for `<id>`, `<title>`, `<author><name>`,
-//!   `<published>`, and `<arxiv:doi>`. An entry whose `<id>` is not an
-//!   `…/abs/<arxivid>` URL is an arXiv *error entry* and is skipped, so the
-//!   corresponding requested key resolves to [`Outcome::Failed`].
+//!   `<published>`, `<updated>`, and `<arxiv:doi>`. An entry whose `<id>` is not
+//!   an `…/abs/<arxivid>` URL is an arXiv *error entry* and is skipped, so the
+//!   corresponding requested key resolves to [`Outcome::Failed`]. Only the
+//!   *per-entry* `<updated>` is read; the feed-level `<updated>` is ignored.
+//! * The CSL `issued` date is the entry's **`<updated>`** (the last-revision
+//!   date, matching feedparser's `.date` and the JS reference), falling back to
+//!   `<published>` (the original submission) only when `<updated>` is absent —
+//!   so for a versioned request `issued` is that version's date, not v1's.
 //! * **Entity references are decoded.** `xmlparser` is a pure tokenizer: it
 //!   hands back the raw source span, so `&amp;`/`&lt;`/`&#38;` would otherwise
 //!   survive verbatim into titles and author names (arXiv titles routinely
@@ -204,17 +211,17 @@ async fn retrieve_impl<'a>(
     }
 
     // Build the id_list query. Ids contain `/` and `.`, so each is
-    // percent-encoded; they are joined with a literal comma. Keys are trimmed
-    // here (and again when matching entries): a key like `"1211.1037 "` would
-    // otherwise encode to `1211.1037%20`, which arXiv rejects with a 400 —
-    // failing every one of the up-to-100 keys in the chunk. Only the *request*
-    // is normalized; the resolutions below still carry the caller's exact key.
+    // percent-encoded; they are joined with a literal comma. The manager has
+    // already trimmed surrounding whitespace from every key (the source's
+    // `trim_key_whitespace` policy), so none is done here — a key like
+    // `"1211.1037 "`, which would encode to `1211.1037%20` and make arXiv 400
+    // the whole chunk, can no longer reach this point.
     let mut url = String::from("https://export.arxiv.org/api/query?id_list=");
     for (i, k) in keys.iter().enumerate() {
         if i > 0 {
             url.push(',');
         }
-        encode_query_into(&mut url, k.trim());
+        encode_query_into(&mut url, k);
     }
     url.push_str("&max_results=");
     url.push_str(&keys.len().to_string());
@@ -296,16 +303,17 @@ fn fail_all(keys: Vec<String>, msg: String) -> Vec<Resolution> {
 /// Resolve one requested key against the parsed feed entries and the effective
 /// override map.
 ///
-/// The key is trimmed for *matching* only: every `Resolution` returned here
-/// carries `key` exactly as the manager supplied it, since the manager pairs
-/// resolutions back to requests by that string.
+/// The manager has already trimmed surrounding whitespace (per the source's
+/// `trim_key_whitespace` policy), so the key is matched as-is; every `Resolution`
+/// returned here carries `key` exactly as the manager supplied it, since the
+/// manager pairs resolutions back to requests by that string.
 fn resolve_key(
     chain_to_doi: bool,
     overrides: &HashMap<String, Option<String>>,
     key: String,
     entries: &[atom::Entry],
 ) -> Resolution {
-    let (base, req_version) = split_version(key.trim());
+    let (base, req_version) = split_version(&key);
 
     // Explicit version requested: select that exact version, emit concrete
     // metadata preserving the version — never chain (a DOI would drop the
@@ -319,9 +327,13 @@ fn resolve_key(
                 let doi = effective_doi(overrides, base, e.doi.as_deref());
                 Resolution::concrete(key, build_csl(e, doi))
             }
+            // The feed loaded and parsed; this exact version simply is not in
+            // it. Authoritatively absent ⇒ `Missing` (report, drop any stale
+            // copy), not `Failed` (a whole-request/transport failure — those
+            // stay `fail_all` above).
             None => {
                 let msg = alloc::format!("no arXiv entry returned for `{key}`");
-                Resolution::failed(key, Error::Source(msg))
+                Resolution::missing(key, Error::Source(msg))
             }
         };
     }
@@ -329,9 +341,10 @@ fn resolve_key(
     // Versionless: select the BEST entry among all returned for this base id.
     let entry = match select_best(entries, base) {
         Some(e) => e,
+        // Absent from a feed that parsed fine ⇒ authoritative `Missing`.
         None => {
             let msg = alloc::format!("no arXiv entry returned for `{key}`");
-            return Resolution::failed(key, Error::Source(msg));
+            return Resolution::missing(key, Error::Source(msg));
         }
     };
 
@@ -342,7 +355,7 @@ fn resolve_key(
     // skipped and the arXiv metadata is kept.
     if chain_to_doi {
         if let Some(doi) = doi {
-            // `base` == the trimmed key on this (versionless) path.
+            // `base` == the key on this (versionless) path.
             let mut sp = serde_json::Map::new();
             sp.insert("arxivid".into(), CslValue::String(base.to_string()));
             return Resolution {
@@ -420,7 +433,13 @@ fn build_csl(e: &atom::Entry, doi: Option<&str>) -> CslValue {
     }
     obj.insert("author".into(), CslValue::Array(authors));
 
-    if let Some(issued) = build_issued(e.published.as_deref()) {
+    // CSL `issued` is the *last-revision* date: `<updated>` when present (this
+    // matches feedparser's `.date` alias used by the JS reference), falling
+    // back to `<published>` (the original v1 submission) only when the entry
+    // carries no `<updated>`. For an explicitly-versioned request the selected
+    // entry *is* that version, so its `<updated>` is that version's date.
+    let issued_src = e.updated.as_deref().or(e.published.as_deref());
+    if let Some(issued) = build_issued(issued_src) {
         obj.insert("issued".into(), issued);
     }
 
@@ -454,10 +473,11 @@ fn build_author(name: &str) -> CslValue {
     CslValue::Object(obj)
 }
 
-/// Build a CSL `issued` object from a `<published>` value (`YYYY-MM-DD…`).
-/// Month and day are included only if present.
-fn build_issued(published: Option<&str>) -> Option<CslValue> {
-    let p = published?;
+/// Build a CSL `issued` object from an arXiv date string (`YYYY-MM-DD…`, from
+/// `<updated>` or `<published>`). Month and day are included only if present;
+/// `None` (no date, or an unparseable year) yields no `issued` field.
+fn build_issued(date_str: Option<&str>) -> Option<CslValue> {
+    let p = date_str?;
     // Keep only the date portion (before any time separator).
     let date = p.find(['T', 't', ' ']).map_or(p, |i| &p[..i]);
     let mut it = date.split('-');
@@ -541,7 +561,12 @@ mod atom {
         pub version: Option<u32>,
         pub title: Option<String>,
         pub authors: Vec<String>,
+        /// The entry's `<published>` — the original (v1) submission date.
         pub published: Option<String>,
+        /// The entry's `<updated>` — the date of *this* revision. Preferred for
+        /// the CSL `issued` date (matching feedparser's `.date` / the JS
+        /// reference); `published` is only a fallback when it is absent.
+        pub updated: Option<String>,
         pub doi: Option<String>,
     }
 
@@ -551,6 +576,7 @@ mod atom {
         id: Option<String>,
         title: Option<String>,
         published: Option<String>,
+        updated: Option<String>,
         doi: Option<String>,
         authors: Vec<String>,
     }
@@ -560,6 +586,7 @@ mod atom {
         Id,
         Title,
         Published,
+        Updated,
         Doi,
         AuthorName,
     }
@@ -585,7 +612,9 @@ mod atom {
                 self.capture = None;
                 return;
             }
-            // Only capture fields while inside an <entry>.
+            // Only capture fields while inside an <entry>. This gate is also
+            // what keeps the *feed-level* `<updated>`/`<id>`/`<title>` out: they
+            // sit outside any `<entry>`, so `raw` is `None` when they open.
             if self.raw.is_none() {
                 return;
             }
@@ -594,6 +623,7 @@ mod atom {
                 "id" => self.begin(Cap::Id),
                 "title" => self.begin(Cap::Title),
                 "published" => self.begin(Cap::Published),
+                "updated" => self.begin(Cap::Updated),
                 "doi" => self.begin(Cap::Doi),
                 "name" if self.in_author => self.begin(Cap::AuthorName),
                 _ => {}
@@ -605,11 +635,15 @@ mod atom {
                 Some(Cap::Id) => local == "id",
                 Some(Cap::Title) => local == "title",
                 Some(Cap::Published) => local == "published",
+                Some(Cap::Updated) => local == "updated",
                 Some(Cap::Doi) => local == "doi",
                 Some(Cap::AuthorName) => local == "name",
                 None => false,
             };
             if cap_matches {
+                // Invariant, not input handling: `cap_matches` is true only in
+                // the `Some(_)` arms above, so `capture` is guaranteed present
+                // here regardless of what the feed contains.
                 let cap = self.capture.take().unwrap();
                 let text = core::mem::take(&mut self.buf);
                 if let Some(raw) = &mut self.raw {
@@ -617,6 +651,7 @@ mod atom {
                         Cap::Id => raw.id = Some(text.trim().to_string()),
                         Cap::Title => raw.title = Some(collapse_ws(&text)),
                         Cap::Published => raw.published = Some(text.trim().to_string()),
+                        Cap::Updated => raw.updated = Some(text.trim().to_string()),
                         // A blank `<arxiv:doi>` (empty, self-closing, or all
                         // whitespace) is *no* DOI, not the empty DOI.
                         Cap::Doi => {
@@ -790,6 +825,7 @@ mod atom {
             title: raw.title,
             authors: raw.authors,
             published: raw.published,
+            updated: raw.updated,
             doi: raw.doi,
         })
     }

@@ -34,15 +34,27 @@ pub enum Outcome {
         ttl: Option<Duration>,
     },
     /// A pointer to another `(prefix, key)`. `set_properties` is merged into
-    /// the resolved target at read time (e.g. re-attaching `arxivid`).
+    /// the resolved target at read time, **overriding** any colliding target
+    /// field (e.g. re-attaching `arxivid`).
     Chained {
         prefix: String,
         key: String,
         set_properties: CslValue,
     },
-    /// This key could not be resolved. The manager applies its
-    /// stale-while-revalidate / grace policy before surfacing the error.
+    /// This key could not be resolved because the source was *unreachable* or
+    /// erroring (transport failure, 5xx/timeout, a whole file that would not
+    /// load, a malformed feed). The manager applies its stale-while-revalidate
+    /// / grace policy: within the grace window a still-cached copy keeps being
+    /// served and the error is **not** reported — "try again later".
     Failed(Error),
+    /// The source is reachable and definitively has **no such key**: a file
+    /// that loaded fine but does not contain the id, an id absent from a 200
+    /// feed, a doi.org 404. This is the *opposite* of [`Outcome::Failed`] — it
+    /// is authoritative, not transient. The manager therefore **always** reports
+    /// it, never consults the grace window, and drops any stale cached copy so
+    /// [`get`](crate::manager::CitationManager::get) stops serving now-known-wrong
+    /// data.
+    Missing(Error),
 }
 
 /// The result of resolving one requested key.
@@ -63,7 +75,8 @@ impl Resolution {
     }
 
     /// Resolved to a pointer at `(target_prefix, target_key)`; `set_properties`
-    /// is merged into the target at read time (see [`Outcome::Chained`]).
+    /// is merged into the target at read time, overriding colliding target
+    /// fields (see [`Outcome::Chained`]).
     pub fn chained(
         key: impl Into<String>,
         target_prefix: impl Into<String>,
@@ -80,12 +93,24 @@ impl Resolution {
         }
     }
 
-    /// Could not be resolved. Still counts as "one `Resolution` per requested
-    /// key" — see [`Source::retrieve_chunk`].
+    /// Could not be resolved because the source was unreachable / erroring
+    /// (transport, 5xx, an unloadable file). Grace-served if a cached copy is
+    /// still within its window — see [`Outcome::Failed`]. Still counts as "one
+    /// `Resolution` per requested key" — see [`Source::retrieve_chunk`].
     pub fn failed(key: impl Into<String>, err: Error) -> Self {
         Resolution {
             key: key.into(),
             outcome: Outcome::Failed(err),
+        }
+    }
+
+    /// The source is reachable and authoritatively has no such key (see
+    /// [`Outcome::Missing`]). Always reported, never grace-served. Mirrors
+    /// [`Resolution::failed`]; still one `Resolution` per requested key.
+    pub fn missing(key: impl Into<String>, err: Error) -> Self {
+        Resolution {
+            key: key.into(),
+            outcome: Outcome::Missing(err),
         }
     }
 }
@@ -120,6 +145,32 @@ pub trait Source {
         Duration::from_secs(30 * 24 * 60 * 60)
     }
 
+    /// Whether the manager should trim stray leading/trailing whitespace off a
+    /// requested key before it is used.
+    ///
+    /// Default `true`. For nearly every source a key is an *identifier* (an
+    /// arXiv id, a DOI, a bibliography key) where surrounding whitespace is
+    /// incidental — `\cite{arXiv: 1211.1037}` yields the key `" 1211.1037"`.
+    /// When this returns `true` the manager applies [`str::trim`]
+    /// (leading/trailing Unicode whitespace) to the key **once, centrally**,
+    /// before routing, `seen`-dedup, bucketing, storage, *and* lookup — so
+    /// `" 1211.1037 "` and `"1211.1037"` collapse to one cache id and one fetch,
+    /// and a later `get("arxiv", "1211.1037 ")` finds the entry stored under the
+    /// trimmed id. [`retrieve_chunk`](Source::retrieve_chunk) therefore only ever
+    /// sees already-trimmed keys, and the canonical `"prefix:key"` echoed in a
+    /// resolved item's `id` and in a [`CiteFailure`] is the trimmed form.
+    ///
+    /// Override to `false` for a source whose key is **free-form text** where
+    /// surrounding whitespace is significant — notably [`ManualSource`], whose
+    /// key *is* the pre-formatted citation text and must be stored verbatim.
+    /// Such a source's keys are never trimmed, so two keys differing only in
+    /// whitespace stay distinct.
+    ///
+    /// [`CiteFailure`]: crate::manager::CiteFailure
+    fn trim_key_whitespace(&self) -> bool {
+        true
+    }
+
     /// Prefixes this source may chain *to* (e.g. arXiv → `["doi"]`).
     ///
     /// **Advisory / introspection only** — the manager does not consult it.
@@ -139,11 +190,21 @@ pub trait Source {
     ///
     /// **Return exactly one [`Resolution`] per requested key**, with
     /// `Resolution::key` equal to the requested key — the manager matches
-    /// results to requests by `res.key`, not by position. Use
-    /// [`Outcome::Failed`] (via [`Resolution::failed`]) for a key you could
-    /// not resolve, including a plain miss; a key you omit is silently
-    /// *neither stored nor reported*, so the caller sees no failure and no
-    /// entry. Extra resolutions for keys that were not requested are ignored.
+    /// results to requests by `res.key`, not by position. For a key you could
+    /// not resolve, choose the outcome by *why*:
+    ///
+    /// * [`Outcome::Failed`] (via [`Resolution::failed`]) when the source was
+    ///   **unreachable or erroring** (transport failure, 5xx, an unloadable
+    ///   file) — the manager may keep serving a still-cached copy within its
+    ///   grace window and suppress the error ("try again later").
+    /// * [`Outcome::Missing`] (via [`Resolution::missing`]) when the source is
+    ///   **reachable and authoritatively has no such key** (the id is absent
+    ///   from a file that loaded fine, or from a successful API response) — the
+    ///   manager always reports it and drops any stale cached copy.
+    ///
+    /// A key you omit is silently *neither stored nor reported*, so the caller
+    /// sees no failure and no entry. Extra resolutions for keys that were not
+    /// requested are ignored.
     ///
     /// Do **not** implement retries here: the `ctx.fetcher` handed to a source
     /// is already wrapped in a

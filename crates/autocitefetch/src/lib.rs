@@ -9,7 +9,7 @@
 //! # Model
 //!
 //! A citation is a `(prefix, key)` pair, e.g. `("arxiv", "1211.1037")`. The
-//! prefix selects a [`Source`](source::Source) (arXiv API, doi.org, a manual
+//! prefix selects a [`source::Source`] (arXiv API, doi.org, a manual
 //! entry, a local bibliography file, …). Retrieval is two-phase:
 //!
 //! 1. [`CitationManager::retrieve`] — async; routes each key to its source,

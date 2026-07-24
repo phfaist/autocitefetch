@@ -18,6 +18,11 @@ pub type Result<T> = core::result::Result<T, Error>;
 pub enum Error {
     /// No source is registered for the given citation prefix.
     UnknownPrefix(String),
+    /// A source was registered under a prefix that cannot form an unambiguous
+    /// `"prefix:key"` id: it is empty, or it contains a `':'`. Citation ids are
+    /// split on the first colon, so such a prefix would collide in the cache
+    /// (`("a", "b:c")` vs `("a:b", "c")`) and break the `get_by_id` round-trip.
+    InvalidPrefix(String),
     /// A citation id is malformed (e.g. it has no `"prefix:key"` separator).
     InvalidId(String),
     /// A key was requested but never resolved (and no cached copy exists).
@@ -40,6 +45,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::UnknownPrefix(p) => write!(f, "no source registered for prefix `{p}`"),
+            Error::InvalidPrefix(p) => {
+                write!(f, "invalid source prefix `{p}`: must be non-empty and contain no ':'")
+            }
             Error::InvalidId(id) => {
                 write!(f, "malformed citation id `{id}`: expected `prefix:key`")
             }
@@ -61,6 +69,7 @@ impl core::error::Error for Error {
             Error::Fetch(e) => Some(e),
             Error::Store(e) => Some(e),
             Error::UnknownPrefix(_)
+            | Error::InvalidPrefix(_)
             | Error::InvalidId(_)
             | Error::NotFound(_)
             | Error::Chain(_)

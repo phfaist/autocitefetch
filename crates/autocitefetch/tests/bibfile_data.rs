@@ -64,6 +64,27 @@ impl Fetcher for MockFetcher {
     }
 }
 
+/// A fetcher for one URL whose body the test can swap between calls, modelling
+/// a bibliography file being edited between retrieves.
+struct TogglingFetcher {
+    url: String,
+    body: Rc<RefCell<Vec<u8>>>,
+}
+impl Fetcher for TogglingFetcher {
+    fn fetch(&self, req: Request) -> BoxFuture<'_, Result<Response, FetchError>> {
+        let result = if req.url == self.url {
+            Ok(Response {
+                status: 200,
+                headers: Default::default(),
+                body: self.body.borrow().clone(),
+            })
+        } else {
+            Err(FetchError::Status(404))
+        };
+        Box::pin(async move { result })
+    }
+}
+
 #[derive(Default)]
 struct MemStore {
     map: RefCell<StdMap<String, CacheRecord>>,
@@ -127,7 +148,7 @@ fn from_entries_resolves_without_any_fetch() {
         serde_json::json!({"id":"knuth1984","type":"book","title":"The TeXbook"}),
     )]);
     let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock, InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![("bib".to_string(), "knuth1984".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -145,7 +166,7 @@ fn retrieve_bib(
     keys: &[&str],
 ) -> Vec<autocitefetch::manager::CiteFailure> {
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
     let cites: Vec<(String, String)> = keys
         .iter()
         .map(|k| ("bib".to_string(), k.to_string()))
@@ -164,7 +185,7 @@ fn the_object_form_maps_id_to_item() {
     );
     let bib = BibliographyFileSource::new([url.to_string()]);
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![
         ("bib".to_string(), "k1".to_string()),
@@ -192,7 +213,7 @@ fn non_object_entries_in_the_object_form_are_reported_not_silently_emptied() {
     );
     let bib = BibliographyFileSource::new([url.to_string()]);
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites: Vec<(String, String)> = ["k1", "k2", "k3", "k4", "ok"]
         .iter()
@@ -242,7 +263,7 @@ fn later_files_win_on_duplicate_ids() {
         .route(b, 200, br#"[{"id":"dup","title":"From B"}]"#);
     let bib = BibliographyFileSource::new([a.to_string(), b.to_string()]);
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![
         ("bib".to_string(), "dup".to_string()),
@@ -265,6 +286,56 @@ fn a_missing_key_is_reported_with_a_readable_message() {
     // it a whole sentence produced
     // "citation `key `zz` not found in bibliography` not found".
     assert_eq!(failures[0].message, "citation `bib:zz` not found");
+}
+
+/// Review item #5: a key that was present and then *removed* from a
+/// successfully-reloaded bibliography must surface in `failures` on the next
+/// `retrieve` — not be silently grace-served for 14 days. A file that loads
+/// fine but lacks the id is an authoritative `Outcome::Missing`, so the stale
+/// cached copy is also dropped and `get()` then errors rather than returning
+/// the old data.
+#[test]
+fn a_key_removed_from_a_reloaded_file_is_reported_and_stops_serving_old_data() {
+    let url = "https://host.example/refs.json";
+    let body = Rc::new(RefCell::new(
+        br#"[{"id":"k1","title":"First"},{"id":"k2","title":"Second"}]"#.to_vec(),
+    ));
+    let fetcher = TogglingFetcher {
+        url: url.into(),
+        body: body.clone(),
+    };
+    let clock = MovableClock::default();
+    // 10 s TTL ⇒ hard expiry is jittered into [8.5 s, 11.5 s]; the default 14-day
+    // grace still covers t = 100 s, so this exercises the *within-grace* path the
+    // old code silently served.
+    let bib = BibliographyFileSource::new([url.to_string()]).with_ttl(Duration::from_secs(10));
+    let mgr = CitationManager::new(fetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(bib).unwrap();
+
+    let cites = vec![("bib".to_string(), "k1".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "first load resolves k1: {:?}", report.failures);
+    assert_eq!(block_on(mgr.get("bib", "k1")).unwrap()["title"], "First");
+
+    // Edit the file so k1 is gone, and wind the clock past the TTL (but well
+    // within grace) so the entry is expired and the file is reloaded.
+    *body.borrow_mut() = br#"[{"id":"k2","title":"Second"}]"#.to_vec();
+    clock.set_secs(100);
+
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert_eq!(
+        report.failures.len(),
+        1,
+        "a removed key must be reported, not grace-served: {:?}",
+        report.failures
+    );
+    assert_eq!(report.failures[0].key, "k1");
+    assert_eq!(report.failures[0].message, "citation `bib:k1` not found");
+    // The now-known-absent key must stop serving its old cached copy.
+    assert!(
+        block_on(mgr.get("bib", "k1")).is_err(),
+        "the removed key must not keep returning the old data"
+    );
 }
 
 #[test]
@@ -324,17 +395,19 @@ fn a_body_that_is_neither_an_array_nor_an_object_is_rejected() {
 }
 
 #[test]
-fn a_file_is_refetched_only_once_its_entries_go_stale() {
+fn a_file_is_refetched_once_its_entries_hard_expire() {
     let url = "https://host.example/refs.json";
     let fetcher = MockFetcher::new().route(url, 200, br#"[{"id":"k1","title":"T"}]"#);
     let calls = fetcher.calls();
     let clock = MovableClock::default();
     // TTL 100 s ⇒ hard expiry is jittered into [85 s, 115 s] and soft expiry is
-    // 80% of that, i.e. [68 s, 92 s]. So 60 s is unambiguously fresh and 95 s
-    // unambiguously not, whatever the id's jitter seed works out to.
+    // 80% of that, i.e. [68 s, 92 s]. So 60 s is unambiguously fresh and 200 s
+    // unambiguously hard-expired, whatever the id's jitter seed works out to.
+    // (In the stale window `[68 s, 115 s)` the reload is probabilistic, so it is
+    // not asserted here — that ramp is covered in `cache_policy.rs`.)
     let bib = BibliographyFileSource::new([url.to_string()]).with_ttl(Duration::from_secs(100));
     let mgr = CitationManager::new(fetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![("bib".to_string(), "k1".to_string())];
     block_on(mgr.retrieve(&cites)).unwrap();
@@ -347,9 +420,9 @@ fn a_file_is_refetched_only_once_its_entries_go_stale() {
     block_on(mgr.retrieve(&cites)).unwrap();
     assert_eq!(calls.get(), 1, "still inside the fresh window");
 
-    clock.set_secs(95);
+    clock.set_secs(200);
     block_on(mgr.retrieve(&cites)).unwrap();
-    assert_eq!(calls.get(), 2, "a stale entry triggers a reload");
+    assert_eq!(calls.get(), 2, "a hard-expired entry triggers a reload");
 }
 
 #[test]
@@ -361,7 +434,7 @@ fn with_ttl_shortens_the_fresh_window() {
     // Same instant as above, but a 1 s TTL: long stale by 60 s.
     let bib = BibliographyFileSource::new([url.to_string()]).with_ttl(Duration::from_secs(1));
     let mgr = CitationManager::new(fetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![("bib".to_string(), "k1".to_string())];
     block_on(mgr.retrieve(&cites)).unwrap();
@@ -377,7 +450,7 @@ fn from_entries_rejects_a_non_object_entry() {
         ("good".to_string(), serde_json::json!({"title":"Fine"})),
     ]);
     let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock, InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![
         ("bib".to_string(), "bad".to_string()),
@@ -402,7 +475,7 @@ fn with_parser_uses_the_injected_parser() {
 
     let bib = BibliographyFileSource::new([file_url.to_string()]).with_parser(parse_custom);
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
-        .register(bib);
+        .register(bib).unwrap();
 
     let cites = vec![("bib".to_string(), "x1".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();

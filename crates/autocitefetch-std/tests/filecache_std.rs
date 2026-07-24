@@ -32,6 +32,32 @@ fn record(expires_ms: i64) -> CacheRecord {
     }
 }
 
+/// An *ephemeral* (TTL-0) record — the `manual` source's case: no fresh window,
+/// so `stale_after == expires`. Must never be persisted.
+fn ephemeral(now_ms: i64) -> CacheRecord {
+    CacheRecord {
+        payload: Payload::Concrete(serde_json::json!({"_formatted_text": "Bohr, N. (1913)"})),
+        stale_after: Timestamp::from_millis(now_ms),
+        expires: Timestamp::from_millis(now_ms),
+    }
+}
+
+/// Names of the sidecar append logs in `dir` — files ending in `.log` but not
+/// `.log.lock` (the companion liveness lock). Sorted for stable assertions.
+fn list_sidecars(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".log") {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 #[test]
 fn put_flush_reopen_roundtrip_leaves_single_committed_file() {
     let tmp = tempfile::tempdir().expect("temp dir");
@@ -79,6 +105,67 @@ fn put_flush_reopen_roundtrip_leaves_single_committed_file() {
     );
     let entries = block_on(reopened.entries()).expect("entries");
     assert_eq!(entries.len(), 2, "both entries present after reopen");
+}
+
+/// Bug #1 on the real filesystem: `put; remove; flush` must leave the id gone,
+/// both in the reopened store and in the committed file's bytes. The old
+/// order-free fold applied a global "records beat tombstones" rule, so the
+/// entry resurrected on flush.
+#[test]
+fn put_then_remove_then_flush_removes_on_disk() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("cache");
+    let store = block_on(SingleFileCacheStore::new(&dir)).expect("open");
+
+    block_on(store.put("doi:10.1/gone", record(1000))).expect("put");
+    block_on(store.remove("doi:10.1/gone")).expect("remove");
+    block_on(store.flush()).expect("flush");
+
+    assert!(
+        block_on(store.get("doi:10.1/gone")).expect("get").is_none(),
+        "remove after put must survive a flush"
+    );
+    // The committed file holds only the header — the entry is not in it.
+    let text = std::fs::read_to_string(dir.join("citations.jsonl")).expect("read main");
+    assert!(
+        !text.contains("doi:10.1/gone"),
+        "the removed id must not be in the committed file: {text}"
+    );
+
+    drop(store);
+    let reopened = block_on(SingleFileCacheStore::new(&dir)).expect("reopen");
+    assert!(
+        block_on(reopened.get("doi:10.1/gone")).expect("get").is_none(),
+        "the removal must survive a reopen"
+    );
+}
+
+/// Bug #2 on the real filesystem: a re-fetch that shortens `expires` (a stepped-
+/// back clock, a reduced TTL) must win because it is the newer write. The old
+/// max-`expires` rule kept the larger stale value and pinned the entry expired.
+#[test]
+fn refetch_with_smaller_expires_wins_on_disk() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("cache");
+    let store = block_on(SingleFileCacheStore::new(&dir)).expect("open");
+
+    // Commit the larger-expiry copy, then re-fetch a smaller one into a fresh
+    // sidecar and compact.
+    block_on(store.put("doi:10.1/a", record(5000))).expect("put large");
+    block_on(store.flush()).expect("first flush");
+    block_on(store.put("doi:10.1/a", record(1000))).expect("re-fetch smaller");
+    block_on(store.flush()).expect("second flush");
+
+    drop(store);
+    let reopened = block_on(SingleFileCacheStore::new(&dir)).expect("reopen");
+    let got = block_on(reopened.get("doi:10.1/a"))
+        .expect("get")
+        .expect("present");
+    assert_eq!(
+        got.expires,
+        Timestamp::from_millis(1000),
+        "the newer, smaller-expiry re-fetch must win"
+    );
 }
 
 /// Regression test for the compaction data-loss bug: `flush()` used to delete
@@ -138,6 +225,95 @@ fn concurrent_writer_appends_are_not_eaten_by_a_peer_flush() {
         "{} of {N} acknowledged puts were destroyed by the peer's flush: {:?}…",
         missing.len(),
         &missing[..missing.len().min(5)]
+    );
+}
+
+/// Reaping a *crashed* writer's sidecar. Writer A records an entry and then is
+/// dropped without flushing — simulating a crash, which releases the liveness
+/// lock A held for its whole life and leaves its `citations.<A>.log` behind.
+/// A fresh writer B must fold A's orphaned data into the committed file and,
+/// finding A's liveness lock free, reap the stray sidecar (and its companion).
+#[test]
+fn a_crashed_writers_sidecar_is_reaped() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("cache");
+
+    let a = block_on(SingleFileCacheStore::new(&dir)).expect("open A");
+    block_on(a.put("doi:crashed", record(1234))).expect("A put");
+
+    // A's stray sidecar is on disk before the crash.
+    let before = list_sidecars(&dir);
+    assert_eq!(before.len(), 1, "exactly A's sidecar present, found {before:?}");
+    drop(a); // crash: the lifetime lock is released, the sidecar orphaned.
+
+    let b = block_on(SingleFileCacheStore::new(&dir)).expect("open B");
+    block_on(b.flush()).expect("B flush");
+
+    // A's entry survived into the committed file.
+    assert!(
+        block_on(b.get("doi:crashed")).expect("get").is_some(),
+        "the crashed writer's data must be folded into the main file"
+    );
+    let text = std::fs::read_to_string(dir.join("citations.jsonl")).expect("read main");
+    assert!(text.contains("doi:crashed"), "committed file holds A's entry");
+
+    // The stray sidecar — and its now-orphaned companion lock — are reaped.
+    let after = list_sidecars(&dir);
+    assert!(
+        after.is_empty(),
+        "the crashed writer's sidecar must be reaped, found {after:?}"
+    );
+    for name in &before {
+        assert!(
+            !dir.join(format!("{name}.lock")).exists(),
+            "the crashed writer's orphaned companion lock must be reaped too"
+        );
+    }
+}
+
+/// The mirror of the above: a *live* writer's sidecar must survive a peer's
+/// flush. A holds its liveness lock; B compacts while A is alive and must fold
+/// A's log read-only without unlinking it — and A's own later work must not be
+/// lost. If reaping ignored the lock, B would delete A's live sidecar here.
+#[test]
+fn a_live_writers_sidecar_is_not_reaped() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("cache");
+
+    let a = block_on(SingleFileCacheStore::new(&dir)).expect("open A");
+    block_on(a.put("doi:from-a", record(1234))).expect("A put");
+
+    let sidecars = list_sidecars(&dir);
+    assert_eq!(sidecars.len(), 1, "A's sidecar present, found {sidecars:?}");
+    let a_sidecar = sidecars[0].clone();
+
+    // B compacts while A is still alive and holding its liveness lock.
+    let b = block_on(SingleFileCacheStore::new(&dir)).expect("open B");
+    block_on(b.flush()).expect("B flush");
+
+    // The discriminating assertion: A's sidecar is untouched.
+    assert!(
+        dir.join(&a_sidecar).is_file(),
+        "a live writer's sidecar must survive a peer's flush"
+    );
+
+    // A keeps working: a later put + flush must not be lost, and A's earlier
+    // acknowledged put (which B folded) must still be present too.
+    block_on(a.put("doi:from-a-again", record(5678))).expect("A second put");
+    block_on(a.flush()).expect("A flush");
+
+    drop(a);
+    drop(b);
+    let reader = block_on(SingleFileCacheStore::new(&dir)).expect("reopen");
+    assert!(
+        block_on(reader.get("doi:from-a")).expect("get").is_some(),
+        "A's first put (folded by B) must survive"
+    );
+    assert!(
+        block_on(reader.get("doi:from-a-again"))
+            .expect("get")
+            .is_some(),
+        "A's later put must not be lost"
     );
 }
 
@@ -431,4 +607,142 @@ fn a_second_flush_blocks_while_the_first_holds_the_lock() {
 
     let text = std::fs::read_to_string(dir.join("citations.jsonl")).expect("read main file");
     assert_eq!(text.lines().count(), 3, "both entries committed: {text}");
+}
+
+/// Review item #7 on the real filesystem: a TTL-0 (ephemeral) record is served
+/// within the run — `get()` returns it before and after a `flush()` — but never
+/// lands in `citations.jsonl` or any sidecar, and is gone after a reopen. A
+/// normal record put alongside it is committed and survives.
+#[test]
+fn ephemeral_records_are_never_committed_to_disk() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("cache");
+    let store = block_on(SingleFileCacheStore::new(&dir)).expect("open");
+
+    block_on(store.put("doi:keep", record(1000))).expect("put normal");
+    block_on(store.put("manual:Bohr, N. (1913)", ephemeral(0))).expect("put ephemeral");
+
+    // Usable within the run, before the flush.
+    assert!(
+        block_on(store.get("manual:Bohr, N. (1913)"))
+            .expect("get")
+            .is_some()
+    );
+
+    block_on(store.flush()).expect("flush");
+
+    // Still usable after the flush, within the same run.
+    assert!(
+        block_on(store.get("manual:Bohr, N. (1913)"))
+            .expect("get")
+            .is_some(),
+        "an ephemeral record must survive a flush within the run"
+    );
+    assert!(block_on(store.get("doi:keep")).expect("get").is_some());
+
+    // The committed file holds the normal id, never the ephemeral text — and
+    // nothing else in the directory (any `.log` sidecar) mentions it either.
+    let main = std::fs::read_to_string(dir.join("citations.jsonl")).expect("read main");
+    assert!(main.contains("doi:keep"), "normal record committed: {main}");
+    assert!(
+        !main.contains("Bohr"),
+        "ephemeral text must never reach citations.jsonl: {main}"
+    );
+    for entry in std::fs::read_dir(&dir).expect("read dir") {
+        let path = entry.expect("entry").path();
+        let bytes = std::fs::read(&path).unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("Bohr"),
+            "ephemeral text leaked into {}: {text}",
+            path.display()
+        );
+    }
+
+    drop(store);
+    // Reopen (a fresh process would): normal survives, ephemeral is gone.
+    let reopened = block_on(SingleFileCacheStore::new(&dir)).expect("reopen");
+    assert!(
+        block_on(reopened.get("doi:keep")).expect("get").is_some(),
+        "the normal record survives a reopen"
+    );
+    assert!(
+        block_on(reopened.get("manual:Bohr, N. (1913)"))
+            .expect("get")
+            .is_none(),
+        "the ephemeral record must be gone after a reopen"
+    );
+}
+
+// --- minimal backends for a manager-level ephemeral test -------------------
+
+/// A fetcher that is never actually called (the `manual` source does no I/O);
+/// it exists only to satisfy `CitationManager::new`.
+struct NoFetch;
+impl autocitefetch::Fetcher for NoFetch {
+    fn fetch(
+        &self,
+        _req: autocitefetch::Request,
+    ) -> autocitefetch::BoxFuture<'_, Result<autocitefetch::Response, autocitefetch::FetchError>> {
+        Box::pin(async { Err(autocitefetch::FetchError::Status(599)) })
+    }
+}
+
+struct FixedClock(i64);
+impl autocitefetch::Clock for FixedClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::from_millis(self.0)
+    }
+}
+
+struct InstantTimer;
+impl autocitefetch::Timer for InstantTimer {
+    fn sleep(&self, _dur: std::time::Duration) -> autocitefetch::BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+}
+
+/// End-to-end through the manager: a `manual:` citation is resolved and readable
+/// within the run (after `retrieve`, which flushes), yet its text never reaches
+/// the committed file and it is gone after a restart (a fresh store over the
+/// same directory). This is the two-phase `retrieve`→`get` flow the ephemeral
+/// policy must not break.
+#[test]
+fn manual_citation_is_usable_in_run_but_never_persisted() {
+    use autocitefetch::CitationManager;
+    use autocitefetch::source::ManualSource;
+
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("cache");
+    let text = "Bohr, N. (1913). On the Constitution of Atoms.";
+
+    {
+        let store = block_on(SingleFileCacheStore::new(&dir)).expect("open");
+        let mgr = CitationManager::new(NoFetch, store, FixedClock(1_000), InstantTimer)
+            .register(ManualSource::new()).unwrap();
+
+        let cites = vec![("manual".to_string(), text.to_string())];
+        let report = block_on(mgr.retrieve(&cites)).expect("retrieve");
+        assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+        // Within the run (retrieve has flushed), get() still resolves it.
+        let item = block_on(mgr.get("manual", text)).expect("get within run");
+        assert_eq!(item["_formatted_text"], text);
+    } // the store (owned by the manager) drops here — simulating process exit.
+
+    // The committed file must not carry the citation text.
+    let main = std::fs::read_to_string(dir.join("citations.jsonl")).unwrap_or_default();
+    assert!(
+        !main.contains("Bohr"),
+        "manual citation text must never be committed: {main}"
+    );
+
+    // Restart: a fresh store over the same directory has no trace of it.
+    let reopened = block_on(SingleFileCacheStore::new(&dir)).expect("reopen");
+    assert!(
+        block_on(reopened.get(&format!("manual:{text}")))
+            .expect("get")
+            .is_none(),
+        "the ephemeral manual entry must be gone after a restart"
+    );
 }

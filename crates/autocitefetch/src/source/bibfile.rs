@@ -167,12 +167,18 @@ impl Source for BibliographyFileSource {
                                 ));
                                 Resolution::failed(k, e)
                             }
+                            // Authoritatively absent: the file(s) loaded fine
+                            // and simply have no such id. This is `Missing`, not
+                            // `Failed` — a reachable source's "no such key" must
+                            // be reported and must not keep a stale copy alive
+                            // for the grace window.
+                            //
                             // `Error::NotFound`'s Display already renders
                             // "citation `…` not found"; pass it the id, not a
                             // sentence, or the two nest into gibberish.
                             None => {
                                 let e = Error::NotFound(crate::csl::cite_id("bib", &k));
-                                Resolution::failed(k, e)
+                                Resolution::missing(k, e)
                             }
                         },
                     }

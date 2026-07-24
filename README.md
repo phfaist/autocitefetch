@@ -76,11 +76,13 @@ chained targets and fetches them; `get()` walks the chain on read.
 * `citations.<writer>.log` — per-writer append logs. Writes go here lock-free
   and are folded into the main file by `flush()` (called at the end of
   `retrieve`/`prune`), which is the only operation that takes the lock or
-  rewrites the whole file. `flush()` folds *every* sidecar it finds but deletes
-  only **its own** — deleting a peer's would race its lock-free appends and
-  destroy acknowledged writes. Consequence: a sidecar left by a **crashed**
-  writer is never reaped. Delete stray `citations.*.log` files by hand while no
-  writer is running.
+  rewrites the whole file. `flush()` folds *every* sidecar it finds but only
+  deletes **its own** and any left by a **crashed** peer — never a live peer's,
+  since that would race its lock-free appends and destroy acknowledged writes.
+* `citations.<writer>.log.lock` — a per-writer **liveness lock**, held open for
+  the store's whole life. `flush()` reaps a peer's sidecar only when it can take
+  that peer's lock (the OS frees it when the owner process crashes); a held lock
+  means the owner is alive, so the sidecar is folded read-only and left in place.
 * `citations.lock` — the compaction lockfile.
 * `citations.jsonl.tmp` — the staging file for the atomic replace.
 
@@ -88,6 +90,7 @@ So commit the first and ignore the rest:
 
 ```gitignore
 citations.*.log
+citations.*.log.lock
 citations.lock
 citations.jsonl.tmp
 ```
@@ -110,6 +113,11 @@ makes `open()` fail rather than silently dropping the entries it can't read.
 
 - **Stale-while-revalidate**: soft + hard expiry with a grace window — mildly
   outdated entries are still served when a source is unreachable.
+- **Probabilistic stale revalidation** — in the soft-stale window an entry is
+  refetched only with a probability that ramps from ~0 at the soft expiry to ~1
+  at the hard expiry (a deterministic FNV-1a draw over `(id, now)`, no RNG). The
+  soft tier thus does real work: the effective TTL is close to the full nominal
+  TTL instead of `stale_percent`% of it, and revalidation is spread out.
 - **TTL jitter** (deterministic, seeded by entry id) — avoids a thundering herd
   when many entries expire together.
 - **Per-citation error tolerance** — failures are reported, not fatal. The
@@ -151,11 +159,13 @@ use autocitefetch::source::{ArxivSource, DoiSource, ManualSource, BibliographyFi
 use autocitefetch_std::{BlockingTimer, SingleFileCacheStore, SystemClock, UreqFetcher};
 
 let store = SingleFileCacheStore::new(".citecache").await?;
+// `register` returns `Result` — it rejects a source whose prefix is empty or
+// contains ':' (which would make `prefix:key` ids ambiguous) — so chain with `?`.
 let mgr = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
-    .register(ArxivSource::new())
-    .register(DoiSource::new())
-    .register(ManualSource::new())
-    .register(BibliographyFileSource::new(["file:refs.json".into()]));
+    .register(ArxivSource::new())?
+    .register(DoiSource::new())?
+    .register(ManualSource::new())?
+    .register(BibliographyFileSource::new(["file:refs.json".into()]))?;
 
 let report = mgr.retrieve(&[("doi".into(), "10.1103/PhysRev.47.777".into())]).await?;
 let item = mgr.get("doi", "10.1103/PhysRev.47.777").await?; // CSL-JSON Value
@@ -177,8 +187,9 @@ four sources (`arxiv`, `doi`, `manual`, `bib`), concurrent within-pass source
 execution, and the `std` backends including a `ureq`-based HTTP `Fetcher` (with
 `file:` support). The arXiv source parses the Atom feed with `xmlparser` (a
 verified `no_std` crate), decodes XML entity references, does version resolution,
-and chains to DOI. 137 tests pass; the core builds for `wasm32-unknown-unknown`;
-clippy and rustdoc are warning-free.
+and chains to DOI. 179 tests pass; the core builds for `wasm32-unknown-unknown`;
+clippy and rustdoc are warning-free. CI (`.github/workflows/ci.yml`) enforces all
+of these on stable and on the MSRV (1.85).
 
 **Not yet implemented:**
 

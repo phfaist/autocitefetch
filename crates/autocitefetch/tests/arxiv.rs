@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap as StdMap;
 use std::future::Future;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use autocitefetch::source::{ArxivSource, DoiSource, Source};
@@ -30,20 +31,25 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 
 struct MockFetcher {
     routes: StdMap<String, (u16, Vec<u8>)>,
-    calls: RefCell<Vec<String>>,
+    calls: Rc<RefCell<Vec<String>>>,
 }
 
 impl MockFetcher {
     fn new() -> Self {
         MockFetcher {
             routes: StdMap::new(),
-            calls: RefCell::new(Vec::new()),
+            calls: Rc::new(RefCell::new(Vec::new())),
         }
     }
     fn route(mut self, url: &str, status: u16, body: &str) -> Self {
         self.routes
             .insert(url.into(), (status, body.as_bytes().to_vec()));
         self
+    }
+    /// A shared handle on the fetch log, taken before the fetcher is moved into
+    /// a manager (so a test can count how many requests actually went out).
+    fn calls(&self) -> Rc<RefCell<Vec<String>>> {
+        self.calls.clone()
     }
 }
 
@@ -125,14 +131,19 @@ const FEED_CHAINED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 // A versionless request, concrete resolution (chaining disabled). Title spans
 // lines (whitespace collapse), authors exercise the family/given split
-// including a single-token name.
+// including a single-token name. The entry carries BOTH a `<published>` (v1
+// submission) and a later `<updated>` (this revision): `issued` must come from
+// `<updated>`. A feed-level `<updated>` with a sentinel far-future date is
+// present too and must NOT be captured (it sits outside any `<entry>`).
 const FEED_CONCRETE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
   <title>ArXiv Query</title>
   <id>http://arxiv.org/api/query-feed-id</id>
+  <updated>2099-12-31T00:00:00Z</updated>
   <entry>
     <id>http://arxiv.org/abs/0905.2794v3</id>
     <published>2013-03-20T09:15:00Z</published>
+    <updated>2013-04-25T09:15:00Z</updated>
     <title>Quantum Error Correction
       for   Beginners</title>
     <author><name>Simon J. Devitt</name></author>
@@ -158,8 +169,8 @@ fn arxiv_versionless_with_doi_chains_and_merges() {
         );
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new())
-        .register(DoiSource::new());
+        .register(ArxivSource::new()).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1211.1037".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -171,7 +182,10 @@ fn arxiv_versionless_with_doi_chains_and_merges() {
     assert_eq!(item["id"], "arxiv:1211.1037");
     assert_eq!(item["title"], "Resolved via DOI");
     assert_eq!(item["arxivid"], "1211.1037", "chained set_properties merged in");
-    assert_eq!(item["DOI"], "10.1103/PhysRevLett.109.170502");
+    // doi.org's uppercase `DOI` is normalized on ingest to a lowercase `doi`
+    // key with a lowercased value; the CSL-spec uppercase key does not survive.
+    assert_eq!(item["doi"], "10.1103/physrevlett.109.170502");
+    assert_eq!(item.get("DOI"), None, "uppercase DOI key must not survive");
 }
 
 #[test]
@@ -181,8 +195,8 @@ fn arxiv_concrete_parses_title_authors_and_issued() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, FEED_CONCRETE);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new().chaining(false))
-        .register(DoiSource::new());
+        .register(ArxivSource::new().chaining(false)).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "0905.2794".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -205,15 +219,83 @@ fn arxiv_concrete_parses_title_authors_and_issued() {
     assert_eq!(authors[2]["family"], "Aristotle");
     assert!(authors[2].get("given").is_none(), "single token = family only");
 
-    // issued from `<published>` = 2013-03-20.
+    // issued comes from `<updated>` (last-revision date) = 2013-04-25, NOT from
+    // `<published>` (2013-03-20) and NOT from the feed-level `<updated>` (2099).
     let dp = &item["issued"]["date-parts"][0];
     assert_eq!(dp[0], 2013);
-    assert_eq!(dp[1], 3);
-    assert_eq!(dp[2], 20);
+    assert_eq!(dp[1], 4);
+    assert_eq!(dp[2], 25);
 
     // arXiv extension fields: id stripped of version, latest version captured.
     assert_eq!(item["arxivid"], "0905.2794");
     assert_eq!(item["arxiv_version_number"], 3);
+}
+
+#[test]
+fn issued_falls_back_to_published_when_no_updated() {
+    // An entry with no `<updated>` element: `issued` must fall back to
+    // `<published>` (feedparser's `.date` does the same fallback).
+    let arxiv_url = "https://export.arxiv.org/api/query?id_list=1601.00007&max_results=1";
+    let feed = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <entry>
+    <id>http://arxiv.org/abs/1601.00007v1</id>
+    <published>2016-07-08T00:00:00Z</published>
+    <title>Only Published, No Updated</title>
+    <author><name>Ada Lovelace</name></author>
+  </entry>
+</feed>"#;
+
+    let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
+
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(ArxivSource::new().chaining(false)).unwrap();
+
+    let cites = vec![("arxiv".to_string(), "1601.00007".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    let item = block_on(mgr.get("arxiv", "1601.00007")).unwrap();
+    let dp = &item["issued"]["date-parts"][0];
+    assert_eq!(dp[0], 2016);
+    assert_eq!(dp[1], 7);
+    assert_eq!(dp[2], 8);
+}
+
+#[test]
+fn versioned_request_uses_that_versions_updated_date() {
+    // An explicitly-versioned request selects that exact entry, whose
+    // `<updated>` is *that version's* date. The old behavior (using
+    // `<published>`) would have reported v1's submission date for every version.
+    let arxiv_url = "https://export.arxiv.org/api/query?id_list=1211.1037v2&max_results=1";
+    let feed = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <entry>
+    <id>http://arxiv.org/abs/1211.1037v2</id>
+    <published>2012-11-05T18:30:00Z</published>
+    <updated>2012-12-14T18:30:00Z</updated>
+    <title>Revised Version</title>
+    <author><name>Ada Lovelace</name></author>
+  </entry>
+</feed>"#;
+
+    let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
+
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(ArxivSource::new()).unwrap()
+        .register(DoiSource::new()).unwrap();
+
+    let cites = vec![("arxiv".to_string(), "1211.1037v2".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    let item = block_on(mgr.get("arxiv", "1211.1037v2")).unwrap();
+    assert_eq!(item["arxiv_version_number"], 2, "exact version, concrete");
+    // issued is v2's `<updated>` (2012-12-14), NOT v1's `<published>` (2012-11-05).
+    let dp = &item["issued"]["date-parts"][0];
+    assert_eq!(dp[0], 2012);
+    assert_eq!(dp[1], 12);
+    assert_eq!(dp[2], 14);
 }
 
 #[test]
@@ -234,7 +316,7 @@ fn arxiv_unknown_id_is_reported_not_fatal() {
     );
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "9999.99999".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -269,7 +351,7 @@ fn entity_references_are_decoded_in_titles_and_authors() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "1234.5678".to_string()),
@@ -311,7 +393,7 @@ fn malformed_entity_references_are_left_verbatim() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1234.5680".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -346,7 +428,7 @@ fn cdata_content_stays_raw() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1234.5681".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -395,8 +477,8 @@ fn blank_arxiv_doi_does_not_chain_to_the_empty_doi_key() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new())
-        .register(DoiSource::new());
+        .register(ArxivSource::new()).unwrap()
+        .register(DoiSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "2100.00001".to_string()),
@@ -449,7 +531,7 @@ fn old_style_ids_and_multi_key_chunks_build_the_expected_url() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "math/0309136".to_string()),
@@ -470,11 +552,12 @@ fn old_style_ids_and_multi_key_chunks_build_the_expected_url() {
 }
 
 #[test]
-fn requested_keys_are_trimmed_for_the_url_but_returned_verbatim() {
-    // `\cite{arXiv: 1211.1037}` yields a key with a leading space; untrimmed it
-    // encodes to `%201211.1037`, which arXiv answers with 400 — failing every
-    // key in the chunk. Only the trimmed URL is routed. The stored citation is
-    // still keyed by the caller's exact string (the manager matches on it).
+fn whitespace_padded_arxiv_keys_dedup_to_one_fetch_and_entry() {
+    // `\cite{arXiv: 1211.1037}` yields a key with incidental surrounding
+    // whitespace. arXiv keeps the default `trim_key_whitespace` policy, so the
+    // manager trims centrally: `" 1211.1037 "` and `"1211.1037"` requested in
+    // one call must collapse to ONE fetch (the trimmed URL) and ONE cache entry
+    // stored under the canonical, trimmed id — and any padded `get` finds it.
     let arxiv_url = "https://export.arxiv.org/api/query?id_list=1211.1037&max_results=1";
     let feed = r#"<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
@@ -487,18 +570,39 @@ fn requested_keys_are_trimmed_for_the_url_but_returned_verbatim() {
 </feed>"#;
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
+    let calls = fetcher.calls();
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
-    let cites = vec![("arxiv".to_string(), " 1211.1037 ".to_string())];
+    let cites = vec![
+        ("arxiv".to_string(), " 1211.1037 ".to_string()),
+        ("arxiv".to_string(), "1211.1037".to_string()),
+    ];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", " 1211.1037 ")).unwrap();
-    assert_eq!(item["id"], "arxiv: 1211.1037 ", "key echoed verbatim");
-    assert_eq!(item["title"], "A Padded Request");
-    assert_eq!(item["arxivid"], "1211.1037");
+    // Exactly one request went out (the trimmed URL); had the two keys not
+    // collapsed, the untrimmed one would build a different `id_list` that 404s.
+    assert_eq!(
+        calls.borrow().len(),
+        1,
+        "padded + clean keys must dedup to one fetch: {:?}",
+        calls.borrow()
+    );
+
+    // And exactly one cache entry, keyed by the trimmed id.
+    let entries = block_on(mgr.store().entries()).unwrap();
+    assert_eq!(entries.len(), 1, "one cache entry expected");
+    assert_eq!(entries[0].0, "arxiv:1211.1037", "stored under the trimmed id");
+
+    // Every whitespace variant reads that one entry; the echoed id is canonical.
+    for k in [" 1211.1037 ", "1211.1037", "1211.1037 ", " 1211.1037"] {
+        let item = block_on(mgr.get("arxiv", k)).unwrap();
+        assert_eq!(item["id"], "arxiv:1211.1037", "canonical trimmed id for {k:?}");
+        assert_eq!(item["title"], "A Padded Request");
+        assert_eq!(item["arxivid"], "1211.1037");
+    }
 }
 
 #[test]
@@ -517,7 +621,7 @@ fn version_suffix_matching_is_case_insensitive() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1211.1037V2".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
@@ -537,7 +641,7 @@ fn http_error_status_fails_every_key_in_the_chunk() {
     let fetcher = MockFetcher::new().route(arxiv_url, 400, "id_list is malformed");
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "1234.5678".to_string()),
@@ -561,7 +665,7 @@ fn malformed_xml_fails_every_key_in_the_chunk() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, "<feed><entry><<</entry></feed>");
 
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register(ArxivSource::new());
+        .register(ArxivSource::new()).unwrap();
 
     let cites = vec![
         ("arxiv".to_string(), "1234.5678".to_string()),

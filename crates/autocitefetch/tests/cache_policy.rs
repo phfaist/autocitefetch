@@ -179,6 +179,55 @@ impl Source for ProbeSource {
     }
 }
 
+/// A source with a configurable prefix that records every key it is asked for
+/// and returns one concrete item per key. Used to observe whether the manager
+/// actually drives a source (a not-refetched entry leaves the log empty) and to
+/// stand in as a chain target.
+struct RecordingSource {
+    prefix: &'static str,
+    calls: Rc<RefCell<Vec<String>>>,
+}
+
+impl RecordingSource {
+    fn new(prefix: &'static str) -> Self {
+        RecordingSource {
+            prefix,
+            calls: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+}
+
+impl Source for RecordingSource {
+    fn prefix(&self) -> &str {
+        self.prefix
+    }
+    fn min_interval(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn default_ttl(&self) -> Duration {
+        Duration::from_secs(3600)
+    }
+    fn retrieve_chunk<'a>(
+        &'a self,
+        keys: Vec<String>,
+        _ctx: &'a RetrieveCtx<'a>,
+    ) -> BoxFuture<'a, Vec<Resolution>> {
+        Box::pin(async move {
+            self.calls.borrow_mut().extend(keys.iter().cloned());
+            keys.into_iter()
+                .map(|k| {
+                    let mut m = serde_json::Map::new();
+                    m.insert(
+                        "title".into(),
+                        CslValue::String(format!("{}:{k}", self.prefix)),
+                    );
+                    Resolution::concrete(k, CslValue::Object(m))
+                })
+                .collect()
+        })
+    }
+}
+
 fn no_jitter(grace: Duration) -> TtlPolicy {
     TtlPolicy {
         stale_percent: 80,
@@ -194,15 +243,17 @@ fn cites(key: &str) -> Vec<(String, String)> {
 // --- freshness / refetch ---------------------------------------------------
 
 /// A fresh entry is served from the cache without touching the source; once it
-/// goes stale the source is asked again.
+/// is hard-expired the source is always asked again. (Stale-window refetch is
+/// probabilistic — covered by the `should_refetch` tests below — so it is not
+/// asserted here where a single id/instant would be a coin flip.)
 #[test]
-fn fresh_is_not_refetched_stale_is() {
+fn fresh_is_not_refetched_expired_is() {
     let clock = MovableClock::new(0);
     let src = ProbeSource::new(Duration::from_millis(1000));
     let calls = src.calls.clone();
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
         .with_policy(no_jitter(Duration::from_secs(60)))
-        .register(src);
+        .register(src).unwrap();
 
     block_on(mgr.retrieve(&cites("k"))).unwrap();
     assert_eq!(calls.borrow().len(), 1, "first retrieve must hit the source");
@@ -212,9 +263,219 @@ fn fresh_is_not_refetched_stale_is() {
     block_on(mgr.retrieve(&cites("k"))).unwrap();
     assert_eq!(calls.borrow().len(), 1, "a fresh entry must not be refetched");
 
-    clock.set(900);
+    clock.set(1000);
     block_on(mgr.retrieve(&cites("k"))).unwrap();
-    assert_eq!(calls.borrow().len(), 2, "a stale entry must be refetched");
+    assert_eq!(calls.borrow().len(), 2, "a hard-expired entry must be refetched");
+}
+
+// --- probabilistic stale-window refetch (`should_refetch`) -----------------
+
+/// The stale-window refetch probability ramps with the stale fraction `f`: near
+/// `stale_after` (f≈0) almost nothing is refetched; near `expires` (f≈1) almost
+/// everything is. Demonstrated by the refetch *rate* over many ids at a fixed
+/// `now`, which validates the ramp without pinning any single id's draw.
+#[test]
+fn stale_refetch_rate_ramps_with_the_stale_fraction() {
+    let policy = no_jitter(Duration::from_secs(60));
+    // stale_after = 800, expires = 1000 (a 200 ms-wide stale window).
+    let rec = policy.make_record(
+        Payload::Concrete(CslValue::Null),
+        Timestamp::from_millis(0),
+        Duration::from_millis(1000),
+        "seed",
+    );
+    let rate = |now_ms: i64| {
+        let now = Timestamp::from_millis(now_ms);
+        let n = 2000;
+        let hits = (0..n)
+            .filter(|i| policy.should_refetch(&rec, now, &format!("id{i}")))
+            .count();
+        hits as f64 / n as f64
+    };
+    let low = rate(820); // f = 0.10
+    let mid = rate(900); // f = 0.50
+    let high = rate(980); // f = 0.90
+    assert!(low < 0.25, "at f≈0.1 few ids should refetch, got {low}");
+    assert!(high > 0.75, "at f≈0.9 most ids should refetch, got {high}");
+    assert!(
+        low < mid && mid < high,
+        "refetch rate must rise with f: {low} < {mid} < {high}"
+    );
+}
+
+/// The deterministic window edges: `Fresh` never refetches; `Expired` always
+/// does, for every id.
+#[test]
+fn fresh_never_and_expired_always_refetch() {
+    let policy = no_jitter(Duration::from_secs(60));
+    let rec = policy.make_record(
+        Payload::Concrete(CslValue::Null),
+        Timestamp::from_millis(0),
+        Duration::from_millis(1000),
+        "seed",
+    );
+    // Fresh: now < stale_after (800).
+    assert!(!policy.should_refetch(&rec, Timestamp::from_millis(0), "any"));
+    assert!(!policy.should_refetch(&rec, Timestamp::from_millis(799), "any"));
+    // Expired: now >= expires (1000), regardless of the id's draw.
+    for i in 0..100 {
+        let id = format!("id{i}");
+        assert!(policy.should_refetch(&rec, Timestamp::from_millis(1000), &id), "{id}");
+        assert!(policy.should_refetch(&rec, Timestamp::from_millis(5000), &id), "{id}");
+    }
+}
+
+/// At `now == stale_after` the fraction is exactly 0, so *no* id refetches — a
+/// deterministic, hash-independent floor. This is what lets a manager test force
+/// "stale but not refetched" without knowing any hash.
+#[test]
+fn at_the_soft_edge_nothing_refetches() {
+    let policy = no_jitter(Duration::from_secs(60));
+    let rec = policy.make_record(
+        Payload::Concrete(CslValue::Null),
+        Timestamp::from_millis(0),
+        Duration::from_millis(1000),
+        "seed",
+    );
+    assert_eq!(policy.classify(&rec, Timestamp::from_millis(800)), Freshness::Stale);
+    for i in 0..100 {
+        assert!(
+            !policy.should_refetch(&rec, Timestamp::from_millis(800), &format!("id{i}")),
+            "f == 0 must never refetch"
+        );
+    }
+}
+
+/// An ephemeral zero-width window (`stale_after == expires`, i.e. a zero-TTL
+/// record) never reaches the probabilistic branch: it is `Fresh` before the
+/// instant and `Expired` at/after it, keeping the plain always/never behavior.
+#[test]
+fn ephemeral_zero_window_is_never_probabilistic() {
+    let policy = TtlPolicy::default();
+    let rec = policy.make_record(
+        Payload::Concrete(CslValue::Null),
+        Timestamp::from_millis(500),
+        Duration::ZERO,
+        "manual:x",
+    );
+    assert_eq!(rec.stale_after, rec.expires);
+    assert!(!policy.should_refetch(&rec, Timestamp::from_millis(499), "manual:x"));
+    // At/after the instant it is Expired → always refetch, for any id.
+    for i in 0..50 {
+        assert!(policy.should_refetch(&rec, Timestamp::from_millis(500), &format!("m{i}")));
+        assert!(policy.should_refetch(&rec, Timestamp::from_millis(9999), &format!("m{i}")));
+    }
+}
+
+/// The draw is a pure function of `(id, now)`: the same pair decides the same
+/// way every call, and distinct ids at one instant disagree (a real per-entry
+/// coin, not a global flag).
+#[test]
+fn should_refetch_is_deterministic_per_id_and_now() {
+    let policy = no_jitter(Duration::from_secs(60));
+    let rec = policy.make_record(
+        Payload::Concrete(CslValue::Null),
+        Timestamp::from_millis(0),
+        Duration::from_millis(1000),
+        "seed",
+    );
+    let now = Timestamp::from_millis(900); // f = 0.5, deep in the stale window.
+    let first = policy.should_refetch(&rec, now, "determinism:probe");
+    for _ in 0..8 {
+        assert_eq!(
+            policy.should_refetch(&rec, now, "determinism:probe"),
+            first,
+            "same (id, now) must decide the same way"
+        );
+    }
+    // Different ids at the same instant do not all agree.
+    let decisions: Vec<bool> = (0..64)
+        .map(|i| policy.should_refetch(&rec, now, &format!("id{i}")))
+        .collect();
+    assert!(
+        decisions.iter().any(|&d| d) && decisions.iter().any(|&d| !d),
+        "the per-id draw must actually vary across ids"
+    );
+}
+
+/// Manager-level: a batch of stale entries is only *partly* refetched — with the
+/// draw at f≈0.5 a fetch-counting source sees strictly fewer refetches than
+/// there are entries (and more than zero), so the soft tier does real work.
+#[test]
+fn a_stale_batch_is_only_partly_refetched() {
+    let clock = MovableClock::new(0);
+    let src = ProbeSource::new(Duration::from_millis(1000));
+    let calls = src.calls.clone();
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .with_policy(no_jitter(Duration::from_secs(600)))
+        .register(src).unwrap();
+
+    let n = 200;
+    let batch: Vec<(String, String)> = (0..n)
+        .map(|i| ("probe".to_string(), format!("k{i}")))
+        .collect();
+
+    // First pass at t=0: everything fetched fresh (stale_after=800, expires=1000).
+    block_on(mgr.retrieve(&batch)).unwrap();
+    assert_eq!(calls.borrow().len(), n, "first pass fetches all {n}");
+
+    // Second pass at t=900 (f=0.5): each stale entry is refetched independently
+    // with probability ~f, so some are and some are not.
+    clock.set(900);
+    block_on(mgr.retrieve(&batch)).unwrap();
+    let refetched = calls.borrow().len() - n;
+    assert!(
+        refetched > 0 && refetched < n,
+        "a stale batch must be only partly refetched, got {refetched}/{n}"
+    );
+}
+
+/// Manager-level: a stale chained pointer that is *not* refetched this pass must
+/// still have its target pulled in, or a later `get()` breaks on the missing
+/// link. Forced deterministically by aging the pointer to exactly `stale_after`
+/// (f = 0 ⇒ never refetched, whatever the id hashes to).
+#[test]
+fn a_not_refetched_stale_pointer_keeps_its_target() {
+    let clock = MovableClock::new(1000);
+    let a = RecordingSource::new("a");
+    let a_calls = a.calls.clone();
+    let b = RecordingSource::new("b");
+    let b_calls = b.calls.clone();
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .with_policy(no_jitter(Duration::from_secs(600)))
+        .register(a).unwrap()
+        .register(b).unwrap();
+
+    // Seed `a:x` as a stale pointer to a `b:t` that is not yet cached.
+    // stale_after == now (1000) < expires (2000) ⇒ Stale with f = 0.
+    block_on(mgr.store().put(
+        "a:x",
+        CacheRecord {
+            payload: Payload::Chained {
+                prefix: "b".into(),
+                key: "t".into(),
+                set_properties: CslValue::Object(serde_json::Map::new()),
+            },
+            stale_after: Timestamp::from_millis(1000),
+            expires: Timestamp::from_millis(2000),
+        },
+    ))
+    .unwrap();
+
+    let report = block_on(mgr.retrieve(&[("a".to_string(), "x".to_string())])).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+    assert!(
+        a_calls.borrow().is_empty(),
+        "the stale pointer must not be refetched at f = 0: {:?}",
+        a_calls.borrow()
+    );
+    assert_eq!(b_calls.borrow().len(), 1, "the kept pointer's target must be fetched");
+    assert_eq!(b_calls.borrow()[0], "t");
+    assert_eq!(
+        block_on(mgr.get("a", "x")).unwrap()["title"],
+        "b:t",
+        "get() must still resolve the chain"
+    );
 }
 
 /// `classify` boundaries are half-open: `now == stale_after` is already Stale,
@@ -398,7 +659,7 @@ fn expired_entry_within_grace_is_kept_and_not_reported() {
     let down = src.down.clone();
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
         .with_policy(no_jitter(Duration::from_secs(60)))
-        .register(src);
+        .register(src).unwrap();
 
     block_on(mgr.retrieve(&cites("k"))).unwrap();
     assert_eq!(block_on(mgr.get("probe", "k")).unwrap()["title"], "item k");
@@ -434,7 +695,7 @@ fn prune_drops_only_entries_past_the_grace_window() {
     let src = ProbeSource::new(Duration::from_millis(1000));
     let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
         .with_policy(no_jitter(Duration::from_secs(60)))
-        .register(src);
+        .register(src).unwrap();
 
     block_on(mgr.retrieve(&cites("old"))).unwrap();
     clock.set(30_000);
@@ -466,7 +727,7 @@ fn store_errors_abort_retrieve_but_still_flush() {
     let src = ProbeSource::new(Duration::from_millis(1000));
     let mgr = CitationManager::new(NoopFetcher, store, MovableClock::new(0), InstantTimer)
         .with_policy(no_jitter(Duration::from_secs(60)))
-        .register(src);
+        .register(src).unwrap();
 
     let err = block_on(mgr.retrieve(&cites("k"))).unwrap_err();
     assert!(

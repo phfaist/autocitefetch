@@ -23,7 +23,8 @@ pub enum Payload {
     /// Concrete CSL-JSON (already carrying its `id`).
     Concrete(CslValue),
     /// A chained pointer, e.g. `arxiv:… -> doi:…`. On read, the target is
-    /// resolved and `set_properties` is merged in (without clobbering).
+    /// resolved and `set_properties` is merged in, **overriding** any colliding
+    /// field of the target (the request's `id` is still forced last).
     Chained {
         prefix: String,
         key: String,

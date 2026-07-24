@@ -159,11 +159,11 @@ fn two_sources_resolve_concurrently_in_one_pass() {
         .register(TagSource {
             prefix: "alpha",
             events: events.clone(),
-        })
+        }).unwrap()
         .register(TagSource {
             prefix: "beta",
             events: events.clone(),
-        });
+        }).unwrap();
 
     // Both prefixes requested in a single retrieve call => same pass => the
     // two `drive_source` calls run concurrently.
