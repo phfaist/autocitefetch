@@ -34,7 +34,8 @@ pub enum Outcome {
         ttl: Option<Duration>,
     },
     /// A pointer to another `(prefix, key)`. `set_properties` is merged into
-    /// the resolved target at read time (e.g. re-attaching `arxivid`).
+    /// the resolved target at read time, **overriding** any colliding target
+    /// field (e.g. re-attaching `arxivid`).
     Chained {
         prefix: String,
         key: String,
@@ -63,7 +64,8 @@ impl Resolution {
     }
 
     /// Resolved to a pointer at `(target_prefix, target_key)`; `set_properties`
-    /// is merged into the target at read time (see [`Outcome::Chained`]).
+    /// is merged into the target at read time, overriding colliding target
+    /// fields (see [`Outcome::Chained`]).
     pub fn chained(
         key: impl Into<String>,
         target_prefix: impl Into<String>,

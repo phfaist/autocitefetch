@@ -500,6 +500,69 @@ fn a_grace_served_pointer_keeps_its_target() {
     assert_eq!(block_on(mgr.get("a", "x")).unwrap()["title"], "b:t");
 }
 
+/// A chain's `set_properties` **override** the concrete target's colliding
+/// fields (both reference impls do `{ ...target, ...set_properties }`). Here the
+/// chain carries `title:"FROM CHAIN"` and the target has `title:"FROM TARGET"`;
+/// the chain must win.
+#[test]
+fn chained_set_properties_override_the_target() {
+    let clock = MovableClock::default();
+    let store = MemStore::default();
+    store.seed(
+        "a:x",
+        Payload::Chained {
+            prefix: "b".into(),
+            key: "t".into(),
+            set_properties: serde_json::json!({"title": "FROM CHAIN", "extra": "kept"}),
+        },
+        10_000,
+        10_000,
+    );
+    store.seed(
+        "b:t",
+        Payload::Concrete(serde_json::json!({"id": "b:t", "title": "FROM TARGET", "year": 1935})),
+        10_000,
+        10_000,
+    );
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer);
+
+    let item = block_on(mgr.get("a", "x")).unwrap();
+    assert_eq!(item["title"], "FROM CHAIN", "the chain must override the target");
+    assert_eq!(item["extra"], "kept", "chain-only field is attached");
+    assert_eq!(item["year"], 1935, "target-only field is preserved");
+    assert_eq!(item["id"], "a:x", "id is rewritten to the requested one");
+}
+
+/// The requested `id` is forced last, so a `set_properties` carrying its own
+/// `id` can never override it — even though `set_properties` otherwise win.
+#[test]
+fn a_set_properties_id_cannot_override_the_requested_id() {
+    let clock = MovableClock::default();
+    let store = MemStore::default();
+    store.seed(
+        "a:y",
+        Payload::Chained {
+            prefix: "b".into(),
+            key: "u".into(),
+            set_properties: serde_json::json!({"id": "HACKED", "note": "n"}),
+        },
+        10_000,
+        10_000,
+    );
+    store.seed(
+        "b:u",
+        Payload::Concrete(serde_json::json!({"id": "b:u", "title": "T"})),
+        10_000,
+        10_000,
+    );
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer);
+
+    let item = block_on(mgr.get("a", "y")).unwrap();
+    assert_eq!(item["id"], "a:y", "the requested id must win over set_properties.id");
+    assert_eq!(item["note"], "n", "other set_properties still apply");
+    assert_eq!(item["title"], "T", "target field with no override is kept");
+}
+
 // --- chunking and rate limiting --------------------------------------------
 
 /// Requests are spaced by `min_interval` *start to start*, across chunks and

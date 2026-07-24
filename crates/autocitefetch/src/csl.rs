@@ -56,9 +56,13 @@ pub fn get_str<'a>(item: &'a CslValue, keys: &[&str]) -> Option<&'a str> {
     None
 }
 
-/// Shallow-merge `overrides` (a JSON object) into `target`, without clobbering
-/// keys that `target` already has. Used when resolving a chained citation to
-/// re-attach properties like `arxivid`.
+/// Shallow-merge `overrides` (a JSON object) into `target`, **without**
+/// clobbering keys that `target` already has — `target` wins on a collision.
+/// Used along a chain to *accumulate* `set_properties` so that a property set
+/// closer to the request wins over one set further away (see [`merge_over`] for
+/// the complementary "overrides win" direction used against the concrete
+/// target). A `null` in `overrides` is treated like any other value: inserted
+/// verbatim only when the key is absent.
 pub fn merge_defaults(target: &mut CslValue, overrides: &CslValue) {
     let (Some(dst), Some(src)) = (target.as_object_mut(), overrides.as_object()) else {
         return;
@@ -69,5 +73,22 @@ pub fn merge_defaults(target: &mut CslValue, overrides: &CslValue) {
         if !dst.contains_key(k) {
             dst.insert(k.clone(), v.clone());
         }
+    }
+}
+
+/// Shallow-merge `overrides` (a JSON object) into `target`, **overwriting**
+/// every colliding key — `overrides` win. This is the mirror of
+/// [`merge_defaults`]: use it when a chained citation's accumulated
+/// `set_properties` must take precedence over the concrete target's fields
+/// (matching both reference implementations, which do
+/// `{ ...target, ...set_properties }`). A `null` in `overrides` is treated like
+/// any other value — inserted/overwritten verbatim, exactly as
+/// [`merge_defaults`] copies it.
+pub fn merge_over(target: &mut CslValue, overrides: &CslValue) {
+    let (Some(dst), Some(src)) = (target.as_object_mut(), overrides.as_object()) else {
+        return;
+    };
+    for (k, v) in src {
+        dst.insert(k.clone(), v.clone());
     }
 }

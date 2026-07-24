@@ -80,9 +80,12 @@ back off exponentially (`RetryPolicy`: 5 retries, 500 ms base, 30 s cap).
 
 arXiv doesn't duplicate DOI metadata: it stores `Outcome::Chained { prefix, key, set_properties }`,
 a pointer. `get()` walks up to `max_chain_depth` (16) links, accumulating `set_properties` with
-`csl::merge_defaults` — **properties closer to the request win** — until it hits a
-`Payload::Concrete`. Note `Source::chains_to()` exists but the manager does not consume it; chain
-discovery is dynamic via the worklist.
+`csl::merge_defaults` — **properties closer to the request win** during accumulation — until it hits
+a `Payload::Concrete`. At the concrete node the accumulated `set_properties` are applied with
+`csl::merge_over`, so they **override** the concrete target's colliding fields (matching both
+reference implementations' `{ ...target, ...set_properties }`); the requested `id` is then forced
+last, so a `set_properties` carrying an `id` can never win. Note `Source::chains_to()` exists but the
+manager does not consume it; chain discovery is dynamic via the worklist.
 
 ### Cache policy (`cache.rs`)
 

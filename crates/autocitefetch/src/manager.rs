@@ -473,7 +473,9 @@ where
     }
 
     /// Read a resolved CSL-JSON item, following chain pointers and merging
-    /// their `set_properties`. The returned item's `id` is the originally
+    /// their `set_properties`. Accumulated `set_properties` **override** the
+    /// concrete target's fields (and among themselves the set closest to the
+    /// request wins). The returned item's `id` is always the originally
     /// requested `"prefix:key"`.
     pub async fn get(&self, prefix: &str, key: &str) -> Result<CslValue> {
         let requested_id = csl::cite_id(prefix, key);
@@ -499,7 +501,11 @@ where
 
             match rec.payload {
                 Payload::Concrete(mut csl) => {
-                    csl::merge_defaults(&mut csl, &accumulated);
+                    // Accumulated `set_properties` override the concrete target
+                    // (both reference impls do `{ ...target, ...set_properties }`).
+                    csl::merge_over(&mut csl, &accumulated);
+                    // Forced last, so the requested id always wins even if a
+                    // `set_properties` carried an `id` of its own.
                     csl::set_id(&mut csl, &requested_id);
                     return Ok(csl);
                 }
@@ -508,7 +514,10 @@ where
                     key: tk,
                     set_properties,
                 } => {
-                    // already-seen wins ⇒ merge the new set as defaults under it
+                    // Accumulation only: a set already seen (closer to the
+                    // request) wins over this further one, so merge the new set
+                    // in as defaults *under* it. The accumulated whole then
+                    // overrides the concrete target at the `Concrete` arm above.
                     csl::merge_defaults(&mut accumulated, &set_properties);
                     let next_id = csl::cite_id(&tp, &tk);
                     if next_id == current_id {
