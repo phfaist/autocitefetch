@@ -170,7 +170,10 @@ fn override_map_injects_doi_when_feed_has_none() {
     assert_eq!(item["id"], "arxiv:2001.00001");
     assert_eq!(item["title"], "Resolved Via Override");
     assert_eq!(item["arxivid"], "2001.00001", "chained set_properties merged in");
-    assert_eq!(item["DOI"], "10.9999/OVERRIDE.abc");
+    // doi.org's uppercase `DOI` is normalized on ingest to a lowercase `doi`
+    // key with a lowercased value; the CSL-spec uppercase key does not survive.
+    assert_eq!(item["doi"], "10.9999/override.abc");
+    assert_eq!(item.get("DOI"), None, "uppercase DOI key must not survive");
 }
 
 #[test]

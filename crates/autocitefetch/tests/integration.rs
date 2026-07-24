@@ -193,8 +193,36 @@ fn doi_source_parses_content_negotiated_csljson() {
 
     let item = block_on(mgr.get("doi", "10.1103/PhysRev.47.777")).unwrap();
     assert_eq!(item["id"], "doi:10.1103/PhysRev.47.777");
-    assert_eq!(item["DOI"], "10.1103/PhysRev.47.777");
+    // doi.org's canonical uppercase `DOI` is normalized on ingest to a lowercase
+    // `doi` key with a lowercased value; the uppercase key does not survive.
+    assert_eq!(item["doi"], "10.1103/physrev.47.777");
+    assert_eq!(item.get("DOI"), None, "uppercase DOI key must not survive");
     assert!(item["title"].as_str().unwrap().starts_with("Can Quantum"));
+}
+
+#[test]
+fn doi_source_normalizes_uppercase_doi_key_and_lowercases_value() {
+    // doi.org returns the CSL-spec uppercase `DOI` key, often with a mixed-case
+    // value. Ingest must fold it to a lowercase `doi` key with a lowercased
+    // value, leaving no uppercase key behind. Every other field is untouched.
+    let fetcher = MockFetcher::new().route(
+        "https://doi.org/10.1103/PhysRevLett.109.170502",
+        200,
+        r#"{"type":"article-journal","title":"Mixed Case DOI","DOI":"10.1103/PhysRevLett.109.170502","URL":"https://doi.org/10.1103/PhysRevLett.109.170502"}"#,
+    );
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(DoiSource::new());
+
+    let cites = vec![("doi".to_string(), "10.1103/PhysRevLett.109.170502".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    let item = block_on(mgr.get("doi", "10.1103/PhysRevLett.109.170502")).unwrap();
+    assert_eq!(item["doi"], "10.1103/physrevlett.109.170502", "value lowercased");
+    assert_eq!(item.get("DOI"), None, "uppercase DOI key must not survive");
+    // Only the DOI key is normalized; other verbatim fields keep their casing.
+    assert_eq!(item["title"], "Mixed Case DOI");
+    assert_eq!(item["URL"], "https://doi.org/10.1103/PhysRevLett.109.170502");
 }
 
 #[test]
@@ -218,7 +246,10 @@ fn arxiv_chains_to_doi_and_merges_set_properties() {
     assert_eq!(item["id"], "arxiv:1211.1037");
     assert_eq!(item["title"], "Chained Title");
     assert_eq!(item["arxivid"], "1211.1037", "set_properties should be merged in");
-    assert_eq!(item["DOI"], "10.9999/1211.1037");
+    // Chained through the doi source, so the uppercase `DOI` is normalized to a
+    // lowercase `doi` key on ingest (this value has no letters to lowercase).
+    assert_eq!(item["doi"], "10.9999/1211.1037");
+    assert_eq!(item.get("DOI"), None, "uppercase DOI key must not survive");
 }
 
 #[test]

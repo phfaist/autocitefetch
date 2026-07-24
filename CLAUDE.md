@@ -125,7 +125,7 @@ across passes, so the second pass of an arXiv→DOI chain cannot hit doi.org wit
 | prefix | chunk / interval / TTL | notes |
 |---|---|---|
 | `arxiv` | 100 / 3100 ms / 10 d | Atom feed parsed with `xmlparser`; version resolution; chains to `doi` |
-| `doi` | 1 / 1100 ms / 360 d | doi.org content negotiation returns CSL-JSON verbatim — no field mapping |
+| `doi` | 1 / 1100 ms / 360 d | doi.org content negotiation returns CSL-JSON stored verbatim — **one exception:** the CSL-spec uppercase `DOI` key is normalized on ingest to a lowercase `doi` key with a lowercased value (uniform lowercase `doi` everywhere; see `normalize_doi_key`) |
 | `manual` | ∞ / 0 / **0** | key *is* the formatted text, stored under `_formatted_text`; TTL 0 ⇒ ephemeral (kept in the store's in-memory view for the run, **never persisted** to `citations.jsonl` or a sidecar, gone on restart — enforced by `FileCacheStore`, keyed on `stale_after == expires`, not on the prefix) |
 | `bib` | ∞ / 0 / 60 s | file(s) fetched through the `Fetcher` (`file:` URLs), indexed by `id` |
 

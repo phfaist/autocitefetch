@@ -42,20 +42,6 @@ pub fn set_id(item: &mut CslValue, id: &str) -> bool {
     }
 }
 
-/// Read a string field, trying several key spellings in order.
-///
-/// doi.org emits canonical CSL casing (`DOI`, `URL`), while the arXiv mapping
-/// writes lowercase (`doi`, `url`); this smooths over that divergence.
-pub fn get_str<'a>(item: &'a CslValue, keys: &[&str]) -> Option<&'a str> {
-    let obj = item.as_object()?;
-    for k in keys {
-        if let Some(v) = obj.get(*k).and_then(CslValue::as_str) {
-            return Some(v);
-        }
-    }
-    None
-}
-
 /// Shallow-merge `overrides` (a JSON object) into `target`, **without**
 /// clobbering keys that `target` already has — `target` wins on a collision.
 /// Used along a chain to *accumulate* `set_properties` so that a property set

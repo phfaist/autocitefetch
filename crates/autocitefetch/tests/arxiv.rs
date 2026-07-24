@@ -171,7 +171,10 @@ fn arxiv_versionless_with_doi_chains_and_merges() {
     assert_eq!(item["id"], "arxiv:1211.1037");
     assert_eq!(item["title"], "Resolved via DOI");
     assert_eq!(item["arxivid"], "1211.1037", "chained set_properties merged in");
-    assert_eq!(item["DOI"], "10.1103/PhysRevLett.109.170502");
+    // doi.org's uppercase `DOI` is normalized on ingest to a lowercase `doi`
+    // key with a lowercased value; the CSL-spec uppercase key does not survive.
+    assert_eq!(item["doi"], "10.1103/physrevlett.109.170502");
+    assert_eq!(item.get("DOI"), None, "uppercase DOI key must not survive");
 }
 
 #[test]
