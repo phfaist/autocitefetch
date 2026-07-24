@@ -362,6 +362,10 @@ fn resolve_key(
                 key,
                 outcome: Outcome::Chained {
                     prefix: "doi".to_string(),
+                    // The chain target is an INTERNAL `doi:` cache id, not the
+                    // CSL `DOI` field: lowercase it so two arXiv entries whose
+                    // DOIs differ only in case dedup to one `doi:` fetch. The
+                    // CSL `DOI` field itself (built in `build_csl`) is verbatim.
                     key: doi.to_ascii_lowercase(),
                     set_properties: CslValue::Object(sp),
                 },
@@ -418,7 +422,10 @@ fn select_best<'e>(entries: &'e [atom::Entry], base: &str) -> Option<&'e atom::E
 }
 
 /// Map a parsed arXiv entry to a CSL-JSON object (built by hand). `doi` is the
-/// *effective* DOI (override-or-feed); when `Some`, it is written lowercased.
+/// *effective* DOI (override-or-feed); when `Some`, it is written **verbatim**
+/// under the canonical CSL-JSON `DOI` key (DOIs display in their registered
+/// case). Note this is distinct from the lowercased `doi:` chain cache-key used
+/// for case-insensitive dedup in [`resolve_key`].
 fn build_csl(e: &atom::Entry, doi: Option<&str>) -> CslValue {
     let mut obj = serde_json::Map::new();
     obj.insert("type".into(), CslValue::String("article-journal".to_string()));
@@ -444,7 +451,8 @@ fn build_csl(e: &atom::Entry, doi: Option<&str>) -> CslValue {
     }
 
     if let Some(doi) = doi {
-        obj.insert("doi".into(), CslValue::String(doi.to_ascii_lowercase()));
+        // Canonical CSL-JSON key is uppercase `DOI`; store the value verbatim.
+        obj.insert("DOI".into(), CslValue::String(doi.to_string()));
     }
 
     obj.insert("arxivid".into(), CslValue::String(e.arxivid.clone()));
