@@ -30,7 +30,7 @@
 //! # Ephemeral (TTL-0) records are memory-only
 //!
 //! A record with no fresh window (`stale_after == expires`, what a zero TTL
-//! produces — see [`is_ephemeral`]) is *ephemeral*: it lives only for the
+//! produces — see `is_ephemeral`) is *ephemeral*: it lives only for the
 //! current run. `put` keeps it in the in-memory map so a same-run `get` still
 //! serves it, but never appends it to a sidecar; `flush` never writes it to
 //! `citations.jsonl` (and carries the in-memory copies forward across its own
@@ -133,7 +133,7 @@
 //! than a skip: skipping it would delete it on the next compaction. In
 //! particular a `{"schema":N}` header for an unknown `N` makes `open`/`flush`
 //! **fail loudly** instead of overwriting a newer build's cache. See
-//! [`parse_main_into`].
+//! `parse_main_into`.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;

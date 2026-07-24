@@ -183,7 +183,7 @@ impl CacheFs for StdCacheFs {
 
 /// A held exclusive lock. Owns the locked `File`; dropping it releases the
 /// advisory lock. Public only because it is [`StdCacheFs`]'s
-/// [`CacheFs::Guard`](autocitefetch::CacheFs::Guard) associated type; it has no
+/// [`autocitefetch::CacheFs::Guard`] associated type; it has no
 /// API of its own beyond being held and dropped. Being `Send` (it owns just a
 /// `File`) is what keeps a `FileCacheStore<StdCacheFs>` movable across threads.
 pub struct StdGuard {

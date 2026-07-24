@@ -187,8 +187,9 @@ four sources (`arxiv`, `doi`, `manual`, `bib`), concurrent within-pass source
 execution, and the `std` backends including a `ureq`-based HTTP `Fetcher` (with
 `file:` support). The arXiv source parses the Atom feed with `xmlparser` (a
 verified `no_std` crate), decodes XML entity references, does version resolution,
-and chains to DOI. 137 tests pass; the core builds for `wasm32-unknown-unknown`;
-clippy and rustdoc are warning-free.
+and chains to DOI. 179 tests pass; the core builds for `wasm32-unknown-unknown`;
+clippy and rustdoc are warning-free. CI (`.github/workflows/ci.yml`) enforces all
+of these on stable and on the MSRV (1.85).
 
 **Not yet implemented:**
 

@@ -15,7 +15,7 @@ port of two prior libraries (see "Reference implementations" below).
 ## Commands
 
 ```sh
-cargo test                                   # all 137 tests (workspace)
+cargo test                                   # all 179 tests (workspace)
 cargo test -p autocitefetch --test arxiv_dois override_map_beats_feed_doi   # one integration test
 cargo test -p autocitefetch --lib filecache::tests::torn_tail_is_tolerated  # one unit test
 cargo doc -p autocitefetch-std --no-deps     # currently warning-free — keep it that way

@@ -8,7 +8,7 @@
 //! uppercase `DOI`, but this workspace uses a uniform lowercase `doi` everywhere
 //! (the arXiv source emits lowercase `doi`, and `get`/chaining read one canonical
 //! spelling). So on ingest we fold an uppercase `DOI` down to lowercase `doi` and
-//! lowercase its value (DOIs are case-insensitive) — see [`normalize_doi_key`].
+//! lowercase its value (DOIs are case-insensitive) — see `normalize_doi_key`.
 //! Every other field is stored verbatim.
 
 use alloc::boxed::Box;
