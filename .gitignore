@@ -2,3 +2,7 @@
 **/*.rs~
 **/*~
 .claude/worktrees/
+# `cargo run -p autocitefetch-cli` drops its cache in the working directory.
+# In a consuming project you would keep `.citations.jsonl` (`!.citations.jsonl`);
+# here it is only ever a scratch artifact of running the tool from the repo root.
+/.citations*

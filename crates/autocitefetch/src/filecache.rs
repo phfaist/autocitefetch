@@ -112,6 +112,15 @@
 //! companion (that would self-deadlock); it deletes its own `.log`
 //! unconditionally, exactly as before, and keeps holding the companion lock.
 //!
+//! That leaves one file to collect: a companion whose `.log` is *already* gone,
+//! which is what every writer leaves behind when it exits (its last flush
+//! unlinked its log while it still held the lock). The rule above cannot reach
+//! it — that loop walks sidecar logs, and this one has none — so `flush` sweeps
+//! them separately, using the same lock as the oracle: held ⇒ a live writer
+//! between flushes, leave it; acquired ⇒ its owner is gone, unlink it. Without
+//! the sweep a short-lived process (a CLI run) leaves one stray file per
+//! invocation, since writer ids are never reused.
+//!
 //! A foreign `{base}.*.log` that no managed writer ever created has **no**
 //! companion lock file, so `flush` finds none to probe and leaves it untouched
 //! — a stray or hand-placed log is folded (read-only) but never reaped, the
@@ -136,7 +145,7 @@
 //! `parse_main_into`.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -535,6 +544,30 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
                 }
             }
 
+            // Reap *orphaned* companion locks — a `{base}.{writer}.log.lock`
+            // whose `.log` is already gone. The loop above cannot: it iterates
+            // sidecar logs, and there is no log left to find one from. Without
+            // this, every process that ever opened the cache leaves one behind
+            // forever (each run has a fresh writer id, and its own last flush
+            // unlinks its log while it still holds the companion) — one stray
+            // file per run in what may well be the user's working directory.
+            //
+            // The lock is again the liveness oracle: held ⇒ a live writer that
+            // has flushed and not yet appended again, leave it alone; acquired ⇒
+            // the OS released it on the owner's exit, so nothing owns the file.
+            // Our own companion is skipped by name rather than probed — we hold
+            // it, and asking for it again would at best tell us nothing.
+            let own_lock_name = alloc::format!("{}.lock", self.sidecar_name);
+            for name in &merged.orphan_locks {
+                if name == &own_lock_name {
+                    continue;
+                }
+                let path = alloc::format!("{}/{name}", self.dir);
+                if let Ok(Some(_reaped)) = self.fs.try_lock_exclusive(&path).await {
+                    let _ = self.fs.remove(&path).await;
+                }
+            }
+
             // Carry forward this run's *ephemeral* (TTL-0) records. They were
             // never written to any sidecar (see `put`) nor to the main file
             // (see `serialize_main`), so the disk-only `merged.map` above does
@@ -707,6 +740,14 @@ struct Merged {
     /// Names (not paths) of the sidecars actually read and folded, sorted.
     /// `flush` consults this before unlinking its own log.
     folded: Vec<String>,
+    /// Names of companion liveness locks (`{base}.{writer}.log.lock`) whose
+    /// `.log` is *not* in this listing. A writer keeps its companion for its
+    /// whole life but reaps its own `.log` at every flush, so this is either a
+    /// live writer between flushes (its lock is still held) or a writer that has
+    /// exited (nothing else will ever reap it — the peer-reaping loop is driven
+    /// by `.log` names, and that log is gone). `flush` tells the two apart with
+    /// the lock itself and deletes the second kind.
+    orphan_locks: Vec<String>,
     /// How many entry lines the main file contributed.
     main_entries: usize,
     /// Whether any sidecar carried a tombstone. Only used by the "never compact
@@ -748,8 +789,26 @@ async fn load_merged<Fs: CacheFs>(fs: &Fs, dir: &str, base: &str) -> Result<Merg
 
     let mut names = fs.list(dir).await?;
     names.sort(); // deterministic cross-writer fold order (see module docs)
-    for name in names {
-        if !is_sidecar(&name, base) {
+
+    // Which sidecars exist at all, so a companion lock can be told apart from an
+    // *orphaned* one. Collected up front because the listing is walked once and
+    // a companion may sort before or after the log it belongs to.
+    let sidecars: BTreeSet<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|n| is_sidecar(n, base))
+        .collect();
+    let orphan_locks: Vec<String> = names
+        .iter()
+        .filter(|n| {
+            n.strip_suffix(".lock")
+                .is_some_and(|log| is_sidecar(log, base) && !sidecars.contains(log))
+        })
+        .cloned()
+        .collect();
+
+    for name in &names {
+        if !is_sidecar(name, base) {
             continue;
         }
         let path = alloc::format!("{dir}/{name}");
@@ -758,12 +817,13 @@ async fn load_merged<Fs: CacheFs>(fs: &Fs, dir: &str, base: &str) -> Result<Merg
             Ok(None) => {}
             Err(_) => continue,
         }
-        folded.push(name);
+        folded.push(name.clone());
     }
 
     Ok(Merged {
         map,
         folded,
+        orphan_locks,
         main_entries,
         saw_tombstone,
     })
@@ -1388,6 +1448,61 @@ mod tests {
         assert!(
             files.contains_key("cache/citations.alive.log.lock"),
             "a live peer's companion lock must never be reaped"
+        );
+    }
+
+    /// A companion lock whose `.log` is already gone — what *every* writer
+    /// leaves behind when it exits, since its last flush unlinks its own log
+    /// while still holding the companion. Nothing else can reap it (the peer
+    /// loop is driven by `.log` names), so without this sweep a short-lived
+    /// process leaves one stray file per run. A live writer's companion is in
+    /// exactly the same state between flushes, so the lock still decides.
+    #[test]
+    fn orphaned_companion_locks_are_reaped_only_when_unheld() {
+        let fs = MemFs::default();
+        // An exited writer: companion only, unheld.
+        write_raw(&fs, "cache/citations.gone.log.lock", "");
+        // A live writer that has flushed and not appended since: companion
+        // only, but still held.
+        write_raw(&fs, "cache/citations.busy.log.lock", "");
+        fs.locks
+            .borrow_mut()
+            .insert("cache/citations.busy.log.lock".to_string());
+
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        block_on(store.put("doi:1", rec(1000))).unwrap();
+        block_on(store.flush()).unwrap();
+
+        let files = store.fs.files.borrow();
+        assert!(
+            !files.contains_key("cache/citations.gone.log.lock"),
+            "an unheld orphaned companion must be reaped"
+        );
+        assert!(
+            files.contains_key("cache/citations.busy.log.lock"),
+            "a held companion means its owner is alive — never reap it"
+        );
+        assert!(
+            files.contains_key("cache/citations.w1.log.lock"),
+            "our own companion is skipped by name: we hold it for our whole life"
+        );
+    }
+
+    /// The compaction lockfile is `{base}.lock`, one `.lock` suffix away from a
+    /// companion's `{base}.{writer}.log.lock`. The orphan sweep must not mistake
+    /// it for one and unlink the lock every writer synchronizes on.
+    #[test]
+    fn the_compaction_lockfile_is_not_mistaken_for_an_orphaned_companion() {
+        let fs = MemFs::default();
+        write_raw(&fs, "cache/citations.lock", "");
+
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        block_on(store.put("doi:1", rec(1000))).unwrap();
+        block_on(store.flush()).unwrap();
+
+        assert!(
+            store.fs.files.borrow().contains_key("cache/citations.lock"),
+            "the compaction lockfile must survive a flush"
         );
     }
 

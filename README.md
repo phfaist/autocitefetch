@@ -45,6 +45,12 @@ crates/
       fetcher.rs          UreqFetcher (blocking HTTP + file:) — `http` feature
     tests/                bibfile.rs, filecache_std.rs
     examples/resolve.rs   end-to-end demo (doi + manual + bib)
+  autocitefetch-cli/      the `autocitefetch` command-line tool
+    src/
+      main.rs             wiring: flags → sources → retrieve/get → CSL-JSON array
+      cli.rs              the clap argument surface
+      input.rs            citation lists (`prefix:key` per line) → (prefix, key) pairs
+      formats.rs          JSON/YAML for --bib files and --arxiv-doi-overrides
 ```
 
 ## Model
@@ -83,6 +89,9 @@ chained targets and fetches them; `get()` walks the chain on read.
   the store's whole life. `flush()` reaps a peer's sidecar only when it can take
   that peer's lock (the OS frees it when the owner process crashes); a held lock
   means the owner is alive, so the sidecar is folded read-only and left in place.
+  The same probe sweeps up companions whose `.log` is already gone — which is
+  what every writer leaves behind when it exits — so a repeatedly-invoked CLI
+  does not litter one file per run.
 * `citations.lock` — the compaction lockfile.
 * `citations.jsonl.tmp` — the staging file for the atomic replace.
 
@@ -179,24 +188,68 @@ async runtime or in a browser, implement the trait yourself with
 a blocking driver (`pollster::block_on`, or the `Waker::noop()` poll loop the
 example and tests use).
 
+## Command-line tool
+
+`autocitefetch-cli` builds an `autocitefetch` binary that reads a citation list
+— one `prefix:key` per line — and writes the resolved CSL-JSON as a JSON array:
+
+```sh
+$ printf 'arxiv:1211.1037\ndoi:10.1103/PhysRev.47.777\n' | autocitefetch
+$ autocitefetch cites.txt --bib refs.yaml -o bibliography.json
+$ autocitefetch --cite bib:knuth1984 --bib refs.yaml --enable bib
+```
+
+The list may also come from `FILE` arguments or repeated `--cite` options;
+blank lines and `#` comments are skipped, and a line is split at its *first*
+colon so a `manual:` key can contain colons of its own.
+
+| Flag | |
+|---|---|
+| `--enable`/`--disable <SOURCE>` | narrow the registered sources (`arxiv`, `doi`, `bib`, `manual`); default is all four |
+| `--bib <FILE>`, `--bib-format` | bibliography files or URLs for the `bib` source — **JSON or YAML**, auto-detected |
+| `--arxiv-doi-overrides <FILE>` | JSON/YAML map of arXiv id → DOI; a `null` value suppresses the DOI |
+| `--no-arxiv-chaining` | keep arXiv metadata instead of chaining to doi.org |
+| `--cache-dir`, `--cache-name` | where the cache lives (default: `.citations` in the working directory) |
+| `--output`, `--compact`, `--user-agent`, `--verbose` | |
+
+Exit status is `0` when every citation resolved, `1` when some did not (the
+rest are still written, and each failure is reported on stderr), `2` on a fatal
+error. YAML support lives entirely in this crate — the `no_std` core stays free
+of format crates, so the CLI parses `--bib` files through
+[`BibliographyFileSource::with_parser`] and hands arXiv overrides over as data.
+
+The cache is the `SingleFileCacheStore` described above, renamed to a dotted
+base so the whole family hides in the user's working directory. Commit
+`.citations.jsonl` if you want the bibliography reproducible offline, and
+ignore the rest:
+
+```gitignore
+.citations*
+!.citations.jsonl
+```
+
+[`BibliographyFileSource::with_parser`]: crates/autocitefetch/src/source/bibfile.rs
+
 ## Status
 
 Implemented and tested end-to-end: the manager, routing, chaining, cache/TTL
 policy, the driver, transparent retry/backoff, the single-file JSONL cache, all
 four sources (`arxiv`, `doi`, `manual`, `bib`), concurrent within-pass source
-execution, and the `std` backends including a `ureq`-based HTTP `Fetcher` (with
-`file:` support). The arXiv source parses the Atom feed with `xmlparser` (a
-verified `no_std` crate), decodes XML entity references, does version resolution,
-and chains to DOI. 180 tests pass; the core builds for `wasm32-unknown-unknown`;
-clippy and rustdoc are warning-free. CI (`.github/workflows/ci.yml`) enforces all
-of these on stable and on the MSRV (1.86).
+execution, the `std` backends including a `ureq`-based HTTP `Fetcher` (with
+`file:` support), and the `autocitefetch` command-line tool. The arXiv source
+parses the Atom feed with `xmlparser` (a verified `no_std` crate), decodes XML
+entity references, does version resolution, and chains to DOI. 194 tests pass;
+the core builds for `wasm32-unknown-unknown`; clippy and rustdoc are
+warning-free. CI (`.github/workflows/ci.yml`) enforces all of these on stable
+and on the MSRV (1.86).
 
 **Not yet implemented:**
 
 - A dedicated **WASM backend crate** (browser `fetch()` + IndexedDB + `setTimeout`
   impls of the four traits). The core already compiles for wasm32.
-- **YAML** files out of the box (JSON is the built-in; YAML/TOML/etc. work today
-  by passing a host parser via `with_parser`, or pre-parsed data).
+- **YAML in the library** — the CLI reads YAML bibliographies and override maps,
+  but it does so as a host, via `with_parser`. JSON stays the core's only
+  built-in format (YAML/TOML/… work the same way for any other host).
 - An async-runtime `Fetcher`/`Timer` (the bundled std ones are blocking, fine for
   CLI/batch; on tokio, impl the traits with `reqwest` / `tokio::time::sleep`).
 
@@ -208,6 +261,7 @@ cargo test                                         # all tests
 cargo build -p autocitefetch --target wasm32-unknown-unknown   # WASM core (no_std)
 cargo build -p autocitefetch-std --no-default-features         # std backends, no HTTP dep
 cargo run   -p autocitefetch-std --example resolve             # live demo (needs network)
+cargo install --path crates/autocitefetch-cli                  # the `autocitefetch` binary
 ```
 
 ## License

@@ -32,7 +32,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build workspace
         run: cargo build --workspace --locked
-      - name: Test workspace (all 179 tests)
+      - name: Test workspace (all 194 tests)
         run: cargo test --workspace --locked
       - name: Core builds for wasm32 (no_std)
         run: cargo build --locked -p autocitefetch --target wasm32-unknown-unknown

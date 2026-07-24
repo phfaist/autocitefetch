@@ -254,23 +254,36 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The base file name used by [`SingleFileCacheStore`] (`citations.jsonl` etc.).
-const BASE: &str = "citations";
+/// The base file name used by [`SingleFileCacheStore::new`] (`citations.jsonl`
+/// etc.).
+pub const DEFAULT_BASE: &str = "citations";
 
 /// A ready-to-use single-file cache store over the local filesystem.
 ///
 /// Thin wrapper over [`FileCacheStore`]`<`[`StdCacheFs`]`>`: keeps one
 /// `citations.jsonl` file (plus per-writer `*.log` sidecars and a `.lock`) in
-/// a directory of your choosing. Construct with [`SingleFileCacheStore::new`].
+/// a directory of your choosing. Construct with [`SingleFileCacheStore::new`],
+/// or with [`SingleFileCacheStore::with_base`] to rename the whole family.
 pub struct SingleFileCacheStore(FileCacheStore<StdCacheFs>);
 
 impl SingleFileCacheStore {
-    /// Open (creating the directory if needed) a single-file cache in `dir`.
+    /// Open (creating the directory if needed) a single-file cache in `dir`,
+    /// named after [`DEFAULT_BASE`].
+    pub async fn new(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::with_base(dir, DEFAULT_BASE).await
+    }
+
+    /// Like [`new`](Self::new), but with a caller-chosen `base` for every file
+    /// in the family: `{base}.jsonl`, `{base}.lock`, `{base}.<writer>.log` and
+    /// its companion `.log.lock`. Use it to keep the cache out of the way in a
+    /// directory that is not its own — a CLI dropping the cache in the user's
+    /// working directory wants `".citations"`, so the committable file is
+    /// `.citations.jsonl` and every sidecar hides under `.citations*` too.
     ///
     /// The writer id is `"<pid>-<nanos-since-epoch>"`, unique per process run
     /// without needing an RNG dependency, so concurrent processes never share
     /// a sidecar log.
-    pub async fn new(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
+    pub async fn with_base(dir: impl AsRef<Path>, base: &str) -> Result<Self, StoreError> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir).map_err(|e| StoreError(e.to_string()))?;
 
@@ -289,7 +302,7 @@ impl SingleFileCacheStore {
             .to_str()
             .ok_or_else(|| StoreError("cache dir path is not valid UTF-8".into()))?
             .to_owned();
-        let inner = FileCacheStore::open(StdCacheFs, dir, BASE, writer_id).await?;
+        let inner = FileCacheStore::open(StdCacheFs, dir, base, writer_id).await?;
         Ok(SingleFileCacheStore(inner))
     }
 

@@ -11,18 +11,22 @@ port of two prior libraries (see "Reference implementations" below).
 
 - `crates/autocitefetch` — the core library. `no_std`, `#![forbid(unsafe_code)]`, no I/O of its own.
 - `crates/autocitefetch-std` — `std` backends (clock, timer, filesystem cache, blocking HTTP fetcher).
+- `crates/autocitefetch-cli` — the `autocitefetch` binary: a `prefix:key` list in, a CSL-JSON
+  array out. The only crate allowed to depend on `clap`/`serde_yaml_ng`; it is the *host* in the
+  host-parses-config principle, so YAML support lives there and never in the core.
 
 ## Commands
 
 ```sh
-cargo test                                   # all 183 tests (workspace)
+cargo test                                   # all 194 tests (workspace)
 cargo test -p autocitefetch --test arxiv_dois override_map_beats_feed_doi   # one integration test
 cargo test -p autocitefetch --lib filecache::tests::torn_tail_is_tolerated  # one unit test
-cargo doc -p autocitefetch-std --no-deps     # currently warning-free — keep it that way
+cargo doc --workspace --no-deps              # currently warning-free — keep it that way
 cargo clippy --workspace --all-targets       # currently clean — keep it that way
 cargo build -p autocitefetch --target wasm32-unknown-unknown  # MUST still pass after core changes
 cargo build -p autocitefetch-std --no-default-features        # std backends without ureq/TLS
 cargo run -p autocitefetch-std --example resolve              # live demo (hits doi.org)
+cargo run -p autocitefetch-cli -- --help                      # the CLI (writes .citations* to cwd!)
 ```
 
 The tree is **not** rustfmt-clean, so `cargo fmt --all` would produce large unrelated diffs. Format
@@ -237,6 +241,37 @@ carries the in-memory copies forward across its own disk reload), and dropped ra
 when read back off an older on-disk file. This keeps `manual`-source citation text out of the
 committed file while preserving the two-phase `retrieve`→`get` flow within a run. Keyed on the
 timestamps, not the prefix.
+
+Two liveness-lock details that are easy to undo. `flush` sweeps **orphaned companions** — a
+`{base}.{writer}.log.lock` whose `.log` is gone — using the same held/acquirable probe, because the
+peer-reaping loop iterates `.log` names and so can never reach one. Every writer creates exactly
+that state when it exits (its last flush unlinks its own log while it still holds the companion), so
+without the sweep each CLI run leaves a file behind forever. A writer still skips **its own**
+companion by name rather than probing it. Also note `SingleFileCacheStore::with_base` exists so the
+CLI can use the base `.citations`: the CLI's cache lands in the user's working directory, so every
+file it creates must hide under one `.citations*` ignore rule.
+
+### The CLI (`autocitefetch-cli`)
+
+`main.rs` is wiring only — flags → registered sources → `retrieve` → `get` per cite → a JSON array —
+plus the same `Waker::noop()` `block_on` the tests and the `resolve` example use (**no async runtime
+anywhere**, still). Things worth keeping straight:
+
+- **`serde_json` is the workspace (alloc-only) dependency**, deliberately. Resolver v2 unifies
+  features across a workspace build, so `serde_json/std` here would compile the `no_std` core
+  against the configuration it promises never to use.
+- **`clap`/`serde_yaml_ng` live only in this crate.** `formats.rs` is the whole YAML story:
+  `--bib` files go through `BibliographyFileSource::with_parser` (so they still travel the one
+  `Fetcher` choke point, URLs included) and `--arxiv-doi-overrides` is parsed host-side and passed
+  to `with_override_dois` as *data* — never `with_override_dois_file`, which is JSON-only.
+- `--bib-format auto` tries **JSON first, then YAML**: YAML is not exactly a JSON superset (a large
+  integer literal is valid JSON and out of range for the YAML reader), and serde_json's errors on a
+  broken JSON file are far better. Both errors are reported on failure.
+- `input.rs` splits a line at its **first** colon and trims only the prefix — a `manual:` key is the
+  citation text, so its interior is payload. Keys are *not* normalized here; the manager does that
+  per-source.
+- Exit status is part of the contract: `0` all resolved, `1` some unresolved (the rest are still
+  written), `2` fatal. A citation that will not fetch is never `2`.
 
 ## Invariants when editing
 

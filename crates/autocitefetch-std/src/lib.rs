@@ -31,7 +31,7 @@ pub mod store;
 pub mod timer;
 
 pub use clock::SystemClock;
-pub use store::{SingleFileCacheStore, StdCacheFs};
+pub use store::{DEFAULT_BASE, SingleFileCacheStore, StdCacheFs};
 pub use timer::BlockingTimer;
 
 #[cfg(feature = "http")]
