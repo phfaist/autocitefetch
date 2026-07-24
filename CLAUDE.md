@@ -15,7 +15,7 @@ port of two prior libraries (see "Reference implementations" below).
 ## Commands
 
 ```sh
-cargo test                                   # all 179 tests (workspace)
+cargo test                                   # all 180 tests (workspace)
 cargo test -p autocitefetch --test arxiv_dois override_map_beats_feed_doi   # one integration test
 cargo test -p autocitefetch --lib filecache::tests::torn_tail_is_tolerated  # one unit test
 cargo doc -p autocitefetch-std --no-deps     # currently warning-free — keep it that way
@@ -115,6 +115,14 @@ reference implementations' `{ ...target, ...set_properties }`); the requested `i
 last, so a `set_properties` carrying an `id` can never win. Note `Source::chains_to()` exists but the
 manager does not consume it; chain discovery is dynamic via the worklist.
 
+**The chain key is lowercased; the CSL `DOI` field is not.** `arxiv.rs` emits
+`Outcome::Chained { key: doi.to_ascii_lowercase(), .. }` so two entries whose DOIs differ only in
+case dedup to one `doi:` cache id — that is an *internal identifier*. The CSL field is a separate
+thing: it is the CSL-standard uppercase **`DOI`** key holding the DOI **verbatim** (DOIs display in
+their registered mixed case), written that way by `arxiv.rs`'s `build_csl` and by `doi.rs`'s
+`canonicalize_doi_key`. Don't "unify" the two — lowercasing the field breaks CSL compliance, and
+case-preserving the cache key breaks dedup.
+
 ### Cache policy (`cache.rs`)
 
 Two-tier expiry per record: `stale_after` (soft, `stale_percent` = 80% of TTL) and `expires` (hard).
@@ -151,7 +159,7 @@ across passes, so the second pass of an arXiv→DOI chain cannot hit doi.org wit
 | prefix | chunk / interval / TTL | notes |
 |---|---|---|
 | `arxiv` | 100 / 3100 ms / 10 d | Atom feed parsed with `xmlparser`; version resolution; chains to `doi` |
-| `doi` | 1 / 1100 ms / 360 d | doi.org content negotiation returns CSL-JSON stored verbatim — **one exception:** the CSL-spec uppercase `DOI` key is normalized on ingest to a lowercase `doi` key with a lowercased value (uniform lowercase `doi` everywhere; see `normalize_doi_key`) |
+| `doi` | 1 / 1100 ms / 360 d | doi.org content negotiation returns CSL-JSON stored verbatim, values included — the only touch is `canonicalize_doi_key`, which renames a nonstandard lowercase `doi` key up to the CSL-standard uppercase `DOI` (doi.org already sends `DOI`, so it is normally a no-op) |
 | `manual` | ∞ / 0 / **0** | key *is* the formatted text, stored under `_formatted_text`; TTL 0 ⇒ ephemeral (kept in the store's in-memory view for the run, **never persisted** to `citations.jsonl` or a sidecar, gone on restart — enforced by `FileCacheStore`, keyed on `stale_after == expires`, not on the prefix) |
 | `bib` | ∞ / 0 / 60 s | file(s) fetched through the `Fetcher` (`file:` URLs), indexed by `id` |
 

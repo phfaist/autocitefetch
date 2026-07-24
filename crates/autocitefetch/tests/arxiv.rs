@@ -114,7 +114,8 @@ impl Timer for InstantTimer {
 // --- canned Atom feeds -----------------------------------------------------
 
 // A versionless request whose entry carries an `<arxiv:doi>` (mixed case, to
-// exercise lowercasing). The id is `…v1`; the request is versionless.
+// exercise the lowercased chain *cache key* vs. the verbatim CSL `DOI` field).
+// The id is `…v1`; the request is versionless.
 const FEED_CHAINED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
   <title>ArXiv Query</title>
@@ -182,10 +183,35 @@ fn arxiv_versionless_with_doi_chains_and_merges() {
     assert_eq!(item["id"], "arxiv:1211.1037");
     assert_eq!(item["title"], "Resolved via DOI");
     assert_eq!(item["arxivid"], "1211.1037", "chained set_properties merged in");
-    // doi.org's uppercase `DOI` is normalized on ingest to a lowercase `doi`
-    // key with a lowercased value; the CSL-spec uppercase key does not survive.
-    assert_eq!(item["doi"], "10.1103/physrevlett.109.170502");
-    assert_eq!(item.get("DOI"), None, "uppercase DOI key must not survive");
+    // The chained doi.org body wins: its CSL-standard uppercase `DOI` key is
+    // kept, with the registered mixed-case value verbatim. Note this differs in
+    // case from the lowercased `doi:` *cache key* used to fetch it above — the
+    // cache id is internal, the CSL field is what the spec governs.
+    assert_eq!(item["DOI"], "10.1103/PhysRevLett.109.170502");
+    assert_eq!(item.get("doi"), None, "lowercase doi key must not survive");
+}
+
+#[test]
+fn arxiv_built_csl_uses_uppercase_doi_key_with_verbatim_value() {
+    // The arXiv source's own `build_csl` (no doi.org in the picture: chaining is
+    // off, and no doi.org route is registered so any chain would fail). The
+    // feed's mixed-case `<arxiv:doi>` must land under the CSL-standard uppercase
+    // `DOI` key with its registered case intact — not lowercased, and not under
+    // a lowercase `doi` key.
+    let arxiv_url = "https://export.arxiv.org/api/query?id_list=1211.1037&max_results=1";
+    let fetcher = MockFetcher::new().route(arxiv_url, 200, FEED_CHAINED);
+
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(ArxivSource::new().chaining(false)).unwrap();
+
+    let cites = vec![("arxiv".to_string(), "1211.1037".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    let item = block_on(mgr.get("arxiv", "1211.1037")).unwrap();
+    assert_eq!(item["title"], "A Chained arXiv Paper", "concrete arXiv metadata");
+    assert_eq!(item["DOI"], "10.1103/PhysRevLett.109.170502", "verbatim, mixed case");
+    assert_eq!(item.get("doi"), None, "lowercase doi key must not survive");
 }
 
 #[test]
@@ -500,7 +526,8 @@ fn blank_arxiv_doi_does_not_chain_to_the_empty_doi_key() {
         let item = block_on(mgr.get("arxiv", key)).unwrap();
         assert_eq!(item["title"], title, "{key}: concrete arXiv metadata");
         assert_eq!(item["arxivid"], key);
-        assert!(item.get("doi").is_none(), "{key}: no empty `doi` field");
+        assert!(item.get("DOI").is_none(), "{key}: no empty `DOI` field");
+        assert!(item.get("doi").is_none(), "{key}: no lowercase `doi` field");
     }
 }
 

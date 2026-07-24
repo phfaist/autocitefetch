@@ -170,10 +170,11 @@ fn override_map_injects_doi_when_feed_has_none() {
     assert_eq!(item["id"], "arxiv:2001.00001");
     assert_eq!(item["title"], "Resolved Via Override");
     assert_eq!(item["arxivid"], "2001.00001", "chained set_properties merged in");
-    // doi.org's uppercase `DOI` is normalized on ingest to a lowercase `doi`
-    // key with a lowercased value; the CSL-spec uppercase key does not survive.
-    assert_eq!(item["doi"], "10.9999/override.abc");
-    assert_eq!(item.get("DOI"), None, "uppercase DOI key must not survive");
+    // The chained doi.org body supplies the CSL `DOI`, stored verbatim — note
+    // its case differs from both the override string and the lowercased `doi:`
+    // cache key that was used to fetch it.
+    assert_eq!(item["DOI"], "10.9999/OVERRIDE.abc", "value verbatim");
+    assert_eq!(item.get("doi"), None, "lowercase doi key must not survive");
 }
 
 #[test]
@@ -496,7 +497,10 @@ fn versionless_and_versioned_requests_for_one_paper_coexist_in_a_batch() {
     assert_eq!(pinned["id"], "arxiv:1805.00006v2");
     assert_eq!(pinned["title"], "Title 1805.00006v2");
     assert_eq!(pinned["arxiv_version_number"], 2);
-    assert_eq!(pinned["doi"], "10.8888/two", "recorded but not chained");
+    // Built by the arXiv source itself: the CSL-standard `DOI` key, with the
+    // feed's registered mixed case (`10.8888/TWO`) preserved verbatim.
+    assert_eq!(pinned["DOI"], "10.8888/TWO", "recorded verbatim, not chained");
+    assert_eq!(pinned.get("doi"), None, "lowercase doi key must not survive");
 }
 
 #[test]
@@ -528,8 +532,9 @@ fn explicit_version_selects_that_version_and_stays_concrete() {
     assert_eq!(item["id"], "arxiv:1801.00002v1");
     assert_eq!(item["arxiv_version_number"], 1, "exact version preserved");
     assert_eq!(item["title"], "Title 1801.00002v1");
-    // The DOI is still recorded on the concrete entry (lowercased) but not chained.
-    assert_eq!(item["doi"], "10.2222/should.not.chain");
+    // The DOI is still recorded on the concrete entry (verbatim, under the
+    // standard `DOI` key) but not chained.
+    assert_eq!(item["DOI"], "10.2222/should.not.chain");
 }
 
 #[test]
@@ -682,7 +687,8 @@ fn override_none_suppresses_feed_doi() {
     assert_eq!(item["id"], "arxiv:6001.00006");
     assert_eq!(item["title"], "Title 6001.00006v1");
     assert_eq!(item["arxiv_version_number"], 1);
-    assert!(item.get("doi").is_none(), "suppressed DOI should be absent");
+    assert!(item.get("DOI").is_none(), "suppressed DOI should be absent");
+    assert!(item.get("doi").is_none(), "no lowercase `doi` key either");
 }
 
 #[test]
@@ -706,7 +712,8 @@ fn override_file_null_suppresses_doi() {
 
     let item = block_on(mgr.get("arxiv", "7001.00007")).unwrap();
     assert_eq!(item["title"], "Title 7001.00007v1");
-    assert!(item.get("doi").is_none(), "null in file suppresses the DOI");
+    assert!(item.get("DOI").is_none(), "null in file suppresses the DOI");
+    assert!(item.get("doi").is_none(), "no lowercase `doi` key either");
 }
 
 // --- Task 1c: a BLANK override DOI is no DOI, not the empty DOI -------------
@@ -737,7 +744,8 @@ fn empty_string_override_does_not_chain_to_the_empty_doi_key() {
     let item = block_on(mgr.get("arxiv", "8001.00008")).unwrap();
     assert_eq!(item["id"], "arxiv:8001.00008");
     assert_eq!(item["title"], "Title 8001.00008v1");
-    assert!(item.get("doi").is_none(), "a blank DOI is no DOI");
+    assert!(item.get("DOI").is_none(), "a blank DOI is no DOI");
+    assert!(item.get("doi").is_none(), "no lowercase `doi` key either");
 }
 
 #[test]
@@ -765,5 +773,6 @@ fn empty_string_in_override_file_does_not_chain_to_the_empty_doi_key() {
 
     let item = block_on(mgr.get("arxiv", "8002.00008")).unwrap();
     assert_eq!(item["title"], "Title 8002.00008v1");
-    assert!(item.get("doi").is_none(), "a blank DOI is no DOI");
+    assert!(item.get("DOI").is_none(), "a blank DOI is no DOI");
+    assert!(item.get("doi").is_none(), "no lowercase `doi` key either");
 }

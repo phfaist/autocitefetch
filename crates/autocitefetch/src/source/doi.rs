@@ -4,12 +4,13 @@
 //! native CSL-JSON — so there is no per-field mapping to do, we store the
 //! response essentially verbatim. One DOI per request; ~1 req/s.
 //!
-//! The one deliberate exception is the **DOI key**: canonical CSL-JSON spells it
-//! uppercase `DOI`, but this workspace uses a uniform lowercase `doi` everywhere
-//! (the arXiv source emits lowercase `doi`, and `get`/chaining read one canonical
-//! spelling). So on ingest we fold an uppercase `DOI` down to lowercase `doi` and
-//! lowercase its value (DOIs are case-insensitive) — see `normalize_doi_key`.
-//! Every other field is stored verbatim.
+//! The one deliberate touch is the **DOI key**: this workspace emits the
+//! canonical CSL-JSON spelling, uppercase `DOI`, everywhere (the arXiv source
+//! also builds `DOI`). doi.org already returns `DOI`, so this is a no-op on its
+//! responses; the normalization exists only to canonicalize a stray lowercase
+//! `doi` up to `DOI` — see `canonicalize_doi_key`. The value is stored
+//! **verbatim** (DOIs display in their registered mixed case, and CSL-JSON
+//! carries them as-is). Every other field is likewise stored verbatim.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -91,7 +92,7 @@ async fn resolve_one(doi: &str, ctx: &RetrieveCtx<'_>) -> Resolution {
             // object and we would store a plausible-looking `{"id": "doi:…"}`
             // shell for the full 360-day TTL, with no failure reported.
             Ok(mut csl) if is_csl_item(&csl) => {
-                normalize_doi_key(&mut csl);
+                canonicalize_doi_key(&mut csl);
                 Resolution::concrete(doi, csl)
             }
             Ok(_) => Resolution::failed(
@@ -123,28 +124,30 @@ fn is_csl_item(v: &CslValue) -> bool {
     v.as_object().is_some_and(|o| !o.is_empty())
 }
 
-/// Fold doi.org's canonical CSL `DOI` key down to the lowercase `doi` this
-/// workspace uses, lowercasing the value (DOIs are case-insensitive).
+/// Canonicalize the DOI key to the CSL-JSON standard uppercase `DOI`, keeping
+/// its value **verbatim** (DOIs display in their registered mixed case).
 ///
 /// This is the *only* place we touch a doi.org field; every other field is
-/// stored verbatim. Rules: an uppercase `DOI` is moved to `doi` (not left as a
-/// duplicate); if a lowercase `doi` is somehow already present it wins and the
-/// uppercase one is dropped; whichever value survives is lowercased when it is a
-/// string. A non-string value (never valid for a DOI) is kept as-is under the
-/// lowercase key.
-fn normalize_doi_key(csl: &mut CslValue) {
+/// stored verbatim. doi.org already returns `DOI`, so on its responses this is a
+/// no-op; it exists to rename a stray lowercase `doi` up to `DOI`. Rules: if
+/// both `DOI` and (a nonstandard) `doi` somehow appear, the uppercase `DOI`
+/// wins and the lowercase duplicate is dropped; otherwise a lone lowercase `doi`
+/// is renamed to `DOI`. The value is never re-cased.
+fn canonicalize_doi_key(csl: &mut CslValue) {
     let Some(obj) = csl.as_object_mut() else {
         return;
     };
-    let upper = obj.remove("DOI");
-    // Prefer an existing lowercase `doi`; otherwise adopt the uppercase value.
-    let Some(mut value) = obj.remove("doi").or(upper) else {
-        return; // no DOI in either spelling — nothing to normalize.
+    // Fast path: no lowercase `doi` ⇒ nothing to canonicalize. This covers
+    // doi.org's own responses (which spell it `DOI`) and bodies with no DOI at
+    // all, and leaves the map completely untouched.
+    let Some(lower) = obj.remove("doi") else {
+        return;
     };
-    if let Some(s) = value.as_str() {
-        value = CslValue::String(s.to_ascii_lowercase());
+    // A lowercase `doi` was present and is now removed. Promote it to `DOI`
+    // only if the standard key was absent — when both appear, uppercase wins.
+    if !obj.contains_key("DOI") {
+        obj.insert("DOI".into(), lower);
     }
-    obj.insert("doi".into(), value);
 }
 
 /// Percent-encode a DOI for use in a URL path. Keeps `/` (DOIs use it as a
