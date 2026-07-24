@@ -99,32 +99,40 @@ them; `get()` walks the chain on read.
 * `citations.jsonl` — the cache itself: a header line, then one sorted
   `{"id":…,"rec":…}` line per entry. One entry per line keeps git diffs minimal;
   this is the only file worth committing.
-* `citations.<writer>.log` — per-writer append logs. Writes go here lock-free
+* `._citations.<writer>.log` — per-writer append logs. Writes go here lock-free
   and are folded into the main file by `flush()` (called at the end of
   `retrieve`/`prune`), which is the only operation that takes the lock or
   rewrites the whole file. `flush()` folds *every* sidecar it finds but only
   deletes **its own** and any left by a **crashed** peer — never a live peer's,
   since that would race its lock-free appends and destroy acknowledged writes.
-* `citations.<writer>.log.lock` — a per-writer **liveness lock**, held open for
-  the store's whole life. `flush()` reaps a peer's sidecar only when it can take
-  that peer's lock (the OS frees it when the owner process crashes); a held lock
-  means the owner is alive, so the sidecar is folded read-only and left in place.
-  The same probe sweeps up companions whose `.log` is already gone — which is
-  what every writer leaves behind when it exits — so a repeatedly-invoked CLI
-  does not litter one file per run.
-* `citations.lock` — the compaction lockfile.
-* `citations.jsonl.tmp` — the staging file for the atomic replace.
+* `._citations.<writer>.log.lock` — a per-writer **liveness lock**, held for
+  exactly as long as that writer's sidecar exists (taken just before the first
+  append, given back by the flush that folds the sidecar away). `flush()` reaps a
+  peer's sidecar only when it can take that peer's lock (the OS frees it when the
+  owner process crashes); a held lock means the owner is alive, so the sidecar is
+  folded read-only and left in place. The same probe sweeps up companions whose
+  `.log` is already gone, which is what a crash between the two unlinks strands.
+* `._citations.lock` — the compaction lockfile, held only for the duration of a
+  `flush()`.
+* `._citations.jsonl.tmp` — the staging file for the atomic replace.
 
-So commit the first and ignore the rest:
+Only the main file wears the bare base name; **every throwaway file carries the
+`._<base>` prefix**, so it is hidden and one rule ignores the lot:
 
 ```gitignore
-citations.*.log
-citations.*.log.lock
-citations.lock
-citations.jsonl.tmp
+._citations*
 ```
 
-The store *reads* every `citations.*.log` in this directory, so don't park
+Those throwaway files are also **transient**: each is unlinked by the writer that
+created it — the two lock files while their lock is still held, so a peer either
+finds the file locked or does not find it at all — so a run that finishes leaves
+`citations.jsonl` alone in the directory. (Lock files used to be kept forever,
+which littered one stray `._citations.<writer>.log.lock` per run plus a permanent
+`._citations.lock` in what, for the CLI, is the user's working directory.) Keep
+the ignore rule anyway: the files exist while a run is in flight, and a crash can
+strand one until the next run sweeps it up.
+
+The store *reads* every `._citations.*.log` in this directory, so don't park
 unrelated files there under that name. A main file it cannot parse — a corrupt
 line, an unresolved merge conflict, or a `{"schema":N}` newer than this build —
 makes `open()` fail rather than silently dropping the entries it can't read.
@@ -248,13 +256,14 @@ of format crates, so the CLI parses `--bib` files through
 [`BibliographyFileSource::with_parser`] and hands arXiv overrides over as data.
 
 The cache is the `SingleFileCacheStore` described above, renamed to a dotted
-base so the whole family hides in the user's working directory. Commit
-`.citations.jsonl` if you want the bibliography reproducible offline, and
-ignore the rest:
+base so the whole family hides in the user's working directory. A finished run
+leaves `.citations.jsonl` and nothing else; commit it if you want the
+bibliography reproducible offline, and ignore the throwaway files a run creates
+while it is in flight — no un-ignoring needed, since they sit under their own
+`._` prefix:
 
 ```gitignore
-.citations*
-!.citations.jsonl
+._.citations*
 ```
 
 [`BibliographyFileSource::with_parser`]: crates/autocitefetch/src/source/bibfile.rs

@@ -71,20 +71,21 @@ fn put_flush_reopen_roundtrip_leaves_single_committed_file() {
     block_on(store.put("arxiv:2101.00001", record(2000))).expect("put b");
     block_on(store.flush()).expect("flush");
 
-    // Exactly one committed JSONL file, and no sidecar `*.log` files remain.
+    // Exactly one file, the committed JSONL one: every throwaway file the store
+    // made — the sidecar, its companion liveness lock, the compaction lockfile,
+    // the staging file — is unlinked by whoever created it. A CLI run drops its
+    // cache in the user's working directory, so leftovers are litter there.
     let main = dir.join("citations.jsonl");
     assert!(main.is_file(), "citations.jsonl should exist after flush");
-    let mut logs = Vec::new();
-    for entry in std::fs::read_dir(&dir).expect("read cache dir") {
-        let name = entry.expect("dir entry").file_name();
-        let name = name.to_string_lossy().into_owned();
-        if name.ends_with(".log") {
-            logs.push(name);
-        }
-    }
-    assert!(
-        logs.is_empty(),
-        "sidecars should be gone after flush, found: {logs:?}"
+    let mut left: Vec<String> = std::fs::read_dir(&dir)
+        .expect("read cache dir")
+        .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        ["citations.jsonl"],
+        "a finished run must leave nothing but the committable file"
     );
 
     // Drop the store before reopening. (It holds no lock: the compaction guard
@@ -107,6 +108,49 @@ fn put_flush_reopen_roundtrip_leaves_single_committed_file() {
     );
     let entries = block_on(reopened.entries()).expect("entries");
     assert_eq!(entries.len(), 2, "both entries present after reopen");
+}
+
+/// The naming contract users gitignore against: `citations.jsonl` is the only
+/// file that wears the bare base name, and everything else the store puts in the
+/// directory — sidecars, companion liveness locks, the compaction lockfile, the
+/// atomic-replace staging file — hides under `._citations`. So `._citations*`
+/// ignores the whole throwaway family and nothing else.
+#[test]
+fn only_the_main_file_is_outside_the_underscore_dot_prefix() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("cache");
+
+    // A *live* peer, so the directory also holds a sidecar and companion lock
+    // that this store's flush is not allowed to reap.
+    let store = block_on(SingleFileCacheStore::new(&dir)).expect("open");
+    let peer = block_on(SingleFileCacheStore::new(&dir)).expect("open peer");
+    block_on(peer.put("doi:10.1/peer", record(1000))).expect("peer put");
+    block_on(store.put("doi:10.1/a", record(1000))).expect("put");
+    block_on(store.flush()).expect("flush");
+
+    let mut stray = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("read cache dir") {
+        let name = entry.expect("entry").file_name().to_string_lossy().into_owned();
+        if name != "citations.jsonl" && !name.starts_with("._citations") {
+            stray.push(name);
+        }
+    }
+    assert!(
+        stray.is_empty(),
+        "every file but citations.jsonl must hide under `._citations`, found: {stray:?}"
+    );
+    // ...and the family really is there to be covered by the rule: the live
+    // peer's sidecar (which our flush may not reap) and its companion lock.
+    let sidecars = list_sidecars(&dir);
+    assert_eq!(
+        sidecars.len(),
+        1,
+        "the live peer's sidecar is in the directory, found {sidecars:?}"
+    );
+    assert!(
+        dir.join(format!("{}.lock", sidecars[0])).is_file(),
+        "...and it is vouched for by its companion liveness lock"
+    );
 }
 
 /// Bug #1 on the real filesystem: `put; remove; flush` must leave the id gone,
@@ -232,7 +276,7 @@ fn concurrent_writer_appends_are_not_eaten_by_a_peer_flush() {
 
 /// Reaping a *crashed* writer's sidecar. Writer A records an entry and then is
 /// dropped without flushing — simulating a crash, which releases the liveness
-/// lock A held for its whole life and leaves its `citations.<A>.log` behind.
+/// lock A held for its whole life and leaves its `._citations.<A>.log` behind.
 /// A fresh writer B must fold A's orphaned data into the committed file and,
 /// finding A's liveness lock free, reap the stray sidecar (and its companion).
 #[test]
@@ -317,6 +361,53 @@ fn a_live_writers_sidecar_is_not_reaped() {
             .is_some(),
         "A's later put must not be lost"
     );
+}
+
+/// The liveness lock is given back at every flush (that is what keeps the
+/// directory clean), so a writer that appends *again* must take a fresh one —
+/// otherwise its second sidecar would sit there unvouched-for and a peer's flush
+/// would read it as a crashed writer's leftover and reap it. Same shape as
+/// `a_live_writers_sidecar_is_not_reaped`, but with A's flush in the middle.
+#[test]
+fn a_sidecar_written_after_a_flush_is_still_protected() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("cache");
+
+    let a = block_on(SingleFileCacheStore::new(&dir)).expect("open A");
+    block_on(a.put("doi:before", record(1234))).expect("A put");
+    block_on(a.flush()).expect("A flush");
+    assert!(
+        list_sidecars(&dir).is_empty(),
+        "A's flush leaves no sidecar behind"
+    );
+
+    // A goes back to work: this append must re-take the companion lock.
+    block_on(a.put("doi:after", record(5678))).expect("A second put");
+    let sidecars = list_sidecars(&dir);
+    assert_eq!(sidecars.len(), 1, "A's new sidecar, found {sidecars:?}");
+    assert!(
+        dir.join(format!("{}.lock", sidecars[0])).is_file(),
+        "a fresh sidecar must come with a fresh companion lock"
+    );
+
+    // B compacts while A is alive: A's new sidecar must survive, unreaped.
+    let b = block_on(SingleFileCacheStore::new(&dir)).expect("open B");
+    block_on(b.flush()).expect("B flush");
+    assert!(
+        dir.join(&sidecars[0]).is_file(),
+        "a live writer's post-flush sidecar must survive a peer's compaction"
+    );
+
+    block_on(a.flush()).expect("A flush again");
+    drop(a);
+    drop(b);
+    let reader = block_on(SingleFileCacheStore::new(&dir)).expect("reopen");
+    for id in ["doi:before", "doi:after"] {
+        assert!(
+            block_on(reader.get(id)).expect("get").is_some(),
+            "{id} must survive"
+        );
+    }
 }
 
 /// The committed file is meant to be read, hand-edited and merged by humans and
@@ -482,9 +573,10 @@ fn flush_preserves_main_file_permissions() {
     assert_eq!(after, 0o664);
 }
 
-/// The store scans the cache directory for `citations.*.log`, but it may only
+/// The store scans the cache directory for `._citations.*.log`, but it may only
 /// ever *delete* its own. A user's unrelated file that happens to match must
-/// come out of a compaction byte-for-byte intact.
+/// come out of a compaction byte-for-byte intact — as must one under the bare
+/// base, which is no longer part of the family at all.
 #[test]
 fn flush_does_not_delete_foreign_citations_star_log_files() {
     let tmp = tempfile::tempdir().expect("temp dir");
@@ -492,8 +584,9 @@ fn flush_does_not_delete_foreign_citations_star_log_files() {
     let store = block_on(SingleFileCacheStore::new(&dir)).expect("open");
 
     let foreign = [
-        ("citations.import-notes.log", "hand-written import notes\n"),
-        ("citations.log", "a log named without a writer segment\n"),
+        ("._citations.import-notes.log", "hand-written import notes\n"),
+        ("._citations.log", "a log named without a writer segment\n"),
+        ("citations.4711-1.log", "a log under the bare base\n"),
         ("unrelated.log", "nothing to do with the cache\n"),
     ];
     for (name, body) in foreign {
@@ -523,7 +616,7 @@ fn flush_does_not_delete_foreign_citations_star_log_files() {
 fn open_on_a_directory_containing_a_subdir_named_citations_x_log() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let dir = tmp.path().join("cache");
-    std::fs::create_dir_all(dir.join("citations.oops.log")).expect("make the decoy directory");
+    std::fs::create_dir_all(dir.join("._citations.oops.log")).expect("make the decoy directory");
 
     let store = block_on(SingleFileCacheStore::new(&dir)).expect("open must tolerate it");
     block_on(store.put("doi:10.1/a", record(1000))).expect("put");
@@ -531,7 +624,7 @@ fn open_on_a_directory_containing_a_subdir_named_citations_x_log() {
 
     assert!(block_on(store.get("doi:10.1/a")).expect("get").is_some());
     assert!(
-        dir.join("citations.oops.log").is_dir(),
+        dir.join("._citations.oops.log").is_dir(),
         "the decoy directory is left alone"
     );
     drop(store);
@@ -539,27 +632,31 @@ fn open_on_a_directory_containing_a_subdir_named_citations_x_log() {
     assert!(block_on(reopened.get("doi:10.1/a")).expect("get").is_some());
 }
 
+/// The compaction lockfile is created by the flush that needs it and unlinked by
+/// that same flush, while its lock is still held — so it is not one of the files
+/// a finished run leaves behind. (Before, it stayed forever: one stray
+/// `._citations.lock` in whatever directory the cache lived in.)
 #[test]
-fn flush_creates_and_keeps_citations_lock() {
+fn flush_creates_the_compaction_lockfile_and_takes_it_away_again() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let dir = tmp.path().join("cache");
     let store = block_on(SingleFileCacheStore::new(&dir)).expect("open");
-    let lock = dir.join("citations.lock");
-    assert!(!lock.exists(), "the lockfile is created by the first flush");
+    let lock = dir.join("._citations.lock");
+    assert!(!lock.exists(), "nothing takes the lock before a flush");
 
     block_on(store.put("doi:10.1/a", record(1000))).expect("put");
     block_on(store.flush()).expect("flush");
-    assert!(lock.is_file(), "flush creates the lockfile");
-
-    // A second flush reuses it and must never truncate or remove it.
-    std::fs::write(&lock, b"sentinel").expect("write sentinel");
-    block_on(store.flush()).expect("second flush");
-    assert!(lock.is_file(), "flush keeps the lockfile");
-    assert_eq!(
-        std::fs::read(&lock).expect("read lock"),
-        b"sentinel",
-        "the lockfile is locked, never rewritten"
+    assert!(
+        !lock.exists(),
+        "the compaction lockfile must not outlive the flush that took it"
     );
+
+    // Repeatable: a second flush takes and gives back a fresh one, and the
+    // cache still works either side of it.
+    block_on(store.put("doi:10.1/b", record(2000))).expect("put");
+    block_on(store.flush()).expect("second flush");
+    assert!(!lock.exists(), "and again on the next flush");
+    assert_eq!(block_on(store.entries()).expect("entries").len(), 2);
 }
 
 /// Compaction is mutually exclusive: a flush must wait for a lock held by
@@ -582,7 +679,7 @@ fn a_second_flush_blocks_while_the_first_holds_the_lock() {
         .read(true)
         .write(true)
         .truncate(false)
-        .open(dir.join("citations.lock"))
+        .open(dir.join("._citations.lock"))
         .expect("open lockfile");
     fs4::FileExt::lock_exclusive(&held).expect("take the lock");
 

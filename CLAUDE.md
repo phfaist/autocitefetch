@@ -18,7 +18,7 @@ port of two prior libraries (see "Reference implementations" below).
 ## Commands
 
 ```sh
-cargo test                                   # all 203 tests (workspace)
+cargo test                                   # all 209 tests (workspace)
 cargo test -p autocitefetch --test arxiv_dois override_map_beats_feed_doi   # one integration test
 cargo test -p autocitefetch --lib filecache::tests::torn_tail_is_tolerated  # one unit test
 cargo doc --workspace --no-deps              # currently warning-free — keep it that way
@@ -233,25 +233,50 @@ is that specific version's date, not v1's. Only the per-entry `<updated>` is rea
 `FileCacheStore<Fs: CacheFs>` lives in the **core** crate (generic over an injected `CacheFs`); the
 std crate supplies only real filesystem ops (`StdCacheFs`) and the `SingleFileCacheStore` wrapper.
 Layout in one directory: `citations.jsonl` (header line 0 + one sorted entry per line — the only
-file worth committing), per-writer `citations.<pid>-<nanos>.log` append logs (lock-free writes), and
-`citations.lock`. `flush()` is the *only* operation that locks or rewrites the whole file: it folds
+file worth committing), per-writer `._citations.<pid>-<nanos>.log` append logs (lock-free writes),
+and `._citations.lock`. **Only the main file wears the bare base name**; every throwaway file the
+store creates (sidecars, companions, the compaction lockfile, the std host's `.jsonl.tmp` staging
+file) is prefixed `._` by `filecache::temp_base`, so it is hidden and a single `._{base}*` ignore
+rule covers all of them without touching `{base}.jsonl`. `is_sidecar` therefore matches against the
+*temp* base — a log under the bare base is a foreign file and is not even read.
+`flush()` is the *only* operation that locks or rewrites the whole file: it folds
 main + all sidecars, atomically replaces the main file, then reaps its own sidecar **plus any
 crashed peer's**. It must never delete a *live* peer's: the compaction lock serializes compaction
 against *compaction*, never against the lock-free `append`, so unlinking a live peer's log destroys
 any write that landed after the fold read it (measured: ~300 of 400 acknowledged puts lost).
 
-Live-vs-crashed is told apart by an **OS-advisory liveness lock**. On `open` a writer takes and
-holds — for the store's whole lifetime — an exclusive `CacheFs::try_lock_exclusive` on a companion
-file `citations.<writer>.log.lock` next to its sidecar; the kernel releases it if the process
-crashes. When `flush` folds a peer's sidecar it tries that peer's companion lock: **held** (`Ok(None)`)
-⇒ owner alive ⇒ fold read-only, never delete; **acquired** (`Ok(Some)`) ⇒ owner gone ⇒ delete the
-log and its orphaned companion (the fold already captured its lines). The companion is a *separate*
-file from the `.log` so reaping our own sidecar each flush never orphans the lock we hold — a writer
-never `try_lock`s its own companion (self-deadlock) and deletes its own `.log` unconditionally. A
-foreign `citations.*.log` with no companion is folded but never reaped, same as round 1. The stored
-guard is `CacheFs::Guard` (an associated type, not `Box<dyn CacheGuard>`) so `FileCacheStore<StdCacheFs>`
-stays `Send` — the concurrent regression test still moves stores across threads. A failed unlink
-never fails the flush.
+Live-vs-crashed is told apart by an **OS-advisory liveness lock**. A writer takes an exclusive
+`CacheFs::try_lock_exclusive` on a companion file `._citations.<writer>.log.lock` next to its
+sidecar and holds it for exactly as long as that sidecar exists — `ensure_lifelock` takes it just
+before the first append creates the log, `flush` gives it back once the log is unlinked (`lifelock`
+is a `RefCell<Option<Fs::Guard>>` for that reason, and a later append re-takes it). The kernel
+releases it if the process crashes. When `flush` folds a peer's sidecar it tries that peer's
+companion lock: **held** (`Ok(None)`) ⇒ owner alive ⇒ fold read-only, never delete; **acquired**
+(`Ok(Some)`) ⇒ owner gone ⇒ delete the log and its orphaned companion (the fold already captured its
+lines). The companion is a *separate* file from the `.log` so reaping our own sidecar never has to
+disturb the lock — a writer never `try_lock`s its own companion (self-deadlock) and deletes its own
+`.log` unconditionally. A foreign `._citations.*.log` with no companion is folded but never reaped,
+same as round 1. The stored guard is `CacheFs::Guard` (an associated type, not `Box<dyn CacheGuard>`)
+so `FileCacheStore<StdCacheFs>` stays `Send` — the concurrent regression test still moves stores
+across threads. A failed unlink never fails the flush.
+
+**No file outlives the run that made it.** Every throwaway file is unlinked by its creator — the
+sidecar and the companion by the owning `flush`, the compaction lockfile at the end of the `flush`
+that took it, the `.jsonl.tmp` by the rename — so a finished run leaves only `{base}.jsonl`. (Both
+lock files used to be kept forever: a CLI run littered one `._.citations.<writer>.log.lock` per
+invocation plus a permanent `._.citations.lock` in the user's working directory.) Two rules hold it
+together. **A lock file is unlinked while its lock is still held**, never after releasing — a peer
+then either sees the file and finds it held (owner alive, hands off) or does not see it at all, so
+there is no instant where the path exists unlocked while its owner is still using it. And because an
+unlinked-but-open file can still be locked by a peer that opened it a moment earlier,
+`CacheFs::lock_exclusive`/`try_lock_exclusive` are **specified to verify after acquiring** that they
+locked the file the path still names, and to retry (blocking) or report not-acquired (`try_`) if not;
+`StdCacheFs` does this with a `(dev, ino)` comparison on unix (`lock_the_file_at` /
+`locked_the_file_at_path`) and accepts the lock unverified elsewhere. Skipping the check would let a
+stale holder and a newcomer both believe they hold the compaction lock — which is a main-file
+data-loss window, not a cosmetic one. `own_sidecar_gone` in `flush` is the third piece: if our own
+log did *not* actually go away, we keep the companion, since an unvouched-for sidecar reads as a
+crashed writer's leftover.
 
 Merge rule (all exercised by unit tests): **last write wins over a deterministic total fold order** —
 the main file first (the baseline written at the last compaction), then each sidecar in sorted name
@@ -275,13 +300,16 @@ committed file while preserving the two-phase `retrieve`→`get` flow within a r
 timestamps, not the prefix.
 
 Two liveness-lock details that are easy to undo. `flush` sweeps **orphaned companions** — a
-`{base}.{writer}.log.lock` whose `.log` is gone — using the same held/acquirable probe, because the
-peer-reaping loop iterates `.log` names and so can never reach one. Every writer creates exactly
-that state when it exits (its last flush unlinks its own log while it still holds the companion), so
-without the sweep each CLI run leaves a file behind forever. A writer still skips **its own**
-companion by name rather than probing it. Also note `SingleFileCacheStore::with_base` exists so the
-CLI can use the base `.citations`: the CLI's cache lands in the user's working directory, so every
-file it creates must hide under one `.citations*` ignore rule.
+`._{base}.{writer}.log.lock` whose `.log` is gone — using the same held/acquirable probe, because the
+peer-reaping loop iterates `.log` names and so can never reach one. That is now a *crash* state (a
+writer that died between the two unlinks, or before its first append), not the normal exit state, but
+without the sweep those files would never be collected. `companion_log_name` is what keeps the
+compaction lockfile out of that sweep: `._{base}.lock` is one `.lock` suffix away from a companion,
+and the remainder must itself be an `is_sidecar` name. A writer still skips **its own** companion by
+name rather than probing it. Also note `SingleFileCacheStore::with_base` exists so the
+CLI can use the base `.citations`: the CLI's cache lands in the user's working directory, so the
+committable file is the hidden `.citations.jsonl` and everything else hides under one `._.citations*`
+ignore rule.
 
 ### The CLI (`autocitefetch-cli`)
 

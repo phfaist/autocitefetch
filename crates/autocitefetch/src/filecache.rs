@@ -11,12 +11,26 @@
 //!   every following line is one entry, `{"id":…,"rec":…}`, sorted by id.
 //!   One entry per line keeps git diffs minimal, and it is the only file worth
 //!   committing to version control.
-//! * `{base}.{writer_id}.log` — a **sidecar** append log, one per writer. Each
+//! * `._{base}.{writer_id}.log` — a **sidecar** append log, one per writer. Each
 //!   line is either an entry or a tombstone (`{"id":…,"del":true}`). Writes go
 //!   here lock-free; there is no header. These are throwaway and should be
-//!   *gitignored* by users (`*.log`), as should the lockfile.
-//! * `{base}.lock` — the compaction lockfile. The **only** thing that ever
+//!   *gitignored* by users, as should the lockfile.
+//! * `._{base}.lock` — the compaction lockfile. The **only** thing that ever
 //!   takes the lock is [`FileCacheStore::flush`]; likewise gitignore it.
+//!
+//! Every one of those throwaway files is **transient**: each is unlinked by the
+//! writer that owns it as soon as it has served its purpose (see "Nothing is
+//! left lying around" below), so a completed run leaves `{base}.jsonl` alone in
+//! the directory. They are still worth gitignoring — they exist for as long as a
+//! run does, and a crash can leave one behind.
+//!
+//! The bare `{base}` name belongs to the committable file alone: **every other
+//! file the store creates carries the `._{base}` prefix** (`temp_base`) — the
+//! sidecars, the compaction lockfile, the per-writer liveness companions, and
+//! (in the std host) the staging file the atomic replace renames from. Two
+//! reasons: the `._` makes them hidden, and it makes a single ignore rule
+//! `._{base}*` cover the whole throwaway family without also swallowing
+//! `{base}.jsonl`, which is exactly the file the user wants committed.
 //!
 //! # How it stays consistent
 //!
@@ -65,11 +79,42 @@
 //! shared-directory setup is best-effort, and each writer's *own* sequence of
 //! operations is always honored exactly.
 //!
+//! # Nothing is left lying around
+//!
+//! Every throwaway file has an owner that unlinks it, so a run that ends cleanly
+//! leaves only `{base}.jsonl`:
+//!
+//! * the **sidecar** is unlinked by its own writer at every `flush`, once its
+//!   lines are folded into the main file;
+//! * the **liveness companion** (`._{base}.{writer}.log.lock`) is taken lazily —
+//!   immediately *before* the first append creates the sidecar — and unlinked at
+//!   the end of the same `flush`, once the sidecar it vouches for is gone. It is
+//!   re-taken if the store appends again, so the invariant "our sidecar exists ⇒
+//!   we hold our companion" never breaks;
+//! * the **compaction lockfile** is unlinked at the end of the `flush` that took
+//!   it;
+//! * the std host's staging file is consumed by the rename that publishes it.
+//!
+//! Both lock files are unlinked **while their lock is still held**, never after
+//! releasing it. That ordering is what makes the unlink safe: a peer either sees
+//! the file and finds the lock held (owner alive — hands off), or does not see
+//! the file at all. There is no instant at which the path exists *and* its lock
+//! is free while its owner is still using it.
+//!
+//! A file that was unlinked by its holder can still be locked by a peer that
+//! opened it a moment earlier, and that peer would then be holding a lock on a
+//! path other processes no longer reach. [`CacheFs::lock_exclusive`] and
+//! [`CacheFs::try_lock_exclusive`] are therefore specified to verify, after
+//! acquiring, that the file they locked is still the one at the path — see their
+//! docs. A host that cannot check (no file identity available) is no worse off
+//! than before this store unlinked anything, since the window is bounded by a
+//! peer's open→acquire gap.
+//!
 //! # Which files compaction may delete
 //!
-//! Its own sidecar always, and a peer's sidecar only once that peer is proven
-//! dead. The main file, the lockfile, and anything else the user keeps in the
-//! directory are only ever **read**.
+//! Its own sidecar and companion always, the compaction lockfile it holds, and a
+//! peer's sidecar only once that peer is proven dead. The main file and anything
+//! else the user keeps in the directory are only ever **read**.
 //!
 //! Deleting a *live* peer's sidecar is the data-loss bug this design guards
 //! against. The compaction lock serializes compaction against *compaction*; it
@@ -93,9 +138,11 @@
 //! then dropped again on the next flush.
 //!
 //! The distinction between a live owner and a dead one is an OS-advisory
-//! **liveness lock**. On `open`, a writer takes and holds — for the whole life
-//! of the store — an exclusive [`CacheFs::try_lock_exclusive`] on a companion
-//! file `{base}.{writer_id}.log.lock` sitting next to its sidecar. The lock is
+//! **liveness lock**. A writer takes an exclusive [`CacheFs::try_lock_exclusive`]
+//! on a companion file `._{base}.{writer_id}.log.lock` sitting next to its
+//! sidecar, and holds it for exactly as long as that sidecar exists: it is taken
+//! lazily, just before the first `put`/`remove` appends (and so creates) the log,
+//! and dropped at the end of the `flush` that unlinks the log again. The lock is
 //! held by the process, not written into any file, so the kernel releases it
 //! automatically when the process exits or crashes. When `flush` folds a
 //! **peer's** sidecar it then tries that peer's companion lock:
@@ -107,21 +154,22 @@
 //!   fold — delete both it and its now-orphaned companion, then drop the guard.
 //!
 //! The companion lock is a *separate* file from the sidecar precisely so that a
-//! writer reaping its **own** sidecar every flush never orphans its liveness
-//! lock onto a deleted inode. A writer therefore never `try_lock`s its own
-//! companion (that would self-deadlock); it deletes its own `.log`
-//! unconditionally, exactly as before, and keeps holding the companion lock.
+//! writer reaping its **own** sidecar never has to unlink the file its liveness
+//! lock lives on while it may still need to append again. A writer therefore
+//! never `try_lock`s its own companion (that would self-deadlock); it deletes
+//! its own `.log` unconditionally, and only then — in the same `flush` — unlinks
+//! and releases its companion, in that order (see "Nothing is left lying
+//! around"). The next append takes a fresh one.
 //!
-//! That leaves one file to collect: a companion whose `.log` is *already* gone,
-//! which is what every writer leaves behind when it exits (its last flush
-//! unlinked its log while it still held the lock). The rule above cannot reach
-//! it — that loop walks sidecar logs, and this one has none — so `flush` sweeps
-//! them separately, using the same lock as the oracle: held ⇒ a live writer
-//! between flushes, leave it; acquired ⇒ its owner is gone, unlink it. Without
-//! the sweep a short-lived process (a CLI run) leaves one stray file per
-//! invocation, since writer ids are never reused.
+//! That leaves one file to collect: a companion whose `.log` is *already* gone.
+//! A writer normally unlinks its own in the same `flush` that unlinks its log,
+//! but a crash in between — or one after taking the lock and before the first
+//! append — strands it. The rule above cannot reach it (that loop walks sidecar
+//! logs, and this one has none), so `flush` sweeps them separately, using the
+//! same lock as the oracle: held ⇒ a live writer that is about to append, leave
+//! it; acquired ⇒ its owner is gone, unlink it.
 //!
-//! A foreign `{base}.*.log` that no managed writer ever created has **no**
+//! A foreign `._{base}.*.log` that no managed writer ever created has **no**
 //! companion lock file, so `flush` finds none to probe and leaves it untouched
 //! — a stray or hand-placed log is folded (read-only) but never reaped, the
 //! same guarantee as for the main file. A failed unlink is never a failed
@@ -215,8 +263,18 @@ pub trait CacheFs {
     /// Remove a file; a no-op if it is already absent.
     fn remove(&self, path: &str) -> BoxFuture<'_, Result<(), FsError>>;
 
-    /// Take an exclusive advisory lock on `path`, returning a held guard.
-    /// Dropping the guard releases the lock.
+    /// Take an exclusive advisory lock on `path`, creating the file if absent,
+    /// and return a held guard. Dropping the guard releases the lock.
+    ///
+    /// The store **unlinks lock files while holding their lock** (see the
+    /// "Nothing is left lying around" section of the module docs), so an
+    /// implementation must not hand back a guard on a file that is no longer the
+    /// one at `path`: after acquiring, check that the locked file is still the
+    /// file `path` names, and if it is not, re-open and re-acquire. Skipping the
+    /// check costs mutual exclusion — the stale holder and a newcomer that
+    /// created a fresh file at the same path would both believe they hold it.
+    /// A host with no way to compare file identity may accept the lock as-is;
+    /// the window is a peer's open→acquire gap.
     fn lock_exclusive(&self, path: &str) -> BoxFuture<'_, Result<Box<dyn CacheGuard>, FsError>>;
 
     /// **Non-blocking** exclusive advisory lock on `path`, creating the file if
@@ -224,8 +282,14 @@ pub trait CacheFs {
     /// `Ok(Some(guard))` when the lock was free and is now held by the returned
     /// guard, or `Ok(None)` when some other holder already has it. Used as a
     /// liveness probe: a writer holds one of these on its own sidecar's
-    /// companion for its whole life, so a peer's `flush` can reclaim that
-    /// sidecar only once the lock comes free (i.e. the owner process is gone).
+    /// companion for as long as that sidecar exists, so a peer's `flush` can
+    /// reclaim the sidecar only once the lock comes free (i.e. the owner process
+    /// is gone).
+    ///
+    /// The same verify-after-acquire rule as [`lock_exclusive`](CacheFs::lock_exclusive)
+    /// applies, and here the conservative answer is `Ok(None)`: a lock taken on a
+    /// file that has since been unlinked proves nothing about its owner, and
+    /// reporting it as free is what would let a live peer's sidecar be reaped.
     fn try_lock_exclusive(
         &self,
         path: &str,
@@ -307,23 +371,29 @@ pub struct FileCacheStore<Fs: CacheFs> {
     dir: String,
     base: String,
     writer_id: String,
-    /// `{dir}/{base}.jsonl`.
+    /// `{dir}/{base}.jsonl` — the one file *not* under [`temp_base`].
     main: String,
-    /// `{base}.{writer_id}.log` — the bare *name* of this writer's append log,
+    /// `._{base}.{writer_id}.log` — the bare *name* of this writer's append log,
     /// as it appears in a [`CacheFs::list`] listing. Compared against the
     /// folded set before compaction unlinks it.
     sidecar_name: String,
-    /// `{dir}/{base}.{writer_id}.log` — the same file, as a path.
+    /// `{dir}/._{base}.{writer_id}.log` — the same file, as a path.
     sidecar: String,
-    /// `{dir}/{base}.lock`.
+    /// `{dir}/._{base}.{writer_id}.log.lock` — the companion file this writer's
+    /// liveness lock is taken on. A *separate* file from the sidecar so that
+    /// reaping the sidecar never has to disturb the lock.
+    sidecar_lock: String,
+    /// `{dir}/._{base}.lock`.
     lockfile: String,
-    /// The liveness lock on `sidecar_lock`, taken at `open` and held until the
-    /// store drops. Its being held is the signal a peer's `flush` reads to
-    /// decide our sidecar is live and must not be reaped; the OS releases it if
-    /// this process crashes. Normally `Some` — `None` only if the (unique)
-    /// writer id somehow collided with a live holder, in which case we simply
-    /// forgo the protection rather than fail to open.
-    lifelock: Option<Fs::Guard>,
+    /// The liveness lock on `sidecar_lock`, held for exactly as long as this
+    /// writer's sidecar exists: taken by `ensure_lifelock` just before the first
+    /// append creates the log, released (and the file unlinked) by the `flush`
+    /// that unlinks the log again. Its being held is the signal a peer's `flush`
+    /// reads to decide our sidecar is live and must not be reaped; the OS
+    /// releases it if this process crashes. `None` whenever we have no sidecar
+    /// on disk — and also if the lock could not be taken at all, in which case
+    /// we simply forgo the protection rather than fail the write.
+    lifelock: RefCell<Option<Fs::Guard>>,
     /// The authoritative in-memory view; reads clone out of it.
     mem: RefCell<BTreeMap<String, CacheRecord>>,
 }
@@ -333,7 +403,7 @@ impl<Fs: CacheFs> fmt::Debug for FileCacheStore<Fs> {
         f.debug_struct("FileCacheStore")
             .field("main", &self.main)
             .field("writer_id", &self.writer_id)
-            .field("live", &self.lifelock.is_some())
+            .field("live", &self.lifelock.borrow().is_some())
             .field("entries", &self.mem.borrow().len())
             .finish()
     }
@@ -352,23 +422,27 @@ impl<Fs: CacheFs> FileCacheStore<Fs> {
         let dir = dir.into();
         let base = base.into();
         let writer_id = writer_id.into();
+        // Only the committable file wears the bare base name; every throwaway
+        // file in the family hides under `._{base}` so one ignore rule covers
+        // them all (see `temp_base`).
         let main = alloc::format!("{dir}/{base}.jsonl");
-        let sidecar_name = alloc::format!("{base}.{writer_id}.log");
+        let temp_base = temp_base(&base);
+        let sidecar_name = alloc::format!("{temp_base}.{writer_id}.log");
         let sidecar = alloc::format!("{dir}/{sidecar_name}");
         // The companion liveness-lock path for this writer's sidecar: a
-        // *separate* file from the sidecar, so reaping our own `.log` every
-        // flush never orphans the lock we are about to take on this one.
+        // *separate* file from the sidecar, so reaping our own `.log` never has
+        // to disturb the lock we take on this one.
         let sidecar_lock = alloc::format!("{sidecar}.lock");
-        let lockfile = alloc::format!("{dir}/{base}.lock");
+        let lockfile = alloc::format!("{dir}/{temp_base}.lock");
 
         let merged = load_merged(&fs, &dir, &base).await.map_err(fs_store)?;
 
-        // Take this writer's liveness lock and hold it for the store's lifetime.
-        // A peer reaps our sidecar only when it can take this lock, which it
-        // never can while we are alive; the OS frees it if we crash. The writer
-        // id is unique per process run, so this normally always succeeds.
-        let lifelock = fs.try_lock_exclusive(&sidecar_lock).await.map_err(fs_store)?;
-
+        // The liveness lock is deliberately *not* taken here: it vouches for a
+        // sidecar, and we have none until something is appended. Taking it at
+        // `open` meant a store that only ever reads still created a file — and
+        // left it behind, since nothing but a *later* process's orphan sweep
+        // could reap it. `ensure_lifelock` takes it just before the first
+        // append instead; `flush` gives it back.
         Ok(FileCacheStore {
             fs,
             dir,
@@ -377,10 +451,31 @@ impl<Fs: CacheFs> FileCacheStore<Fs> {
             main,
             sidecar_name,
             sidecar,
+            sidecar_lock,
             lockfile,
-            lifelock,
+            lifelock: RefCell::new(None),
             mem: RefCell::new(merged.map),
         })
+    }
+
+    /// Take this writer's liveness lock, if it is not already held. Called
+    /// immediately before any append, so that a sidecar on disk always has a
+    /// held companion lock vouching for it — that is the whole signal a peer's
+    /// `flush` uses to tell "owner alive, hands off" from "crashed, reap it".
+    ///
+    /// Failing to take it is not an error: the writer id is unique per process
+    /// run, so a collision means something unexpected is holding the file, and
+    /// the honest response is to forgo *our* crash-detection protection (a peer
+    /// then sees a held lock and leaves our sidecar alone — the safe direction)
+    /// rather than to fail an otherwise fine write.
+    async fn ensure_lifelock(&self) {
+        let held = self.lifelock.borrow().is_some();
+        if held {
+            return;
+        }
+        if let Ok(guard @ Some(_)) = self.fs.try_lock_exclusive(&self.sidecar_lock).await {
+            *self.lifelock.borrow_mut() = guard;
+        }
     }
 
     /// Serialize a single entry line (`{"id":…,"rec":…}`) with a trailing
@@ -432,6 +527,11 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
         Box::pin(async move {
             if let Some(line) = line {
                 let line = line?;
+                // Before the append, never after: the sidecar must not exist on
+                // disk for even an instant without a held companion lock, or a
+                // peer's flush could read it as a crashed writer's leftover and
+                // reap it out from under us.
+                self.ensure_lifelock().await;
                 self.fs
                     .append(&sidecar, line.as_bytes())
                     .await
@@ -447,6 +547,9 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
         let sidecar = self.sidecar.clone();
         Box::pin(async move {
             let line = line?;
+            // Same ordering rule as `put`: the companion lock first, so the log
+            // this append may create is never unvouched-for.
+            self.ensure_lifelock().await;
             self.fs
                 .append(&sidecar, line.as_bytes())
                 .await
@@ -513,6 +616,7 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
             // A failed unlink is never a failed flush: the data is already
             // durable in the main file and any surviving sidecar is simply
             // re-folded (idempotently) next time.
+            let mut own_sidecar_gone = true;
             for name in &merged.folded {
                 if name == &self.sidecar_name {
                     // Our own log: reap unconditionally, exactly as before. We
@@ -520,7 +624,10 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
                     // `sidecar_lock` companion, never on the log we delete here,
                     // so this unlink can never orphan it, and we must never
                     // `try_lock` our own companion (that would self-deadlock).
-                    let _ = self.fs.remove(&self.sidecar).await;
+                    // Whether it actually went decides if the companion may be
+                    // given back below: a log that is still there must keep its
+                    // lock held, or a peer would read it as abandoned.
+                    own_sidecar_gone = self.fs.remove(&self.sidecar).await.is_ok();
                     continue;
                 }
                 // A peer's log. Reap it only if its owner is provably gone. A
@@ -544,18 +651,17 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
                 }
             }
 
-            // Reap *orphaned* companion locks — a `{base}.{writer}.log.lock`
+            // Reap *orphaned* companion locks — a `._{base}.{writer}.log.lock`
             // whose `.log` is already gone. The loop above cannot: it iterates
-            // sidecar logs, and there is no log left to find one from. Without
-            // this, every process that ever opened the cache leaves one behind
-            // forever (each run has a fresh writer id, and its own last flush
-            // unlinks its log while it still holds the companion) — one stray
-            // file per run in what may well be the user's working directory.
+            // sidecar logs, and there is no log left to find one from. A writer
+            // that exits normally unlinks its own companion below, so what this
+            // collects is what a crash strands: between unlinking the log and
+            // unlinking the companion, or before the first append ever happened.
             //
             // The lock is again the liveness oracle: held ⇒ a live writer that
-            // has flushed and not yet appended again, leave it alone; acquired ⇒
-            // the OS released it on the owner's exit, so nothing owns the file.
-            // Our own companion is skipped by name rather than probed — we hold
+            // is between its lock and its append, leave it alone; acquired ⇒ the
+            // OS released it on the owner's exit, so nothing owns the file. Our
+            // own companion is skipped by name rather than probed — we may hold
             // it, and asking for it again would at best tell us nothing.
             let own_lock_name = alloc::format!("{}.lock", self.sidecar_name);
             for name in &merged.orphan_locks {
@@ -566,6 +672,27 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
                 if let Ok(Some(_reaped)) = self.fs.try_lock_exclusive(&path).await {
                     let _ = self.fs.remove(&path).await;
                 }
+            }
+
+            // Give our own liveness companion back, now that the sidecar it
+            // vouched for is gone: there is nothing left for a peer to reap, so
+            // nothing left to vouch for, and holding on would strand the file in
+            // the user's directory for the next process to sweep up (one per run
+            // — the litter this cleans up). The next append takes a fresh lock.
+            //
+            // Order matters: unlink *while still holding* the lock, then
+            // release. A peer therefore either finds the file and its lock held
+            // (owner alive, hands off) or does not find the file at all; the
+            // file never sits there unlocked while we are still using it. If our
+            // own log did not actually go away, we keep the lock instead —
+            // an unvouched-for sidecar reads as a crashed writer's leftover.
+            //
+            // Only when we really hold it: a companion we never took is not ours
+            // to unlink, and this store deletes nothing it does not own.
+            let hold_lifelock = self.lifelock.borrow().is_some();
+            if own_sidecar_gone && hold_lifelock {
+                let _ = self.fs.remove(&self.sidecar_lock).await;
+                *self.lifelock.borrow_mut() = None;
             }
 
             // Carry forward this run's *ephemeral* (TTL-0) records. They were
@@ -585,6 +712,16 @@ impl<Fs: CacheFs> CacheStore for FileCacheStore<Fs> {
                 }
             }
             *self.mem.borrow_mut() = merged_map;
+
+            // Finally, unlink the compaction lockfile — the last throwaway file
+            // of the run — so a directory whose writers have all finished holds
+            // nothing but the committable `{base}.jsonl`. As with the companion
+            // above this happens *while the lock is still held* (`_guard` drops
+            // just below): a peer either blocks on the file it found or creates
+            // a fresh one, never both. `CacheFs::lock_exclusive`'s contract asks
+            // implementations to notice they locked an unlinked file and retry,
+            // which is what makes a waiter's turn correct here.
+            let _ = self.fs.remove(&self.lockfile).await;
             Ok(())
         })
     }
@@ -698,16 +835,30 @@ fn fold_sidecar_into(bytes: &[u8], map: &mut BTreeMap<String, CacheRecord>) -> b
     saw_tombstone
 }
 
-/// Whether `name` is a sidecar log belonging to this store's family:
-/// `{base}.{writer}.log` with a **non-empty** writer segment.
+/// The prefix every file in the family *except* the committable `{base}.jsonl`
+/// carries: `._{base}`.
 ///
-/// Rejected: the main file (`{base}.jsonl`), the lockfile (`{base}.lock`), a
-/// bare `{base}.log` with no writer segment at all, and anything under a
-/// different base.
+/// The leading `._` is what keeps the throwaway files (sidecars, the compaction
+/// lockfile, the liveness companions, the std host's staging file) hidden and,
+/// more importantly, ignorable as a group: `._{base}*` matches all of them and
+/// none of `{base}.jsonl`. Everything that builds or matches one of those names
+/// goes through here so the convention lives in one place.
+fn temp_base(base: &str) -> String {
+    alloc::format!("._{base}")
+}
+
+/// Whether `name` is a sidecar log belonging to this store's family:
+/// `{temp_base}.{writer}.log` with a **non-empty** writer segment, where
+/// `temp_base` is [`temp_base`]`(base)` — i.e. `._{base}`.
+///
+/// Rejected: the main file (`{base}.jsonl`), the lockfile (`._{base}.lock`), a
+/// bare `._{base}.log` with no writer segment at all, and anything under a
+/// different base. The main file cannot match by construction: it does not carry
+/// the `._` prefix at all.
 ///
 /// The writer segment itself cannot be validated — `writer_id` is
 /// caller-supplied (the std host happens to use `<pid>-<nanos>`, but nothing in
-/// the core requires that shape), so `citations.notes.log` is genuinely
+/// the core requires that shape), so `._citations.notes.log` is genuinely
 /// indistinguishable from the log of a writer called `notes`. Matching one is
 /// harmless in both directions: a match only ever causes a **read**, lines that
 /// do not parse are skipped, and compaction unlinks nothing but this store's
@@ -718,8 +869,8 @@ fn fold_sidecar_into(bytes: &[u8], map: &mut BTreeMap<String, CacheRecord>) -> b
 /// an old `citations.jsonl` — would still be folded in and could resurrect
 /// stale entries. Distinguishing that properly needs a self-identifying header
 /// line in the sidecar format; noted as follow-up, not fixed here.)
-fn is_sidecar(name: &str, base: &str) -> bool {
-    let Some(rest) = name.strip_prefix(base) else {
+fn is_sidecar(name: &str, temp_base: &str) -> bool {
+    let Some(rest) = name.strip_prefix(temp_base) else {
         return false;
     };
     let Some(rest) = rest.strip_prefix('.') else {
@@ -731,6 +882,19 @@ fn is_sidecar(name: &str, base: &str) -> bool {
     !writer.is_empty()
 }
 
+/// The sidecar log a companion liveness lock belongs to, if `name` is one:
+/// `._{base}.{writer}.log.lock` → `._{base}.{writer}.log`.
+///
+/// The remainder must itself be a [`is_sidecar`] name, which is what keeps the
+/// **compaction lockfile** out: `._{base}.lock` is one `.lock` suffix away from a
+/// companion, and classifying it as one would hand the orphan sweep the very
+/// file every writer synchronizes on. `._{base}` has no writer segment, so it is
+/// not a sidecar name and the file is not a companion.
+fn companion_log_name<'a>(name: &'a str, temp_base: &str) -> Option<&'a str> {
+    let log = name.strip_suffix(".lock")?;
+    is_sidecar(log, temp_base).then_some(log)
+}
+
 /// One folded view of the whole cache directory.
 struct Merged {
     /// The merged map, built last-write-wins in a total fold order: the main
@@ -740,7 +904,7 @@ struct Merged {
     /// Names (not paths) of the sidecars actually read and folded, sorted.
     /// `flush` consults this before unlinking its own log.
     folded: Vec<String>,
-    /// Names of companion liveness locks (`{base}.{writer}.log.lock`) whose
+    /// Names of companion liveness locks (`._{base}.{writer}.log.lock`) whose
     /// `.log` is *not* in this listing. A writer keeps its companion for its
     /// whole life but reaps its own `.log` at every flush, so this is either a
     /// live writer between flushes (its lock is still held) or a writer that has
@@ -790,25 +954,26 @@ async fn load_merged<Fs: CacheFs>(fs: &Fs, dir: &str, base: &str) -> Result<Merg
     let mut names = fs.list(dir).await?;
     names.sort(); // deterministic cross-writer fold order (see module docs)
 
+    // Everything but the main file lives under `._{base}`; computed once rather
+    // than per name, since the listing is filtered three times below.
+    let temp_base = temp_base(base);
+
     // Which sidecars exist at all, so a companion lock can be told apart from an
     // *orphaned* one. Collected up front because the listing is walked once and
     // a companion may sort before or after the log it belongs to.
     let sidecars: BTreeSet<&str> = names
         .iter()
         .map(String::as_str)
-        .filter(|n| is_sidecar(n, base))
+        .filter(|n| is_sidecar(n, &temp_base))
         .collect();
     let orphan_locks: Vec<String> = names
         .iter()
-        .filter(|n| {
-            n.strip_suffix(".lock")
-                .is_some_and(|log| is_sidecar(log, base) && !sidecars.contains(log))
-        })
+        .filter(|n| companion_log_name(n, &temp_base).is_some_and(|log| !sidecars.contains(log)))
         .cloned()
         .collect();
 
     for name in &names {
-        if !is_sidecar(name, base) {
+        if !is_sidecar(name, &temp_base) {
             continue;
         }
         let path = alloc::format!("{dir}/{name}");
@@ -1027,7 +1192,7 @@ mod tests {
             !inner_fs
                 .files
                 .borrow()
-                .contains_key("cache/citations.w1.log")
+                .contains_key("cache/._citations.w1.log")
         );
 
         // Reopen over the same fs contents: both entries survive.
@@ -1123,7 +1288,7 @@ mod tests {
         );
         let eph_side =
             FileCacheStore::<MemFs>::entry_line("manual:old-side", &ephemeral_rec(0)).unwrap();
-        write_raw(&fs, "cache/citations.peer.log", &eph_side);
+        write_raw(&fs, "cache/._citations.peer.log", &eph_side);
 
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
         assert!(block_on(store.get("doi:keep")).unwrap().is_some());
@@ -1157,7 +1322,7 @@ mod tests {
         // Write the larger-expires line first, the smaller one last: last wins.
         write_raw(
             &fs,
-            "cache/citations.w1.log",
+            "cache/._citations.w1.log",
             &alloc::format!("{larger}{smaller}"),
         );
 
@@ -1186,7 +1351,7 @@ mod tests {
         let b_del = FileCacheStore::<MemFs>::tombstone_line("doi:B").unwrap();
         write_raw(
             &fs,
-            "cache/citations.w1.log",
+            "cache/._citations.w1.log",
             &alloc::format!("{a_rec}{a_del}{b_del}"),
         );
 
@@ -1211,7 +1376,7 @@ mod tests {
         let a_rec = FileCacheStore::<MemFs>::entry_line("doi:A", &rec(1000)).unwrap();
         write_raw(
             &fs,
-            "cache/citations.w1.log",
+            "cache/._citations.w1.log",
             &alloc::format!("{a_del}{a_rec}"),
         );
 
@@ -1264,7 +1429,7 @@ mod tests {
         let fs = MemFs::default();
         write_raw(
             &fs,
-            "cache/citations.w1.log",
+            "cache/._citations.w1.log",
             &alloc::format!("{larger}{smaller}"),
         );
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w2")).unwrap();
@@ -1282,7 +1447,7 @@ mod tests {
             "cache/citations.jsonl",
             &alloc::format!("{HEADER}\n{larger}"),
         );
-        write_raw(&fs, "cache/citations.w1.log", &smaller);
+        write_raw(&fs, "cache/._citations.w1.log", &smaller);
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w2")).unwrap();
         assert_eq!(
             block_on(store.get("doi:1")).unwrap().unwrap().expires,
@@ -1302,12 +1467,12 @@ mod tests {
         // magnitude, must decide, so w2 (folded last) wins.
         write_raw(
             &fs,
-            "cache/citations.w1.log",
+            "cache/._citations.w1.log",
             &FileCacheStore::<MemFs>::entry_line("doi:1", &rec(9000)).unwrap(),
         );
         write_raw(
             &fs,
-            "cache/citations.w2.log",
+            "cache/._citations.w2.log",
             &FileCacheStore::<MemFs>::entry_line("doi:1", &rec(1000)).unwrap(),
         );
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w3")).unwrap();
@@ -1326,7 +1491,7 @@ mod tests {
         let torn = r#"{"id":"doi:2","rec":{"payload":{"conc"#;
         write_raw(
             &fs,
-            "cache/citations.w1.log",
+            "cache/._citations.w1.log",
             &alloc::format!("{good}{torn}"),
         );
 
@@ -1350,12 +1515,12 @@ mod tests {
         let fs = MemFs::default();
         write_raw(
             &fs,
-            "cache/citations.w1.log",
+            "cache/._citations.w1.log",
             &FileCacheStore::<MemFs>::entry_line("doi:1", &rec(1000)).unwrap(),
         );
         write_raw(
             &fs,
-            "cache/citations.w2.log",
+            "cache/._citations.w2.log",
             &FileCacheStore::<MemFs>::entry_line("doi:2", &rec(1000)).unwrap(),
         );
 
@@ -1366,15 +1531,15 @@ mod tests {
         let files = store.fs.files.borrow();
         assert!(files.contains_key("cache/citations.jsonl"));
         assert!(
-            files.contains_key("cache/citations.w1.log"),
+            files.contains_key("cache/._citations.w1.log"),
             "a peer's sidecar must survive our compaction"
         );
         assert!(
-            files.contains_key("cache/citations.w2.log"),
+            files.contains_key("cache/._citations.w2.log"),
             "a peer's sidecar must survive our compaction"
         );
         assert!(
-            !files.contains_key("cache/citations.w3.log"),
+            !files.contains_key("cache/._citations.w3.log"),
             "our own sidecar is reaped"
         );
         drop(files);
@@ -1388,7 +1553,7 @@ mod tests {
         let fs = MemFs::default();
         write_raw(
             &fs,
-            "cache/citations.peer.log",
+            "cache/._citations.peer.log",
             &FileCacheStore::<MemFs>::entry_line("doi:1", &rec(1000)).unwrap(),
         );
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
@@ -1411,21 +1576,21 @@ mod tests {
         // A crashed writer: sidecar + companion lock both exist, lock unheld.
         write_raw(
             &fs,
-            "cache/citations.dead.log",
+            "cache/._citations.dead.log",
             &FileCacheStore::<MemFs>::entry_line("doi:dead", &rec(1000)).unwrap(),
         );
-        write_raw(&fs, "cache/citations.dead.log.lock", "");
+        write_raw(&fs, "cache/._citations.dead.log.lock", "");
         // A live writer: sidecar + companion both exist, and the companion is
         // held (as its owner's lifelock would hold it for the store's life).
         write_raw(
             &fs,
-            "cache/citations.alive.log",
+            "cache/._citations.alive.log",
             &FileCacheStore::<MemFs>::entry_line("doi:alive", &rec(1000)).unwrap(),
         );
-        write_raw(&fs, "cache/citations.alive.log.lock", "");
+        write_raw(&fs, "cache/._citations.alive.log.lock", "");
         fs.locks
             .borrow_mut()
-            .insert("cache/citations.alive.log.lock".to_string());
+            .insert("cache/._citations.alive.log.lock".to_string());
 
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
         block_on(store.flush()).unwrap();
@@ -1436,40 +1601,40 @@ mod tests {
 
         let files = store.fs.files.borrow();
         assert!(
-            !files.contains_key("cache/citations.dead.log"),
+            !files.contains_key("cache/._citations.dead.log"),
             "a crashed peer's sidecar must be reaped"
         );
         assert!(
-            !files.contains_key("cache/citations.dead.log.lock"),
+            !files.contains_key("cache/._citations.dead.log.lock"),
             "the crashed peer's orphaned companion lock must be reaped too"
         );
         assert!(
-            files.contains_key("cache/citations.alive.log"),
+            files.contains_key("cache/._citations.alive.log"),
             "a live peer's sidecar must never be reaped"
         );
         assert!(
-            files.contains_key("cache/citations.alive.log.lock"),
+            files.contains_key("cache/._citations.alive.log.lock"),
             "a live peer's companion lock must never be reaped"
         );
     }
 
-    /// A companion lock whose `.log` is already gone — what *every* writer
-    /// leaves behind when it exits, since its last flush unlinks its own log
-    /// while still holding the companion. Nothing else can reap it (the peer
-    /// loop is driven by `.log` names), so without this sweep a short-lived
-    /// process leaves one stray file per run. A live writer's companion is in
-    /// exactly the same state between flushes, so the lock still decides.
+    /// A companion lock whose `.log` is already gone — what a writer that
+    /// crashed between unlinking its log and unlinking its companion (or before
+    /// its first append) strands. Nothing else can reap it (the peer loop is
+    /// driven by `.log` names), so without this sweep it would sit there
+    /// forever. A live writer between its lock and its append looks exactly the
+    /// same on disk, so the lock still decides.
     #[test]
     fn orphaned_companion_locks_are_reaped_only_when_unheld() {
         let fs = MemFs::default();
         // An exited writer: companion only, unheld.
-        write_raw(&fs, "cache/citations.gone.log.lock", "");
-        // A live writer that has flushed and not appended since: companion
+        write_raw(&fs, "cache/._citations.gone.log.lock", "");
+        // A live writer that has taken its lock and not appended yet: companion
         // only, but still held.
-        write_raw(&fs, "cache/citations.busy.log.lock", "");
+        write_raw(&fs, "cache/._citations.busy.log.lock", "");
         fs.locks
             .borrow_mut()
-            .insert("cache/citations.busy.log.lock".to_string());
+            .insert("cache/._citations.busy.log.lock".to_string());
 
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
         block_on(store.put("doi:1", rec(1000))).unwrap();
@@ -1477,38 +1642,94 @@ mod tests {
 
         let files = store.fs.files.borrow();
         assert!(
-            !files.contains_key("cache/citations.gone.log.lock"),
+            !files.contains_key("cache/._citations.gone.log.lock"),
             "an unheld orphaned companion must be reaped"
         );
         assert!(
-            files.contains_key("cache/citations.busy.log.lock"),
+            files.contains_key("cache/._citations.busy.log.lock"),
             "a held companion means its owner is alive — never reap it"
-        );
-        assert!(
-            files.contains_key("cache/citations.w1.log.lock"),
-            "our own companion is skipped by name: we hold it for our whole life"
         );
     }
 
-    /// The compaction lockfile is `{base}.lock`, one `.lock` suffix away from a
-    /// companion's `{base}.{writer}.log.lock`. The orphan sweep must not mistake
-    /// it for one and unlink the lock every writer synchronizes on.
+    /// The whole point of the exercise: a store that opens, writes and flushes
+    /// leaves the committable file **alone** in the directory. Every throwaway
+    /// file — our sidecar, our liveness companion, the compaction lockfile — is
+    /// unlinked by the writer that created it.
     #[test]
-    fn the_compaction_lockfile_is_not_mistaken_for_an_orphaned_companion() {
+    fn a_finished_run_leaves_only_the_committable_file() {
         let fs = MemFs::default();
-        write_raw(&fs, "cache/citations.lock", "");
-
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
         block_on(store.put("doi:1", rec(1000))).unwrap();
         block_on(store.flush()).unwrap();
 
-        assert!(
-            store.fs.files.borrow().contains_key("cache/citations.lock"),
-            "the compaction lockfile must survive a flush"
+        let files = store.fs.files.borrow();
+        let names: Vec<&str> = files.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            ["cache/citations.jsonl"],
+            "a finished run must leave nothing but the committable file"
         );
     }
 
-    /// A foreign `citations.*.log` with **no** companion lock file is folded but
+    /// A store that only ever *reads* must not create files at all — the
+    /// liveness companion is taken lazily, immediately before the first append,
+    /// because it exists solely to vouch for a sidecar.
+    #[test]
+    fn a_read_only_store_creates_no_files() {
+        let fs = MemFs::default();
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        assert!(block_on(store.get("doi:1")).unwrap().is_none());
+        assert!(
+            store.fs.files.borrow().is_empty(),
+            "opening and reading must not create a single file: {:?}",
+            store.fs.files.borrow().keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// After a flush the companion is released and gone, but the store is still
+    /// usable: a later append must take a **fresh** lock, so the invariant "a
+    /// sidecar on disk always has a held companion" holds for its whole life.
+    #[test]
+    fn a_later_append_retakes_the_liveness_lock() {
+        let fs = MemFs::default();
+        let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
+        block_on(store.put("doi:1", rec(1000))).unwrap();
+        block_on(store.flush()).unwrap();
+        assert!(store.lifelock.borrow().is_none(), "given back at flush");
+
+        block_on(store.put("doi:2", rec(2000))).unwrap();
+        assert!(
+            store.lifelock.borrow().is_some(),
+            "a new sidecar must come with a held companion lock"
+        );
+        let files = store.fs.files.borrow();
+        assert!(files.contains_key("cache/._citations.w1.log"));
+        assert!(files.contains_key("cache/._citations.w1.log.lock"));
+        drop(files);
+
+        block_on(store.flush()).unwrap();
+        assert_eq!(block_on(store.entries()).unwrap().len(), 2);
+    }
+
+    /// The compaction lockfile is `._{base}.lock`, one `.lock` suffix away from a
+    /// companion's `._{base}.{writer}.log.lock`. It must never be classified as
+    /// one: the orphan sweep would then unlink the file every writer
+    /// synchronizes on, at a moment its holder had not chosen.
+    #[test]
+    fn the_compaction_lockfile_is_not_mistaken_for_an_orphaned_companion() {
+        let tb = temp_base("citations");
+        assert_eq!(companion_log_name("._citations.lock", &tb), None);
+        assert_eq!(
+            companion_log_name("._citations.w1.log.lock", &tb),
+            Some("._citations.w1.log")
+        );
+        // Not a companion either: no writer segment, a foreign base, a bare log.
+        assert_eq!(companion_log_name("._citations.log.lock", &tb), None);
+        assert_eq!(companion_log_name("._other.w1.log.lock", &tb), None);
+        assert_eq!(companion_log_name("._citations.w1.log", &tb), None);
+    }
+
+    /// A foreign `._citations.*.log` with **no** companion lock file is folded but
     /// never reaped — the reap path must not create a companion for, and then
     /// delete, a file no writer ever managed.
     #[test]
@@ -1516,7 +1737,7 @@ mod tests {
         let fs = MemFs::default();
         write_raw(
             &fs,
-            "cache/citations.orphan.log",
+            "cache/._citations.orphan.log",
             &FileCacheStore::<MemFs>::entry_line("doi:x", &rec(1000)).unwrap(),
         );
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
@@ -1524,11 +1745,11 @@ mod tests {
 
         let files = store.fs.files.borrow();
         assert!(
-            files.contains_key("cache/citations.orphan.log"),
+            files.contains_key("cache/._citations.orphan.log"),
             "a companion-less peer log must be left untouched"
         );
         assert!(
-            !files.contains_key("cache/citations.orphan.log.lock"),
+            !files.contains_key("cache/._citations.orphan.log.lock"),
             "the reap probe must not create a companion lock for it"
         );
     }
@@ -1694,7 +1915,7 @@ mod tests {
         );
         write_raw(
             &fs,
-            "cache/citations.w1.log",
+            "cache/._citations.w1.log",
             &FileCacheStore::<MemFs>::entry_line("doi:1", &rec(5000)).unwrap(),
         );
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w2")).unwrap();
@@ -1717,7 +1938,7 @@ mod tests {
         );
         write_raw(
             &fs,
-            "cache/citations.w1.log",
+            "cache/._citations.w1.log",
             &FileCacheStore::<MemFs>::entry_line("doi:1", &rec(1000)).unwrap(),
         );
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w2")).unwrap();
@@ -1751,31 +1972,39 @@ mod tests {
 
     #[test]
     fn is_sidecar_matches_only_writer_logs() {
+        let tb = temp_base("citations");
+        assert_eq!(tb, "._citations");
         // Real sidecars, whatever the caller-supplied writer id looks like.
-        assert!(is_sidecar("citations.w1.log", "citations"));
-        assert!(is_sidecar("citations.4711-1234567890.log", "citations"));
+        assert!(is_sidecar("._citations.w1.log", &tb));
+        assert!(is_sidecar("._citations.4711-1234567890.log", &tb));
         // No writer segment at all.
-        assert!(!is_sidecar("citations.log", "citations"));
+        assert!(!is_sidecar("._citations.log", &tb));
         // The committed file and the lockfile are never sidecars.
-        assert!(!is_sidecar("citations.jsonl", "citations"));
-        assert!(!is_sidecar("citations.lock", "citations"));
+        assert!(!is_sidecar("citations.jsonl", &tb));
+        assert!(!is_sidecar("._citations.lock", &tb));
+        // The `._` prefix is required: a log under the *bare* base is a foreign
+        // file, not one of ours (it is also what an older layout wrote).
+        assert!(!is_sidecar("citations.w1.log", &tb));
         // Another base entirely, and a stray temp file.
-        assert!(!is_sidecar("unrelated.log", "citations"));
-        assert!(!is_sidecar(".tmpAb12Cd", "citations"));
-        assert!(!is_sidecar("citationsX.w1.log", "citations"));
+        assert!(!is_sidecar("unrelated.log", &tb));
+        assert!(!is_sidecar(".tmpAb12Cd", &tb));
+        assert!(!is_sidecar("._citationsX.w1.log", &tb));
         // Indistinguishable from writer id "jsonl" — accepted on purpose (see
         // `is_sidecar`'s docs); folding is read-only and nothing unlinks it.
-        assert!(is_sidecar("citations.jsonl.log", "citations"));
+        assert!(is_sidecar("._citations.jsonl.log", &tb));
     }
 
     /// A file the store never created is folded (harmlessly) but must never be
-    /// unlinked by a compaction.
+    /// unlinked by a compaction — whether it matches the sidecar pattern
+    /// (`._citations.import-notes.log`) or, now that the throwaway family hides
+    /// under `._`, merely looks like it used to (`citations.w1.log`).
     #[test]
     fn foreign_log_files_are_never_deleted() {
         let fs = MemFs::default();
-        write_raw(&fs, "cache/citations.import-notes.log", "not json at all\n");
-        write_raw(&fs, "cache/citations.log", "nor is this\n");
-        write_raw(&fs, "cache/unrelated.log", "nor this\n");
+        write_raw(&fs, "cache/._citations.import-notes.log", "not json at all\n");
+        write_raw(&fs, "cache/._citations.log", "nor is this\n");
+        write_raw(&fs, "cache/citations.w1.log", "nor this\n");
+        write_raw(&fs, "cache/unrelated.log", "nor this either\n");
 
         let store = block_on(FileCacheStore::open(fs, "cache", "citations", "w1")).unwrap();
         block_on(store.put("doi:1", rec(1000))).unwrap();
@@ -1783,8 +2012,9 @@ mod tests {
 
         let files = store.fs.files.borrow();
         for name in [
-            "cache/citations.import-notes.log",
-            "cache/citations.log",
+            "cache/._citations.import-notes.log",
+            "cache/._citations.log",
+            "cache/citations.w1.log",
             "cache/unrelated.log",
         ] {
             assert!(files.contains_key(name), "{name} must survive a compaction");

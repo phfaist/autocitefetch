@@ -3,6 +3,8 @@
 **/*~
 .claude/worktrees/
 # `cargo run -p autocitefetch-cli` drops its cache in the working directory.
-# In a consuming project you would keep `.citations.jsonl` (`!.citations.jsonl`);
-# here it is only ever a scratch artifact of running the tool from the repo root.
+# A consuming project only needs the second line: every throwaway file the cache
+# writes hides under `._<base>`, so `.citations.jsonl` stays committable without
+# any un-ignoring. Here the committed file is a scratch artifact too, so both go.
 /.citations*
+/._.citations*

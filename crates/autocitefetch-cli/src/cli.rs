@@ -69,9 +69,9 @@ starting with `#` are ignored and surrounding whitespace is stripped; the line
 is split at its *first* colon, so a `manual:` key may itself contain colons.
 
 Resolved entries are cached in `.citations.jsonl` in the current directory (see
---cache-dir / --cache-name), alongside the `.citations*` sidecar, lock and temp
+--cache-dir / --cache-name), alongside the `._.citations*` sidecar, lock and temp
 files the cache needs. Only `.citations.jsonl` is worth committing to version
-control.
+control; gitignoring `._.citations*` covers everything else.
 
 Exit status: 0 if every citation resolved, 1 if some did not (the rest are
 still written out), 2 on a fatal error.",
@@ -155,7 +155,7 @@ pub struct Cli {
     #[arg(long, value_name = "DIR", default_value = ".")]
     pub cache_dir: PathBuf,
 
-    /// Base name of the cache files (`<NAME>.jsonl`, `<NAME>.lock`, …).
+    /// Base name of the cache files (`<NAME>.jsonl`, plus `._<NAME>.lock`, …).
     #[arg(long, value_name = "NAME", default_value = ".citations")]
     pub cache_name: String,
 

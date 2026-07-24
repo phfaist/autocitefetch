@@ -23,11 +23,16 @@
 //! (following arXiv → DOI chain pointers). A citation can therefore fail in two
 //! places, and both are reported.
 //!
-//! **The cache is a directory of files, not one file.** The committable
-//! `.citations.jsonl` is joined by `.citations.<writer>.log` sidecars, their
-//! `.log.lock` companions, `.citations.lock` and `.citations.jsonl.tmp` — all
-//! sharing the `.citations` base so a single `.citations*` gitignore line
-//! covers everything but the file worth committing.
+//! **The cache is a directory of files, not one file.** While a run is in
+//! progress the committable `.citations.jsonl` is joined by
+//! `._.citations.<writer>.log` sidecars, their `.log.lock` companions,
+//! `._.citations.lock` and `._.citations.jsonl.tmp` — every throwaway file
+//! carrying the `._` prefix the core store puts in front of the base name, so
+//! `._.citations*` gitignores all of them and `.citations.jsonl` (the one file
+//! worth committing) needs no un-ignoring. Each is unlinked by whoever created
+//! it, so a finished run leaves only `.citations.jsonl` in the user's working
+//! directory; the ignore rule covers the in-flight files and anything a crash
+//! strands.
 
 mod cli;
 mod formats;
