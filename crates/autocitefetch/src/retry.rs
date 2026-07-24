@@ -22,6 +22,7 @@ use core::time::Duration;
 
 use crate::env::Timer;
 use crate::fetch::{FetchError, Fetcher, Request, Response};
+use crate::report::{Event, NopReporter, Reporter, Wait};
 use crate::BoxFuture;
 
 /// How the [`RetryingFetcher`] backs off and how many times it retries.
@@ -60,6 +61,11 @@ fn is_retryable_status(status: u16) -> bool {
     FetchError::Status(status).is_retryable()
 }
 
+/// What a [`RetryingFetcher`] reports to when the caller supplied no reporter.
+/// A `static` so it can be borrowed for any `'a`; `NopReporter` is a unit struct
+/// and therefore trivially `Sync`.
+static NOP_REPORTER: NopReporter = NopReporter;
+
 /// A [`Fetcher`] wrapper that transparently retries retryable failures.
 ///
 /// Holds only shared borrows of the inner fetcher and the timer, so it can be
@@ -69,6 +75,11 @@ pub struct RetryingFetcher<'a> {
     inner: &'a dyn Fetcher,
     timer: &'a dyn Timer,
     policy: RetryPolicy,
+    /// Where request/backoff progress goes. This is the only component that
+    /// sees every HTTP request, so it is where the network-level events come
+    /// from — and a sustained backoff (up to `cap`, 30 s by default) is
+    /// otherwise completely silent and reads as a hang.
+    reporter: &'a dyn Reporter,
 }
 
 impl<'a> RetryingFetcher<'a> {
@@ -78,7 +89,26 @@ impl<'a> RetryingFetcher<'a> {
             inner,
             timer,
             policy,
+            reporter: &NOP_REPORTER,
         }
+    }
+
+    /// Announce request and backoff progress to `reporter`. Builder-style;
+    /// without it the wrapper is silent.
+    pub fn with_reporter(mut self, reporter: &'a dyn Reporter) -> Self {
+        self.reporter = reporter;
+        self
+    }
+
+    /// Sleep out one backoff delay, bracketed by the paired wait events.
+    async fn back_off(&self, url: &str, attempt: u32, delay: Duration) {
+        let what = Wait::Backoff { url, attempt };
+        self.reporter.report(&Event::WaitStarted {
+            what,
+            expected: Some(delay),
+        });
+        self.timer.sleep(delay).await;
+        self.reporter.report(&Event::WaitFinished { what });
     }
 
     /// The delay to wait before the retry that follows `attempt` (0-based:
@@ -124,8 +154,16 @@ impl Fetcher for RetryingFetcher<'_> {
         Box::pin(async move {
             let mut attempt: u32 = 0;
             loop {
+                self.reporter.report(&Event::RequestStarted {
+                    url: &req.url,
+                    attempt,
+                });
                 match self.inner.fetch(req.clone()).await {
                     Ok(resp) => {
+                        self.reporter.report(&Event::RequestFinished {
+                            url: &req.url,
+                            result: Ok(resp.status),
+                        });
                         if attempt < self.policy.max_retries && is_retryable_status(resp.status) {
                             let ra = if self.policy.honor_retry_after {
                                 parse_retry_after(&resp)
@@ -133,7 +171,7 @@ impl Fetcher for RetryingFetcher<'_> {
                                 None
                             };
                             let delay = self.backoff(&req.url, attempt, ra);
-                            self.timer.sleep(delay).await;
+                            self.back_off(&req.url, attempt, delay).await;
                             attempt += 1;
                             continue;
                         }
@@ -141,9 +179,13 @@ impl Fetcher for RetryingFetcher<'_> {
                         return Ok(resp);
                     }
                     Err(e) => {
+                        self.reporter.report(&Event::RequestFinished {
+                            url: &req.url,
+                            result: Err(&e),
+                        });
                         if attempt < self.policy.max_retries && e.is_retryable() {
                             let delay = self.backoff(&req.url, attempt, None);
-                            self.timer.sleep(delay).await;
+                            self.back_off(&req.url, attempt, delay).await;
                             attempt += 1;
                             continue;
                         }

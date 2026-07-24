@@ -37,21 +37,33 @@
 mod cli;
 mod formats;
 mod input;
+mod progress;
 
 use std::future::Future;
 use std::io::Write;
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
+use autocitefetch::report::{Reporter, ThrottledReporter};
 use autocitefetch::source::{ArxivSource, BibliographyFileSource, DoiSource, ManualSource};
 use autocitefetch::{CitationManager, CslValue};
 use autocitefetch_std::{BlockingTimer, SingleFileCacheStore, SystemClock, UreqFetcher};
 use clap::Parser;
 
 use crate::cli::{Cli, SourceKind};
+use crate::progress::StderrReporter;
 
 /// Program name used to prefix everything written to stderr.
-const PROG: &str = "autocitefetch";
+pub const PROG: &str = "autocitefetch";
+
+/// At `-v`, the shortest gap between two progress counters for one source.
+///
+/// `doi:` is paced at one request per 1100 ms, so an unthrottled counter would
+/// put a line between every pair of requests. `-vv` drops the throttle: if you
+/// asked for every request you want every counter too.
+const PROGRESS_GAP: Duration = Duration::from_millis(1000);
 
 /// Every citation resolved.
 const EXIT_OK: u8 = 0;
@@ -97,7 +109,7 @@ fn run(cli: &Cli) -> Result<usize, String> {
 
     let manager = build_manager(cli, &sources)?;
 
-    if cli.verbose {
+    if cli.verbose > 0 {
         note(&format!(
             "resolving {} citation(s) via {}",
             cites.len(),
@@ -168,7 +180,7 @@ fn run(cli: &Cli) -> Result<usize, String> {
         }
     }
 
-    if cli.verbose {
+    if cli.verbose > 0 {
         note(&format!(
             "wrote {} item(s), {unresolved} unresolved",
             items.len()
@@ -204,7 +216,10 @@ fn build_manager(
     let mut manager = CitationManager::new(fetcher, store, SystemClock, BlockingTimer)
         // `--drop-field`: stripped on the way into the cache, so a dropped
         // field never reaches `.citations.jsonl` either.
-        .with_dropped_csl_fields(cli.drop_field.iter().cloned());
+        .with_dropped_csl_fields(cli.drop_field.iter().cloned())
+        // Progress is a host capability like the other four, just optional: at
+        // `-v` off it is a `NopReporter` and costs an empty vtable call.
+        .with_reporter(reporter(cli.verbose));
     for kind in sources {
         let prefix = kind.prefix();
         manager = match kind {
@@ -222,6 +237,26 @@ fn build_manager(
         .map_err(|e| format!("registering the `{prefix}` source: {e}"))?;
     }
     Ok(manager)
+}
+
+/// The progress sink for a given `--verbose` count.
+///
+/// At `-v` the stderr renderer is wrapped in a
+/// [`ThrottledReporter`], which caps *sample* events
+/// ([`SourceProgress`](autocitefetch::report::Event::SourceProgress)) at one per
+/// [`PROGRESS_GAP`] per source and passes every milestone straight through.
+/// Dropping samples is safe because each `*Finished` event carries final counts,
+/// so a throttled run still ends on a complete reading. `-vv` asked for detail,
+/// so it gets the renderer unthrottled.
+fn reporter(verbose: u8) -> Rc<dyn Reporter> {
+    match verbose {
+        0 | 1 => Rc::new(ThrottledReporter::new(
+            StderrReporter::new(verbose),
+            SystemClock,
+            PROGRESS_GAP,
+        )),
+        n => Rc::new(StderrReporter::new(n)),
+    }
 }
 
 /// The `arxiv` source, with `--no-arxiv-chaining` and `--arxiv-doi-overrides`

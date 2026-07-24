@@ -18,7 +18,7 @@ port of two prior libraries (see "Reference implementations" below).
 ## Commands
 
 ```sh
-cargo test                                   # all 209 tests (workspace)
+cargo test                                   # all 220 tests (workspace)
 cargo test -p autocitefetch --test arxiv_dois override_map_beats_feed_doi   # one integration test
 cargo test -p autocitefetch --lib filecache::tests::torn_tail_is_tolerated  # one unit test
 cargo doc --workspace --no-deps              # currently warning-free — keep it that way
@@ -51,7 +51,7 @@ Nothing else returns CSL data.
 2. `manager.get(prefix, key)` → `CslValue`. Walks chain pointers, merges `set_properties`, and
    rewrites `id` back to the originally requested `"prefix:key"`.
 
-### The four injected traits
+### The four injected traits (plus one optional fifth)
 
 `Fetcher`, `CacheStore`, `Clock`, `Timer` (in `fetch.rs`, `store.rs`, `env.rs`) are the entire host
 surface, assembled via `CitationManager::new(fetcher, store, clock, timer).register(prefix, source)?`
@@ -62,6 +62,9 @@ the traits object-safe (`&dyn Fetcher`, `Box<dyn Source>`). Do not add `Send`/`S
 
 `CacheStore` methods take `&self`; implementations use interior mutability (`RefCell`). The manager
 holds only shared borrows while driving sources concurrently, so this is required, not incidental.
+
+The fifth is `Reporter` (`report.rs`), and it breaks every one of those rules on purpose — see
+"Progress reporting" below.
 
 ### Prefixes are host-chosen bindings
 
@@ -150,6 +153,54 @@ A worklist loop, not a fixed pipeline:
 **never add retry logic inside a source**, and any I/O done outside `manager.retrieve` gets no
 retries. Retries cover transport errors and 429/500/502/503/504, honor numeric `Retry-After`, and
 back off exponentially (`RetryPolicy`: 5 retries, 500 ms base, 30 s cap).
+
+### Progress reporting (`report.rs`)
+
+Optional fifth host capability. `CitationManager::with_reporter(Rc<dyn Reporter>)`; a `NopReporter`
+by default, so an unreported emission is one vtable call to an empty body. Five decisions are
+load-bearing and each is easy to undo by accident:
+
+- **`fn report(&self, ev: &Event<'_>)` is synchronous and returns `()`.** Not a `BoxFuture` like
+  every other trait method in the crate. An async reporter would make every emission a new yield
+  point inside `buffer_unordered`, inside `driver`'s pacing loop and inside `retry`'s backoff loop,
+  so a host callback that awaited could be **re-entered** while a previous report was still pending.
+  Sync makes that structurally impossible. The missing return value is equally deliberate: the
+  reporter must never steer control flow (cancellation is a different feature — it has to be checked
+  at await points and unwind the worklist).
+- **Every `Event` field is borrowed** — `&str`, integers, `Duration`, `&Error`. Never a `String`, and
+  **never a pre-formatted message**: `format!` on an event would allocate even when nobody is
+  listening. This is also why there is no "does the reporter want this?" hook — no payload is
+  expensive enough for asking to pay off, so `desired_update_frequency()`-style inversion of control
+  would buy nothing. Throttling is `ThrottledReporter`, a decorator.
+- **Every event names its subject.** `buffer_unordered(8)` interleaves events from different
+  prefixes, so there is no implicit "current activity" and no push/pop scope. Do not add an event
+  that only makes sense relative to a previous one.
+- **Samples vs. milestones.** `Event::sample_key()` returns `Some(subject)` only for
+  `SourceProgress` — the one droppable event. What makes dropping safe is that **every `*Finished`
+  event carries final counts**, so a throttled run still ends on a complete reading. Adding a
+  droppable event without that property breaks `ThrottledReporter`.
+- **Progress comes from `driver.rs`, not `store_resolutions`.** The manager applies a pass's
+  resolutions *serially after* `buffer_unordered` collects, so `CiteResolved` arrives in one burst at
+  the end of a pass; a bar driven off it jumps 0% → 100%. The driver's per-chunk `SourceProgress` is
+  the signal that advances during a pass — and emitting it there means a third-party `Source` is
+  instrumented without implementing anything.
+
+Emission sites: `manager.rs` (retrieve/pass lifecycle, per-citation outcomes, the `CacheFlush` wait),
+`driver.rs` (source start/progress/finish, the `RateLimit` wait), `retry.rs` (`RequestStarted`/
+`Finished`, the `Backoff` wait). Sources reach it as `ctx.reporter` but rarely need to.
+
+**Cache-lock waits are bracketed around `store.flush()` in the manager, not emitted from inside
+`FileCacheStore`.** Giving the store an `Rc<dyn Reporter>` would make it `!Send`, and
+`autocitefetch-std/tests/filecache_std.rs` moves stores into `thread::spawn`. `flush` is the only
+operation that locks, so the call site loses nothing but the ability to distinguish "blocked on the
+lock" from "folding the sidecars". If that granularity is ever wanted, make it a generic `R: Reporter`
+parameter on `FileCacheStore` (`Send` when `R: Send`) — never an `Rc`.
+
+`CiteFailed` carries `grace_served`: `true` means the failure was suppressed by stale-while-revalidate
+and is **not** in the `RetrieveReport`. That is the only way a host can observe the grace window
+working. The CLI relies on this — `progress.rs` renders only the `grace_served: true` case, because
+`main.rs` already prints the report's failures with their `origin` attribution, and rendering both
+would double every failure line.
 
 ### Chaining
 
@@ -336,6 +387,12 @@ anywhere**, still). Things worth keeping straight:
   rather than letting it look like it worked.
 - Exit status is part of the contract: `0` all resolved, `1` some unresolved (the rest are still
   written), `2` fatal. A citation that will not fetch is never `2`.
+- `--verbose` is a **count** (`-v`/`-vv`), and `progress.rs` is the whole rendering story — presentation
+  belongs to the host, which is why there is no stderr reporter in `autocitefetch-std`. At `-v` the
+  renderer is wrapped in a `ThrottledReporter` (1 s), since `doi:` is paced at 1100 ms and an
+  unthrottled counter would put a line between every pair of requests; `-vv` drops the throttle and
+  adds per-request/per-citation lines. Rate-limit waits under 2 s are not announced at `-v`: they
+  read as normal pacing rather than as a hang.
 
 ## Invariants when editing
 
@@ -349,6 +406,10 @@ anywhere**, still). Things worth keeping straight:
 - **No RNG, no ambient clock, no `std`** in the core. Jitter is FNV-1a over a stable seed (id, or
   url+attempt); time only ever comes from the injected `Clock`. `Timestamp` is `i64` ms since epoch.
   Use `hashbrown::HashMap`, `core::error::Error`, `alloc::format!`.
+- **Nothing ambient, including logging.** `log`/`tracing` are rejected not for `no_std` reasons
+  (`tracing-core` would build) but because both are global registries with `Send + Sync` subscribers,
+  against a crate whose whole thesis is that every capability is injected and nothing is `Send`. A
+  host can bridge `Reporter` → `tracing` in ten lines.
 - Host-parses-config principle: the library takes **data**, not file formats. Non-JSON formats reach
   it via `BibliographyFileSource::with_parser` / `from_entries` and `ArxivSource::with_override_dois`.
   Don't add format crates (YAML/TOML/BibTeX) to the core.
@@ -361,6 +422,12 @@ pended"). All std backends are blocking-in-a-future (`UreqFetcher` blocks the th
 sleeps it), so they resolve on first poll. Mocks (`MockFetcher` with a URL→response route table,
 `MemStore`, `FixedClock`, `InstantTimer`) are **deliberately duplicated per test file** rather than
 shared — follow that pattern; copy from `tests/integration.rs` or `tests/arxiv.rs`.
+
+`tests/reporting.rs` adds a `RecordingReporter` that flattens each `Event` to a short stable string.
+It is worth knowing about beyond progress reporting: it is the only way to assert on things the
+public API otherwise hides — that the driver slept once between two chunks, that the retry loop made
+exactly three attempts, that a grace-served failure happened at all. Reach for it when a behavioral
+test would otherwise have to infer timing from side effects.
 
 Tests must not hit the network. Only `examples/resolve.rs` does.
 

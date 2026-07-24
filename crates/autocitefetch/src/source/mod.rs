@@ -34,6 +34,7 @@ use crate::csl::CslValue;
 use crate::env::{Clock, Timer};
 use crate::error::Error;
 use crate::fetch::Fetcher;
+use crate::report::Reporter;
 use crate::BoxFuture;
 
 /// What a source resolved a single requested key into.
@@ -146,6 +147,19 @@ pub struct RetrieveCtx<'a> {
     /// prefixes, this is the only correct way to build a `"prefix:key"` id for a
     /// message about the keys in *this* batch.
     pub prefix: &'a str,
+    /// Where to announce progress. A [`NopReporter`](crate::report::NopReporter)
+    /// unless the host called
+    /// [`with_reporter`](crate::manager::CitationManager::with_reporter).
+    ///
+    /// **A source rarely needs to touch this.** The chunk-level events a
+    /// progress display is built from are emitted by
+    /// [`driver`](crate::driver) around `retrieve_chunk`, so every source —
+    /// including a third-party one — is instrumented without cooperating.
+    /// Reach for it only to announce something source-specific that the driver
+    /// cannot see, and emit *milestones* sparingly:
+    /// [`report`](crate::report::Reporter::report) is synchronous and runs
+    /// inside the retrieval loop.
+    pub reporter: &'a dyn Reporter,
 }
 
 /// A provider of bibliographic information, bound to a citation prefix by the

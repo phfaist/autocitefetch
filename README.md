@@ -6,9 +6,10 @@ Automatic retrieval of bibliographic citations from multiple sources
 
 The core crate is **`#![no_std]`** (with `alloc`) and **executor-agnostic**: all
 I/O — URL retrieval, cache persistence, the wall clock, and delays — is injected
-through traits. The same core runs on a native `std` host or in a browser
-(WASM `fetch()` + IndexedDB + `setTimeout`). It is designed to be paired with a
-document-processing system that emits `\cite{arXiv:1211.1037}`-style commands.
+through traits, and so is progress reporting. The same core runs on a native
+`std` host or in a browser (WASM `fetch()` + IndexedDB + `setTimeout`). It is
+designed to be paired with a document-processing system that emits
+`\cite{arXiv:1211.1037}`-style commands.
 
 ## Workspace layout
 
@@ -27,6 +28,7 @@ crates/
       cache.rs            TTL policy: soft/hard expiry, jitter, freshness
       driver.rs           per-source chunking + rate limiting
       retry.rs            RetryingFetcher: transparent retry/backoff wrapper
+      report.rs           Reporter trait + Event vocabulary, NopReporter, throttle
       fetch.rs            Fetcher trait + Request/Response
       store.rs            CacheStore trait (per-entry KV) + CacheRecord
       filecache.rs        FileCacheStore: single-file JSONL cache over a CacheFs
@@ -35,7 +37,7 @@ crates/
       error.rs            crate Error
     tests/                integration.rs, arxiv.rs, arxiv_dois.rs,
                           bibfile_data.rs, concurrency.rs, retry.rs,
-                          cache_policy.rs, manager_contract.rs
+                          cache_policy.rs, manager_contract.rs, reporting.rs
   autocitefetch-std/      std backends for non-WASM consumers
     src/
       lib.rs              crate root, re-exports
@@ -51,6 +53,7 @@ crates/
       cli.rs              the clap argument surface
       input.rs            citation lists (`prefix:key` per line) → (prefix, key) pairs
       formats.rs          JSON/YAML for --bib files and --arxiv-doi-overrides
+      progress.rs         --verbose rendering: Reporter → stderr lines
 ```
 
 ## Model
@@ -91,6 +94,59 @@ When arXiv finds a DOI, it stores a *pointer* (`Payload::Chained`) to the prefix
 it was configured to chain to (`doi` by default) instead of duplicating
 metadata. The manager's retrieval loop discovers chained targets and fetches
 them; `get()` walks the chain on read.
+
+### Progress reporting
+
+A fifth, **optional** host capability: `CitationManager::with_reporter(Rc<dyn
+Reporter>)` takes a sink that is handed one borrowed `Event` per interesting
+moment. Without it the manager carries a `NopReporter` and every emission is one
+vtable call to an empty body.
+
+```rust,ignore
+let mgr = CitationManager::new(fetcher, store, clock, timer)
+    .with_reporter(Rc::new(MyReporter))
+    .register("doi", DoiSource::new())?;
+```
+
+The trait is one method, `fn report(&self, ev: &Event<'_>)` — **synchronous**,
+`&self`, returning nothing. That is deliberate: an async reporter would turn
+every emission into a new yield point inside the retrieval, backoff and pacing
+loops, so a host callback that awaited could be re-entered while a previous
+report was still pending. A sync method makes that impossible, and the missing
+return value keeps the reporter from steering control flow (cancellation is a
+different feature, with different requirements). Hosts use interior mutability,
+exactly as they already do for `CacheStore`.
+
+`Event` is `#[non_exhaustive]` and every field is borrowed — `&str`s, integers,
+`Duration`s, an `&Error` — so emitting allocates nothing and formatting is the
+host's business. Four things it covers that were previously invisible:
+
+* **Per-source progress**, emitted by the *driver* around `retrieve_chunk`, so a
+  third-party `Source` is instrumented without implementing anything. It is also
+  the only signal that advances *during* a pass: the manager applies a pass's
+  resolutions serially after every source returns, so a bar driven off the
+  per-citation events would jump from 0% straight to 100%.
+* **Every point the core blocks** — rate-limit pacing, retry backoff, cache
+  compaction — as a paired `WaitStarted`/`WaitFinished`, with the duration
+  announced up front where it is known. A 30 s backoff is otherwise silent and
+  reads as a hang. The duration is announced rather than the sleep being chopped
+  into ticks: no extra `Timer` calls, and a rich display renders its own
+  countdown at its own frame rate.
+* **Grace-served failures** — the source was unreachable but a cached copy inside
+  the grace window is still good, so nothing reaches the `RetrieveReport`. This
+  is the one moment stale-while-revalidate does its job, and the event is the
+  only way to see it.
+* **A growing denominator.** `PassFinished { discovered }` reports the chain
+  targets a pass queued: the total is genuinely not knowable up front, since an
+  arXiv batch only reveals its DOI fetches in pass 2.
+
+Because the manager drives up to eight sources concurrently, **events from
+different prefixes interleave**: every event names its subject, there is no
+implicit "current activity", and a reporter's per-source state must be keyed by
+prefix. `ThrottledReporter` is supplied for hosts that want to cap the update
+rate; it drops only *sample* events (`Event::sample_key`), and every `*Finished`
+event carries final counts so a dropped sample can never leave a display stuck
+short of the total.
 
 ### Cache files (std backend)
 
@@ -145,6 +201,7 @@ makes `open()` fail rather than silently dropping the entries it can't read.
 | CSL-JSON model | **Generic JSON value** (`serde_json::Value`) — lossless passthrough of doi.org / bib data; arXiv mapping done by hand. |
 | Cache interface | **Per-entry key-value** `CacheStore` — incremental writes, maps to IndexedDB / embedded KV. |
 | Trait surface | **Separate composable traits** (`Fetcher`, `CacheStore`, `Clock`, `Timer`) assembled on the manager. |
+| Progress reporting | **One synchronous method + a borrowed `#[non_exhaustive]` event enum** (`Reporter`), optional and `Rc`-shared rather than a fifth generic parameter. Async would add yield points to the retrieval loop; named callbacks would make filtering and throttling a per-method chore. |
 
 ### Improvements over the JS/Python reference implementations
 
@@ -188,6 +245,10 @@ makes `open()` fail rather than silently dropping the entries it can't read.
   Here the host names every source at `register` time and tells arXiv which
   prefix to chain to (`chain_dois_to`), so one source type can serve several
   prefixes and no source can dangle a pointer at a name nobody registered.
+- **Progress reporting** — neither reference reports anything; both go silent for
+  the length of a rate-limit gap or a backoff. Here every wait, request, chunk
+  and per-citation outcome is announced through an injected `Reporter`, with no
+  ambient logger and no allocation when nobody is listening.
 - **Host-parses I/O for config** — the library takes overrides as data, and the
   `bib` source's byte→CSL step is a pluggable parser (`with_parser`), so any
   serde format (YAML, TOML, …) works without the `no_std` core depending on it.
@@ -247,7 +308,8 @@ colon so a `manual:` key can contain colons of its own.
 | `--no-arxiv-chaining` | keep arXiv metadata instead of chaining to doi.org |
 | `--manual-format <NAME>` | markup name a `manual:` text is emitted under — `{"_ready_formatted": {"<NAME>": …}}` (default `flm`) |
 | `--cache-dir`, `--cache-name` | where the cache lives (default: `.citations` in the working directory) |
-| `--output`, `--compact`, `--user-agent`, `--verbose` | |
+| `-v`/`-vv` | progress on stderr: `-v` for passes, per-source counters and long waits; `-vv` adds every HTTP request and resolved citation, unthrottled |
+| `--output`, `--compact`, `--user-agent` | |
 
 Exit status is `0` when every citation resolved, `1` when some did not (the
 rest are still written, and each failure is reported on stderr), `2` on a fatal
@@ -271,15 +333,15 @@ while it is in flight — no un-ignoring needed, since they sit under their own
 ## Status
 
 Implemented and tested end-to-end: the manager, routing, chaining, cache/TTL
-policy, the driver, transparent retry/backoff, the single-file JSONL cache, all
-four sources (`arxiv`, `doi`, `manual`, `bib`), concurrent within-pass source
-execution, the `std` backends including a `ureq`-based HTTP `Fetcher` (with
-`file:` support), and the `autocitefetch` command-line tool. The arXiv source
-parses the Atom feed with `xmlparser` (a verified `no_std` crate), decodes XML
-entity references, does version resolution, and chains to DOI. 199 tests pass;
-the core builds for `wasm32-unknown-unknown`; clippy and rustdoc are
-warning-free. CI (`.github/workflows/ci.yml`) enforces all of these on stable
-and on the MSRV (1.86).
+policy, the driver, transparent retry/backoff, progress reporting, the
+single-file JSONL cache, all four sources (`arxiv`, `doi`, `manual`, `bib`),
+concurrent within-pass source execution, the `std` backends including a
+`ureq`-based HTTP `Fetcher` (with `file:` support), and the `autocitefetch`
+command-line tool. The arXiv source parses the Atom feed with `xmlparser` (a
+verified `no_std` crate), decodes XML entity references, does version resolution,
+and chains to DOI. 220 tests pass; the core builds for `wasm32-unknown-unknown`;
+clippy and rustdoc are warning-free. CI (`.github/workflows/ci.yml`) enforces all
+of these on stable and on the MSRV (1.86).
 
 **Not yet implemented:**
 

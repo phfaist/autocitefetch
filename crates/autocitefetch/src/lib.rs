@@ -4,7 +4,8 @@
 //! This crate is `#![no_std]` (with `alloc`) and executor-agnostic: all I/O
 //! — URL retrieval, cache persistence, the wall clock, and delays — is
 //! injected through traits so the same core runs on a native `std` host or in
-//! a browser (WASM `fetch()` + IndexedDB + `setTimeout`).
+//! a browser (WASM `fetch()` + IndexedDB + `setTimeout`). Progress is reported
+//! the same way, through an optional [`report::Reporter`].
 //!
 //! # Model
 //!
@@ -32,6 +33,7 @@ pub mod error;
 pub mod fetch;
 pub mod filecache;
 pub mod manager;
+pub mod report;
 pub mod retry;
 pub mod source;
 pub mod store;
@@ -43,6 +45,7 @@ pub use crate::error::{Error, Result};
 pub use crate::fetch::{FetchError, Fetcher, Method, Request, Response};
 pub use crate::filecache::{CacheFs, CacheGuard, FileCacheStore, FsError};
 pub use crate::manager::{CitationManager, CiteFailure, RetrieveReport};
+pub use crate::report::{Event, NopReporter, Reporter, Resolved, ThrottledReporter, Wait};
 pub use crate::retry::{RetryPolicy, RetryingFetcher};
 pub use crate::source::{Outcome, Resolution, RetrieveCtx, Source};
 pub use crate::store::{CacheRecord, CacheStore, Payload, StoreError};

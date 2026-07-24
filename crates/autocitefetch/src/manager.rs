@@ -1,6 +1,7 @@
 //! [`CitationManager`] — routing, the retrieval driver, and chain resolution.
 
 use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -13,6 +14,7 @@ use crate::driver::drive_source;
 use crate::env::{Clock, Timer, Timestamp};
 use crate::error::{Error, Result};
 use crate::fetch::Fetcher;
+use crate::report::{Event, NopReporter, Reporter, Resolved, Wait};
 use crate::retry::{RetryPolicy, RetryingFetcher};
 use crate::source::{Outcome, Resolution, RetrieveCtx, Source};
 use crate::store::{CacheStore, Payload};
@@ -148,6 +150,14 @@ pub struct CitationManager<F, S, C, T> {
     /// Top-level CSL fields stripped from every item on its way into the store
     /// — see [`CitationManager::with_dropped_csl_fields`]. Empty by default.
     dropped_csl_fields: Vec<String>,
+    /// Where progress is announced — see [`CitationManager::with_reporter`].
+    /// A [`NopReporter`] by default.
+    ///
+    /// Unlike the four backends this is *not* a generic parameter:
+    /// [`RetrieveCtx`] erases the others to `&dyn` anyway, so genericity would
+    /// buy nothing at the point of use, and an `Rc` lets the host share one
+    /// reporter with whatever else it builds.
+    reporter: Rc<dyn Reporter>,
 }
 
 impl<F, S, C, T> CitationManager<F, S, C, T>
@@ -170,7 +180,31 @@ where
             retry_policy: RetryPolicy::default(),
             max_chain_depth: 16,
             dropped_csl_fields: Vec::new(),
+            reporter: Rc::new(NopReporter),
         }
+    }
+
+    /// Announce progress to `reporter`. Builder-style; without it the manager is
+    /// silent and every emission costs one vtable call to an empty body.
+    ///
+    /// ```ignore
+    /// let mgr = CitationManager::new(fetcher, store, clock, timer)
+    ///     .with_reporter(Rc::new(StderrReporter::new()))
+    ///     .register("doi", DoiSource::new())?;
+    /// ```
+    ///
+    /// The reporter sees the whole retrieval: pass planning, per-source chunk
+    /// progress (from [`driver`](crate::driver), so third-party sources are
+    /// covered too), per-citation outcomes, every HTTP request, and every point
+    /// the core blocks — rate-limit pacing, retry backoff, cache compaction.
+    /// It is handed to sources as [`RetrieveCtx::reporter`] and to the
+    /// [`RetryingFetcher`] that wraps the host fetcher.
+    ///
+    /// [`Reporter::report`] is synchronous by design; see the
+    /// [module docs](crate::report) for why that matters here.
+    pub fn with_reporter(mut self, reporter: Rc<dyn Reporter>) -> Self {
+        self.reporter = reporter;
+        self
     }
 
     /// Bind `source` to `prefix`. Builder-style, so registrations compose as
@@ -318,22 +352,43 @@ where
     /// so far are lost) — but the buffered writes are still flushed, so a
     /// file-backed cache is never left with un-folded sidecars.
     pub async fn retrieve(&self, cites: &[(String, String)]) -> Result<RetrieveReport> {
+        self.reporter.report(&Event::RetrieveStarted { cites: cites.len() });
         let mut report = RetrieveReport::default();
         let outcome = self.run_passes(cites, &mut report).await;
         // Durably compact buffered writes *even if* a pass aborted: everything
         // written before the error is still worth keeping.
+        //
+        // Bracketed with the wait events here rather than inside
+        // `FileCacheStore`: `flush` is the only operation that locks, and giving
+        // the store an `Rc<dyn Reporter>` would make it `!Send` — the
+        // concurrency regression tests move stores across threads.
+        self.reporter.report(&Event::WaitStarted {
+            what: Wait::CacheFlush,
+            expected: None,
+        });
         let flushed = self.store.flush().await;
-        outcome?;
+        self.reporter.report(&Event::WaitFinished {
+            what: Wait::CacheFlush,
+        });
+        let considered = outcome?;
         flushed?;
+        self.reporter.report(&Event::RetrieveFinished {
+            considered,
+            failed: report.failures.len(),
+        });
         Ok(report)
     }
 
     /// The worklist loop behind [`CitationManager::retrieve`].
+    ///
+    /// Returns how many distinct citation ids were considered — requested ones
+    /// plus every chain target pulled in — which is the denominator
+    /// [`Event::RetrieveFinished`] reports.
     async fn run_passes(
         &self,
         cites: &[(String, String)],
         report: &mut RetrieveReport,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         // id → the depth and origin (see `WorkItem`) at which it was first
         // reached. Doubles as the dedup set; the depth is what stops an
         // ill-behaved source from making `retrieve` walk an unbounded chain, and
@@ -367,9 +422,12 @@ where
         // so a source's `min_interval` is not reset every pass (the arXiv→DOI
         // chain guarantees at least two passes hit the `doi` source).
         let mut last_start: HashMap<String, Timestamp> = HashMap::new();
+        // 1-based, for `Event::PassStarted`/`PassFinished` only.
+        let mut pass = 0usize;
 
         while !worklist.is_empty() {
             let batch: Vec<WorkItem> = core::mem::take(&mut worklist);
+            pass += 1;
 
             // One clock reading for the whole pass: classifying a large batch
             // against a drifting `now` would make the freshness cutoff depend
@@ -378,6 +436,9 @@ where
 
             // Decide, per citation, what needs fetching this pass.
             let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
+            // Progress bookkeeping only: how many of this batch were served
+            // from a record that did not need refetching.
+            let mut cached = 0usize;
             for WorkItem {
                 prefix,
                 key,
@@ -438,24 +499,28 @@ where
                             // for if that dead target 404s. `store_resolutions`
                             // pushes the *new* target when it stores the pointer.
                             buckets.entry(prefix).or_default().push(key);
-                        } else if let Payload::Chained {
-                            prefix: tp,
-                            key: tk,
-                            ..
-                        } = &rec.payload
-                        {
-                            // A record we are keeping (Fresh, or Stale but the
-                            // draw said serve-as-is): a chained pointer we keep
-                            // must still pull its target in, or a later `get()`
-                            // breaks on the missing link. The target inherits
-                            // this item's origin so a failure on it still points
-                            // back to the same request.
-                            worklist.push(WorkItem {
-                                prefix: tp.clone(),
-                                key: tk.clone(),
-                                depth: depth + 1,
-                                origin,
-                            });
+                        } else {
+                            cached += 1;
+                            if let Payload::Chained {
+                                prefix: tp,
+                                key: tk,
+                                ..
+                            } = &rec.payload
+                            {
+                                // A record we are keeping (Fresh, or Stale but
+                                // the draw said serve-as-is): a chained pointer
+                                // we keep must still pull its target in, or a
+                                // later `get()` breaks on the missing link. The
+                                // target inherits this item's origin so a
+                                // failure on it still points back to the same
+                                // request.
+                                worklist.push(WorkItem {
+                                    prefix: tp.clone(),
+                                    key: tk.clone(),
+                                    depth: depth + 1,
+                                    origin,
+                                });
+                            }
                         }
                     }
                     None => {
@@ -463,6 +528,12 @@ where
                     }
                 }
             }
+
+            self.reporter.report(&Event::PassStarted {
+                pass,
+                cached,
+                to_fetch: buckets.values().map(Vec::len).sum(),
+            });
 
             // Snapshot each source's pacing state before building the futures,
             // so the concurrent phase does not borrow `last_start`.
@@ -493,7 +564,8 @@ where
             // (= `&retrying`) — so retries happen without any source knowing.
             // Both `retrying` and the futures hold only shared borrows of
             // `self`, so they coexist with the interior-mutable store.
-            let retrying = RetryingFetcher::new(&self.fetcher, &self.timer, self.retry_policy);
+            let retrying = RetryingFetcher::new(&self.fetcher, &self.timer, self.retry_policy)
+                .with_reporter(&*self.reporter);
             let source_futures = bucket_list.into_iter().map(|(prefix, keys, last)| {
                 let retrying = &retrying;
                 async move {
@@ -516,6 +588,7 @@ where
                         timer: &self.timer,
                         clock: &self.clock,
                         prefix: &prefix,
+                        reporter: &*self.reporter,
                     };
                     // Keep the keys we asked for: a source that silently omits
                     // one must not leave the citation unstored *and*
@@ -560,9 +633,17 @@ where
                 )
                 .await?;
             }
+
+            // `worklist` was drained into `batch` at the top of the pass, so
+            // whatever is in it now is exactly what this pass discovered — the
+            // number a progress denominator has to grow by.
+            self.reporter.report(&Event::PassFinished {
+                pass,
+                discovered: worklist.len(),
+            });
         }
 
-        Ok(())
+        Ok(seen.len())
     }
 
     async fn store_resolutions(
@@ -617,6 +698,11 @@ where
                         .policy
                         .make_record(Payload::Concrete(csl), now, ttl, &id);
                     self.store.put(&id, record).await?;
+                    self.reporter.report(&Event::CiteResolved {
+                        prefix,
+                        key: &res.key,
+                        how: Resolved::Concrete,
+                    });
                 }
                 Outcome::Chained {
                     prefix: tp,
@@ -653,6 +739,14 @@ where
                         .policy
                         .make_record(payload, now, source.default_ttl(), &id);
                     self.store.put(&id, record).await?;
+                    self.reporter.report(&Event::CiteResolved {
+                        prefix,
+                        key: &res.key,
+                        how: Resolved::Chained {
+                            prefix: &tp,
+                            key: &tk,
+                        },
+                    });
                     // The newly discovered target inherits this item's origin, so
                     // a failure further down the chain still points back to the
                     // original request.
@@ -714,6 +808,15 @@ where
             Some(rec) if self.policy.usable_within_grace(&rec, now) => Some(rec),
             _ => None,
         };
+        // Announced either way: a grace-served failure never reaches the
+        // `RetrieveReport`, so without this the one moment stale-while-
+        // revalidate actually kicks in would be entirely invisible.
+        self.reporter.report(&Event::CiteFailed {
+            prefix,
+            key,
+            err: &err,
+            grace_served: kept.is_some(),
+        });
         match kept {
             // Keeping a chained pointer alive means its target must be present
             // too, otherwise `get()` breaks on the next link. Nothing else
@@ -765,6 +868,13 @@ where
     ) -> Result<()> {
         let id = csl::cite_id(prefix, key);
         self.store.remove(&id).await?;
+        // Never grace-served: `Missing` is authoritative.
+        self.reporter.report(&Event::CiteFailed {
+            prefix,
+            key,
+            err: &err,
+            grace_served: false,
+        });
         sink.report.failures.push(CiteFailure::new(
             prefix,
             key,
@@ -876,7 +986,15 @@ where
             }
         }
         // Durably compact the removals before returning.
-        self.store.flush().await?;
+        self.reporter.report(&Event::WaitStarted {
+            what: Wait::CacheFlush,
+            expected: None,
+        });
+        let flushed = self.store.flush().await;
+        self.reporter.report(&Event::WaitFinished {
+            what: Wait::CacheFlush,
+        });
+        flushed?;
         Ok(removed)
     }
 

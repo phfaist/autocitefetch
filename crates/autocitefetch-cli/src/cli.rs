@@ -164,9 +164,14 @@ pub struct Cli {
     #[arg(long, value_name = "STRING")]
     pub user_agent: Option<String>,
 
-    /// Report progress on stderr.
-    #[arg(short, long)]
-    pub verbose: bool,
+    /// Report progress on stderr. Repeatable.
+    ///
+    /// `-v` reports milestones: each retrieval pass, per-source progress, and
+    /// any wait long enough to look like a hang (rate-limit pacing, retry
+    /// backoff, cache compaction). `-vv` adds one line per HTTP request and per
+    /// resolved citation, and stops throttling the progress counters.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
 }
 
 /// Format name given to [`ManualSource`](autocitefetch::source::ManualSource)
