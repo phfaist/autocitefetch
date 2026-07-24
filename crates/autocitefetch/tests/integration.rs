@@ -291,22 +291,49 @@ fn doi_requests_carry_the_csl_json_accept_header() {
 
 #[test]
 fn doi_non_success_status_is_one_reported_failure() {
-    let fetcher = MockFetcher::new().route("https://doi.org/10.1/missing", 404, "Not Found");
+    // A non-404 non-success status (e.g. a 403 the retrying fetcher does not
+    // retry) is a reachability `Failed`, reported with the status named. A 404
+    // is handled separately — see `doi_404_is_an_authoritative_missing`.
+    let fetcher = MockFetcher::new().route("https://doi.org/10.1/forbidden", 403, "Forbidden");
     let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
         .register(DoiSource::new());
 
-    let cites = vec![("doi".to_string(), "10.1/missing".to_string())];
+    let cites = vec![("doi".to_string(), "10.1/forbidden".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
     assert_eq!(report.failures[0].prefix, "doi");
-    assert_eq!(report.failures[0].key, "10.1/missing");
+    assert_eq!(report.failures[0].key, "10.1/forbidden");
     assert!(
-        report.failures[0].message.contains("404"),
+        report.failures[0].message.contains("403"),
         "message should name the status: {}",
         report.failures[0].message
     );
     // Nothing was cached, so reading it back fails too.
-    assert!(block_on(mgr.get("doi", "10.1/missing")).is_err());
+    assert!(block_on(mgr.get("doi", "10.1/forbidden")).is_err());
+}
+
+/// A doi.org 404 is authoritative "no such DOI" (`Outcome::Missing`), so it is
+/// always reported and nothing is cached — distinct from a 5xx/403 reachability
+/// `Failed`. (That a `Missing` also *removes* a stale grace-window copy is
+/// pinned generically in `manager_contract::missing_is_reported_and_removes_...`.)
+#[test]
+fn doi_404_is_an_authoritative_missing() {
+    let fetcher = MockFetcher::new().route("https://doi.org/10.1/gone", 404, "Not Found");
+    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        .register(DoiSource::new());
+
+    let cites = vec![("doi".to_string(), "10.1/gone".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert_eq!(report.failures[0].key, "10.1/gone");
+    // The message is the authoritative "not found", not a bare status line.
+    assert!(
+        report.failures[0].message.contains("not found"),
+        "a 404 should read as authoritative not-found: {}",
+        report.failures[0].message
+    );
+    // Nothing was cached.
+    assert!(block_on(mgr.get("doi", "10.1/gone")).is_err());
 }
 
 #[test]

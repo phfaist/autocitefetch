@@ -319,9 +319,13 @@ fn resolve_key(
                 let doi = effective_doi(overrides, base, e.doi.as_deref());
                 Resolution::concrete(key, build_csl(e, doi))
             }
+            // The feed loaded and parsed; this exact version simply is not in
+            // it. Authoritatively absent ⇒ `Missing` (report, drop any stale
+            // copy), not `Failed` (a whole-request/transport failure — those
+            // stay `fail_all` above).
             None => {
                 let msg = alloc::format!("no arXiv entry returned for `{key}`");
-                Resolution::failed(key, Error::Source(msg))
+                Resolution::missing(key, Error::Source(msg))
             }
         };
     }
@@ -329,9 +333,10 @@ fn resolve_key(
     // Versionless: select the BEST entry among all returned for this base id.
     let entry = match select_best(entries, base) {
         Some(e) => e,
+        // Absent from a feed that parsed fine ⇒ authoritative `Missing`.
         None => {
             let msg = alloc::format!("no arXiv entry returned for `{key}`");
-            return Resolution::failed(key, Error::Source(msg));
+            return Resolution::missing(key, Error::Source(msg));
         }
     };
 

@@ -64,6 +64,27 @@ impl Fetcher for MockFetcher {
     }
 }
 
+/// A fetcher for one URL whose body the test can swap between calls, modelling
+/// a bibliography file being edited between retrieves.
+struct TogglingFetcher {
+    url: String,
+    body: Rc<RefCell<Vec<u8>>>,
+}
+impl Fetcher for TogglingFetcher {
+    fn fetch(&self, req: Request) -> BoxFuture<'_, Result<Response, FetchError>> {
+        let result = if req.url == self.url {
+            Ok(Response {
+                status: 200,
+                headers: Default::default(),
+                body: self.body.borrow().clone(),
+            })
+        } else {
+            Err(FetchError::Status(404))
+        };
+        Box::pin(async move { result })
+    }
+}
+
 #[derive(Default)]
 struct MemStore {
     map: RefCell<StdMap<String, CacheRecord>>,
@@ -265,6 +286,56 @@ fn a_missing_key_is_reported_with_a_readable_message() {
     // it a whole sentence produced
     // "citation `key `zz` not found in bibliography` not found".
     assert_eq!(failures[0].message, "citation `bib:zz` not found");
+}
+
+/// Review item #5: a key that was present and then *removed* from a
+/// successfully-reloaded bibliography must surface in `failures` on the next
+/// `retrieve` — not be silently grace-served for 14 days. A file that loads
+/// fine but lacks the id is an authoritative `Outcome::Missing`, so the stale
+/// cached copy is also dropped and `get()` then errors rather than returning
+/// the old data.
+#[test]
+fn a_key_removed_from_a_reloaded_file_is_reported_and_stops_serving_old_data() {
+    let url = "https://host.example/refs.json";
+    let body = Rc::new(RefCell::new(
+        br#"[{"id":"k1","title":"First"},{"id":"k2","title":"Second"}]"#.to_vec(),
+    ));
+    let fetcher = TogglingFetcher {
+        url: url.into(),
+        body: body.clone(),
+    };
+    let clock = MovableClock::default();
+    // 10 s TTL ⇒ hard expiry is jittered into [8.5 s, 11.5 s]; the default 14-day
+    // grace still covers t = 100 s, so this exercises the *within-grace* path the
+    // old code silently served.
+    let bib = BibliographyFileSource::new([url.to_string()]).with_ttl(Duration::from_secs(10));
+    let mgr = CitationManager::new(fetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .register(bib);
+
+    let cites = vec![("bib".to_string(), "k1".to_string())];
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert!(report.is_complete(), "first load resolves k1: {:?}", report.failures);
+    assert_eq!(block_on(mgr.get("bib", "k1")).unwrap()["title"], "First");
+
+    // Edit the file so k1 is gone, and wind the clock past the TTL (but well
+    // within grace) so the entry is expired and the file is reloaded.
+    *body.borrow_mut() = br#"[{"id":"k2","title":"Second"}]"#.to_vec();
+    clock.set_secs(100);
+
+    let report = block_on(mgr.retrieve(&cites)).unwrap();
+    assert_eq!(
+        report.failures.len(),
+        1,
+        "a removed key must be reported, not grace-served: {:?}",
+        report.failures
+    );
+    assert_eq!(report.failures[0].key, "k1");
+    assert_eq!(report.failures[0].message, "citation `bib:k1` not found");
+    // The now-known-absent key must stop serving its old cached copy.
+    assert!(
+        block_on(mgr.get("bib", "k1")).is_err(),
+        "the removed key must not keep returning the old data"
+    );
 }
 
 #[test]

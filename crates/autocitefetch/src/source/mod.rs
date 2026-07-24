@@ -41,9 +41,20 @@ pub enum Outcome {
         key: String,
         set_properties: CslValue,
     },
-    /// This key could not be resolved. The manager applies its
-    /// stale-while-revalidate / grace policy before surfacing the error.
+    /// This key could not be resolved because the source was *unreachable* or
+    /// erroring (transport failure, 5xx/timeout, a whole file that would not
+    /// load, a malformed feed). The manager applies its stale-while-revalidate
+    /// / grace policy: within the grace window a still-cached copy keeps being
+    /// served and the error is **not** reported — "try again later".
     Failed(Error),
+    /// The source is reachable and definitively has **no such key**: a file
+    /// that loaded fine but does not contain the id, an id absent from a 200
+    /// feed, a doi.org 404. This is the *opposite* of [`Outcome::Failed`] — it
+    /// is authoritative, not transient. The manager therefore **always** reports
+    /// it, never consults the grace window, and drops any stale cached copy so
+    /// [`get`](crate::manager::CitationManager::get) stops serving now-known-wrong
+    /// data.
+    Missing(Error),
 }
 
 /// The result of resolving one requested key.
@@ -82,12 +93,24 @@ impl Resolution {
         }
     }
 
-    /// Could not be resolved. Still counts as "one `Resolution` per requested
-    /// key" — see [`Source::retrieve_chunk`].
+    /// Could not be resolved because the source was unreachable / erroring
+    /// (transport, 5xx, an unloadable file). Grace-served if a cached copy is
+    /// still within its window — see [`Outcome::Failed`]. Still counts as "one
+    /// `Resolution` per requested key" — see [`Source::retrieve_chunk`].
     pub fn failed(key: impl Into<String>, err: Error) -> Self {
         Resolution {
             key: key.into(),
             outcome: Outcome::Failed(err),
+        }
+    }
+
+    /// The source is reachable and authoritatively has no such key (see
+    /// [`Outcome::Missing`]). Always reported, never grace-served. Mirrors
+    /// [`Resolution::failed`]; still one `Resolution` per requested key.
+    pub fn missing(key: impl Into<String>, err: Error) -> Self {
+        Resolution {
+            key: key.into(),
+            outcome: Outcome::Missing(err),
         }
     }
 }
@@ -141,11 +164,21 @@ pub trait Source {
     ///
     /// **Return exactly one [`Resolution`] per requested key**, with
     /// `Resolution::key` equal to the requested key — the manager matches
-    /// results to requests by `res.key`, not by position. Use
-    /// [`Outcome::Failed`] (via [`Resolution::failed`]) for a key you could
-    /// not resolve, including a plain miss; a key you omit is silently
-    /// *neither stored nor reported*, so the caller sees no failure and no
-    /// entry. Extra resolutions for keys that were not requested are ignored.
+    /// results to requests by `res.key`, not by position. For a key you could
+    /// not resolve, choose the outcome by *why*:
+    ///
+    /// * [`Outcome::Failed`] (via [`Resolution::failed`]) when the source was
+    ///   **unreachable or erroring** (transport failure, 5xx, an unloadable
+    ///   file) — the manager may keep serving a still-cached copy within its
+    ///   grace window and suppress the error ("try again later").
+    /// * [`Outcome::Missing`] (via [`Resolution::missing`]) when the source is
+    ///   **reachable and authoritatively has no such key** (the id is absent
+    ///   from a file that loaded fine, or from a successful API response) — the
+    ///   manager always reports it and drops any stale cached copy.
+    ///
+    /// A key you omit is silently *neither stored nor reported*, so the caller
+    /// sees no failure and no entry. Extra resolutions for keys that were not
+    /// requested are ignored.
     ///
     /// Do **not** implement retries here: the `ctx.fetcher` handed to a source
     /// is already wrapped in a

@@ -91,7 +91,13 @@ manager does not consume it; chain discovery is dynamic via the worklist.
 
 Two-tier expiry per record: `stale_after` (soft, `stale_percent` = 80% of TTL) and `expires` (hard),
 plus a `grace` window (14 days) during which a hard-expired entry is still served **if the source is
-currently unreachable** (stale-while-revalidate — see `store_resolutions`' `Outcome::Failed` arm).
+currently unreachable** (stale-while-revalidate — see `store_resolutions`' `Outcome::Failed` arm →
+`note_failure`). Grace applies **only to `Outcome::Failed`** (transport/5xx/unloadable-file — "try
+again later"). An `Outcome::Missing` — a *reachable* source that authoritatively has no such key (an
+id absent from a file that loaded fine or from a 200 API response, a doi.org 404) — is the opposite:
+`note_missing` **always** reports it, never consults grace, and **removes** the stale cached entry so
+`get()` stops serving now-known-wrong data (a removed entry may be some other citation's chain
+target, whose `get()` then fails on the dead link — correct, the target really no longer resolves).
 Hard TTL gets ±15% deterministic jitter seeded by FNV-1a over the entry id, so a batch fetched
 together doesn't expire together.
 
@@ -158,9 +164,11 @@ rewriting turned recoverable corruption into permanent loss).
 
 - **All I/O goes through `Fetcher`** — including local file reads (bib files, the arXiv DOI-override
   JSON). Sources must never touch the filesystem or network directly.
-- **`retrieve_chunk` must return exactly one `Resolution` per requested key**, using
-  `Outcome::Failed` for misses. The manager matches by `res.key`; an omitted key is silently neither
-  stored nor reported.
+- **`retrieve_chunk` must return exactly one `Resolution` per requested key**. Pick the miss outcome
+  by *why*: `Outcome::Failed` when the source was unreachable/erroring (grace-served if cached),
+  `Outcome::Missing` when it is reachable and authoritatively lacks the key (always reported, drops
+  the stale copy). The manager matches by `res.key`; an omitted key is silently neither stored nor
+  reported.
 - **No RNG, no ambient clock, no `std`** in the core. Jitter is FNV-1a over a stable seed (id, or
   url+attempt); time only ever comes from the injected `Clock`. `Timestamp` is `i64` ms since epoch.
   Use `hashbrown::HashMap`, `core::error::Error`, `alloc::format!`.

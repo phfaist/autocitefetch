@@ -408,6 +408,9 @@ where
                     self.note_failure(prefix, &res.key, err, now, depth, sink)
                         .await?;
                 }
+                Outcome::Missing(err) => {
+                    self.note_missing(prefix, &res.key, err, sink).await?;
+                }
             }
         }
 
@@ -469,6 +472,34 @@ where
                 message: err.to_string(),
             }),
         }
+        Ok(())
+    }
+
+    /// Record an *authoritative* "no such key" from a reachable source.
+    ///
+    /// Unlike [`note_failure`](Self::note_failure), this **always** reports and
+    /// **never** consults the grace window: a `Missing` result means the source
+    /// answered and the id is genuinely gone, so a still-cached copy is now
+    /// known to be wrong. That stale entry is therefore also removed, so a later
+    /// [`get`](Self::get) errors instead of serving now-invalid data — rather
+    /// than the entry lingering (and being grace-served / re-reported) for the
+    /// whole 14-day window. The removed entry may be a chain target of some
+    /// other citation; that citation's `get` then fails on the dead link, which
+    /// is correct — the target really no longer resolves.
+    async fn note_missing(
+        &self,
+        prefix: &str,
+        key: &str,
+        err: Error,
+        sink: &mut PassSink<'_>,
+    ) -> Result<()> {
+        let id = csl::cite_id(prefix, key);
+        self.store.remove(&id).await?;
+        sink.report.failures.push(CiteFailure {
+            prefix: prefix.to_string(),
+            key: key.to_string(),
+            message: err.to_string(),
+        });
         Ok(())
     }
 

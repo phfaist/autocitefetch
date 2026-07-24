@@ -133,8 +133,10 @@ enum Answer {
     ChainToSuccessor,
     /// Chain every key to itself.
     SelfChain,
-    /// Fail every key.
+    /// Fail every key (reachability failure → grace-served if cached).
     Fail,
+    /// Report every key as authoritatively absent (reachable, no such key).
+    Missing,
     /// Resolve concretely, but with a JSON array instead of an object.
     NonObject,
     /// Answer only the key `"ok"`, silently dropping every other key.
@@ -246,6 +248,10 @@ impl Source for ScriptSource {
                     }),
                     Answer::Fail => {
                         out.push(Resolution::failed(k, Error::Source("source down".into())))
+                    }
+                    Answer::Missing => {
+                        let id = format!("{}:{k}", self.prefix);
+                        out.push(Resolution::missing(k, Error::NotFound(id)))
                     }
                     Answer::NonObject => out.push(Resolution::concrete(
                         k,
@@ -561,6 +567,68 @@ fn a_set_properties_id_cannot_override_the_requested_id() {
     assert_eq!(item["id"], "a:y", "the requested id must win over set_properties.id");
     assert_eq!(item["note"], "n", "other set_properties still apply");
     assert_eq!(item["title"], "T", "target field with no override is kept");
+}
+
+// --- authoritative missing vs. reachability failure ------------------------
+
+/// The `Missing` / `Failed` distinction, pinned side by side over an identical
+/// hard-expired-but-within-grace cached copy.
+///
+/// * `Outcome::Failed` (source unreachable) is grace-served: no failure is
+///   reported and the stale copy keeps being served (stale-while-revalidate).
+/// * `Outcome::Missing` (source reachable, key authoritatively gone) is
+///   **always** reported *and* removes the stale copy, so a later `get()` errors
+///   instead of serving now-known-wrong data for the whole grace window.
+#[test]
+fn missing_is_reported_and_removes_stale_while_failed_is_grace_served() {
+    // A cached concrete copy, hard-expired at t=1000 but well within the
+    // default 14-day grace at the t=30_000 we read at.
+    let seed = |store: &MemStore| {
+        store.seed(
+            "s:k",
+            Payload::Concrete(serde_json::json!({"id": "s:k", "title": "OLD"})),
+            0,
+            1000,
+        );
+    };
+
+    // Failed → grace-served, not reported, old data still served.
+    let clock = MovableClock::default();
+    clock.advance(30_000);
+    let store = MemStore::default();
+    seed(&store);
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
+        .register(ScriptSource::new("s", Answer::Fail, &clock));
+    let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
+    assert!(
+        report.is_complete(),
+        "a within-grace Failed must not be reported: {:?}",
+        report.failures
+    );
+    assert_eq!(
+        block_on(mgr.get("s", "k")).unwrap()["title"],
+        "OLD",
+        "the stale copy must still be served on a reachability failure"
+    );
+
+    // Missing → reported even within grace, and the stale copy is removed.
+    let clock = MovableClock::default();
+    clock.advance(30_000);
+    let store = MemStore::default();
+    seed(&store);
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
+        .register(ScriptSource::new("s", Answer::Missing, &clock));
+    let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
+    assert_eq!(
+        report.failures.len(),
+        1,
+        "an authoritative Missing must be reported even within grace"
+    );
+    assert_eq!(report.failures[0].key, "k");
+    assert!(
+        block_on(mgr.get("s", "k")).is_err(),
+        "the now-known-wrong stale copy must be removed, not served"
+    );
 }
 
 // --- chunking and rate limiting --------------------------------------------

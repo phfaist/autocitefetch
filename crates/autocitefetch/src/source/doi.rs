@@ -92,6 +92,14 @@ async fn resolve_one(doi: &str, ctx: &RetrieveCtx<'_>) -> Resolution {
             ),
             Err(e) => Resolution::failed(doi, Error::Parse(alloc::format!("{e}"))),
         },
+        // A 404 is doi.org's authoritative "no such DOI": reachable, definitive,
+        // not "try again". Report it and drop any stale copy (`Missing`) rather
+        // than grace-serving now-wrong metadata. Every other non-2xx (and any
+        // 5xx/timeout the retrying fetcher already gave up on) is treated as a
+        // transient reachability failure (`Failed`), grace-served if cached.
+        Ok(resp) if resp.status == 404 => {
+            Resolution::missing(doi, Error::NotFound(crate::csl::cite_id("doi", doi)))
+        }
         Ok(resp) => Resolution::failed(
             doi,
             Error::Source(alloc::format!("doi.org returned status {}", resp.status)),
