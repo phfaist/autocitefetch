@@ -1,60 +1,31 @@
-# autocitefetch
+# Autocitefetch
 
 Automatic retrieval of bibliographic citations from multiple sources
 (arXiv, doi.org, local bibliography files, manual entries, …) into a canonical
-**CSL-JSON** representation.
+CSL-JSON representation.
 
-The core crate is **`#![no_std]`** (with `alloc`) and **executor-agnostic**: all
-I/O — URL retrieval, cache persistence, the wall clock, and delays — is injected
-through traits, and so is progress reporting. The same core runs on a native
-`std` host or in a browser (WASM `fetch()` + IndexedDB + `setTimeout`). It is
-designed to be paired with a document-processing system that emits
-`\cite{arXiv:1211.1037}`-style commands.
+**Experimental development status:** This crate is still expermental and under active development; you can expect its API to change.
 
-## Workspace layout
 
-```
-crates/
-  autocitefetch/          core library — #![no_std] + alloc
-    src/
-      lib.rs              crate root, re-exports, BoxFuture
-      manager.rs          CitationManager: routing, retrieval loop, chaining, get()
-      source/             the Source trait + built-in sources
-        mod.rs            Source, Outcome, Resolution, RetrieveCtx
-        arxiv.rs          arXiv Atom API (xmlparser), version resolution, DOI overrides
-        doi.rs            doi.org content negotiation
-        manual.rs         key-is-the-text escape hatch
-        bibfile.rs        bibliography files (pluggable parser; JSON default)
-      cache.rs            TTL policy: soft/hard expiry, jitter, freshness
-      driver.rs           per-source chunking + rate limiting
-      retry.rs            RetryingFetcher: transparent retry/backoff wrapper
-      report.rs           Reporter trait + Event vocabulary, NopReporter, throttle
-      fetch.rs            Fetcher trait + Request/Response
-      store.rs            CacheStore trait (per-entry KV) + CacheRecord
-      filecache.rs        FileCacheStore: single-file JSONL cache over a CacheFs
-      env.rs              Clock + Timer traits, Timestamp
-      csl.rs              CSL-JSON helpers (id, merge, field lookup)
-      error.rs            crate Error
-    tests/                integration.rs, arxiv.rs, arxiv_dois.rs,
-                          bibfile_data.rs, concurrency.rs, retry.rs,
-                          cache_policy.rs, manager_contract.rs, reporting.rs
-  autocitefetch-std/      std backends for non-WASM consumers
-    src/
-      lib.rs              crate root, re-exports
-      clock.rs            SystemClock
-      timer.rs            BlockingTimer (thread::sleep)
-      store.rs            StdCacheFs + SingleFileCacheStore (citations.jsonl)
-      fetcher.rs          UreqFetcher (blocking HTTP + file:) — `http` feature
-    tests/                bibfile.rs, filecache_std.rs
-    examples/resolve.rs   end-to-end demo (doi + manual + bib)
-  autocitefetch-cli/      the `autocitefetch` command-line tool
-    src/
-      main.rs             wiring: flags → sources → retrieve/get → CSL-JSON array
-      cli.rs              the clap argument surface
-      input.rs            citation lists (`prefix:key` per line) → (prefix, key) pairs
-      formats.rs          JSON/YAML for --bib files and --arxiv-doi-overrides
-      progress.rs         --verbose rendering: Reporter → stderr lines
-```
+## Library structure
+
+The core crate is `no_std` + `alloc` and all environment-related actions (I/O,
+URL retrieval, cache persistence, the wall clock, and delays) are injected
+through traits. It is designed to be paired with a document-processing system
+that emits `\cite{arXiv:1211.1037}`-style commands (see
+[FLM](https://github.com/phfaist/flm) and
+[`flm-citations`](https://github.com/phfaist/flm-citations)).
+
+**Components:**
+
+- `crates/autocitefetch` — the core library (`no_std` + `alloc`).
+
+- `crates/autocitefetch-std` — simple trait implementations for a standard `std`
+  environment (clock, timer, filesystem cache, blocking HTTP fetcher).
+
+- `crates/autocitefetch-cli` — a simple command-line interface to the library;
+  convert a list of `prefix:key` citation keys into CSL-JSON output.
+
 
 ## Model
 
@@ -69,190 +40,34 @@ selects a [`Source`]. Retrieval is two-phase:
    following any **chaining** pointers (e.g. arXiv → DOI) and merging their
    `set_properties`, rewriting `id` back to the requested one.
 
-### Prefixes are host-chosen bindings
 
-A `Source` declares **no prefix of its own**. `(prefix, source)` is a binding the
-manager holds, created by `register(prefix, source)`, so the host owns the
-citation vocabulary entirely: register `DoiSource` as `dx`, run two
-`BibliographyFileSource`s over different files as `bib` and `theses`, or shadow a
-built-in by re-registering its prefix with your own source. The prefix has to be
-non-empty and `':'`-free (ids are `prefix:key`, split on the first colon), which
-is the only thing `register` rejects.
+### Prefixes and sources
 
-Two consequences for source authors:
+The manager holds a list of `(prefix, source)` pairs, created by
+`manager.register(prefix, source)`.  Upon encountering a citation with a given
+prefix, it queries the corresponding citaiton source.
 
-* A source that needs the prefix it is *currently* answering for — to build an
-  id for an error message, say — reads `ctx.prefix`, never a constant.
-* A source that *points at* another one takes the target prefix as
-  configuration. `ArxivSource::chain_dois_to(Some("doi"))` is the built-in
-  example: `Some(prefix)` names whatever the host registered its DOI source
-  under, and `None` switches chaining off so arXiv metadata is kept as-is.
+The prefix is a non-empty string that may not contain the character `':'`.
+
 
 ### Chaining
 
-When arXiv finds a DOI, it stores a *pointer* (`Payload::Chained`) to the prefix
-it was configured to chain to (`doi` by default) instead of duplicating
-metadata. The manager's retrieval loop discovers chained targets and fetches
-them; `get()` walks the chain on read.
+Some arXiv entries have a corresponding "Related DOI", meaning that the paper
+preprint was published in some publication venue.  When *autocitefetch*
+retrieves such an entry from the arXiv with a related DOI, it stores a *pointer*
+to the `doi` prefix so that the DOI source resolver can download the full
+citation entry of the published version of the preprint (via
+`Payload::Chained`).  (This behavior is fully configurable, including a
+different prefix to use instead of `doi`.)
+
+The manager's retrieval loop discovers chained targets and fetches them.
+
 
 ### Progress reporting
 
-A fifth, **optional** host capability: `CitationManager::with_reporter(Rc<dyn
-Reporter>)` takes a sink that is handed one borrowed `Event` per interesting
-moment. Without it the manager carries a `NopReporter` and every emission is one
-vtable call to an empty body.
+Callers can be informed of progress of the citation fetching by registering a
+*reporter*; see `CitationManager::with_reporter(Rc<dyn Reporter>)`.
 
-```rust,ignore
-let mgr = CitationManager::new(fetcher, store, clock, timer)
-    .with_reporter(Rc::new(MyReporter))
-    .register("doi", DoiSource::new())?;
-```
-
-The trait is one method, `fn report(&self, ev: &Event<'_>)` — **synchronous**,
-`&self`, returning nothing. That is deliberate: an async reporter would turn
-every emission into a new yield point inside the retrieval, backoff and pacing
-loops, so a host callback that awaited could be re-entered while a previous
-report was still pending. A sync method makes that impossible, and the missing
-return value keeps the reporter from steering control flow (cancellation is a
-different feature, with different requirements). Hosts use interior mutability,
-exactly as they already do for `CacheStore`.
-
-`Event` is `#[non_exhaustive]` and every field is borrowed — `&str`s, integers,
-`Duration`s, an `&Error` — so emitting allocates nothing and formatting is the
-host's business. Four things it covers that were previously invisible:
-
-* **Per-source progress**, emitted by the *driver* around `retrieve_chunk`, so a
-  third-party `Source` is instrumented without implementing anything. It is also
-  the only signal that advances *during* a pass: the manager applies a pass's
-  resolutions serially after every source returns, so a bar driven off the
-  per-citation events would jump from 0% straight to 100%.
-* **Every point the core blocks** — rate-limit pacing, retry backoff, cache
-  compaction — as a paired `WaitStarted`/`WaitFinished`, with the duration
-  announced up front where it is known. A 30 s backoff is otherwise silent and
-  reads as a hang. The duration is announced rather than the sleep being chopped
-  into ticks: no extra `Timer` calls, and a rich display renders its own
-  countdown at its own frame rate.
-* **Grace-served failures** — the source was unreachable but a cached copy inside
-  the grace window is still good, so nothing reaches the `RetrieveReport`. This
-  is the one moment stale-while-revalidate does its job, and the event is the
-  only way to see it.
-* **A growing denominator.** `PassFinished { discovered }` reports the chain
-  targets a pass queued: the total is genuinely not knowable up front, since an
-  arXiv batch only reveals its DOI fetches in pass 2.
-
-Because the manager drives up to eight sources concurrently, **events from
-different prefixes interleave**: every event names its subject, there is no
-implicit "current activity", and a reporter's per-source state must be keyed by
-prefix. `ThrottledReporter` is supplied for hosts that want to cap the update
-rate; it drops only *sample* events (`Event::sample_key`), and every `*Finished`
-event carries final counts so a dropped sample can never leave a display stuck
-short of the total.
-
-### Cache files (std backend)
-
-`SingleFileCacheStore` keeps three kinds of file in a directory of your choosing:
-
-* `citations.jsonl` — the cache itself: a header line, then one sorted
-  `{"id":…,"rec":…}` line per entry. One entry per line keeps git diffs minimal;
-  this is the only file worth committing.
-* `._citations.<writer>.log` — per-writer append logs. Writes go here lock-free
-  and are folded into the main file by `flush()` (called at the end of
-  `retrieve`/`prune`), which is the only operation that takes the lock or
-  rewrites the whole file. `flush()` folds *every* sidecar it finds but only
-  deletes **its own** and any left by a **crashed** peer — never a live peer's,
-  since that would race its lock-free appends and destroy acknowledged writes.
-* `._citations.<writer>.log.lock` — a per-writer **liveness lock**, held for
-  exactly as long as that writer's sidecar exists (taken just before the first
-  append, given back by the flush that folds the sidecar away). `flush()` reaps a
-  peer's sidecar only when it can take that peer's lock (the OS frees it when the
-  owner process crashes); a held lock means the owner is alive, so the sidecar is
-  folded read-only and left in place. The same probe sweeps up companions whose
-  `.log` is already gone, which is what a crash between the two unlinks strands.
-* `._citations.lock` — the compaction lockfile, held only for the duration of a
-  `flush()`.
-* `._citations.jsonl.tmp` — the staging file for the atomic replace.
-
-Only the main file wears the bare base name; **every throwaway file carries the
-`._<base>` prefix**, so it is hidden and one rule ignores the lot:
-
-```gitignore
-._citations*
-```
-
-Those throwaway files are also **transient**: each is unlinked by the writer that
-created it — the two lock files while their lock is still held, so a peer either
-finds the file locked or does not find it at all — so a run that finishes leaves
-`citations.jsonl` alone in the directory. (Lock files used to be kept forever,
-which littered one stray `._citations.<writer>.log.lock` per run plus a permanent
-`._citations.lock` in what, for the CLI, is the user's working directory.) Keep
-the ignore rule anyway: the files exist while a run is in flight, and a crash can
-strand one until the next run sweeps it up.
-
-The store *reads* every `._citations.*.log` in this directory, so don't park
-unrelated files there under that name. A main file it cannot parse — a corrupt
-line, an unresolved merge conflict, or a `{"schema":N}` newer than this build —
-makes `open()` fail rather than silently dropping the entries it can't read.
-
-## Design decisions
-
-| Decision | Choice |
-|---|---|
-| Execution model | **Async, executor-agnostic** (`core::future::Future`; boxed futures keep traits object-safe). |
-| CSL-JSON model | **Generic JSON value** (`serde_json::Value`) — lossless passthrough of doi.org / bib data; arXiv mapping done by hand. |
-| Cache interface | **Per-entry key-value** `CacheStore` — incremental writes, maps to IndexedDB / embedded KV. |
-| Trait surface | **Separate composable traits** (`Fetcher`, `CacheStore`, `Clock`, `Timer`) assembled on the manager. |
-| Progress reporting | **One synchronous method + a borrowed `#[non_exhaustive]` event enum** (`Reporter`), optional and `Rc`-shared rather than a fifth generic parameter. Async would add yield points to the retrieval loop; named callbacks would make filtering and throttling a per-method chore. |
-
-### Improvements over the JS/Python reference implementations
-
-- **Stale-while-revalidate**: soft + hard expiry with a grace window — mildly
-  outdated entries are still served when a source is unreachable.
-- **Probabilistic stale revalidation** — in the soft-stale window an entry is
-  refetched only with a probability that ramps from ~0 at the soft expiry to ~1
-  at the hard expiry (a deterministic FNV-1a draw over `(id, now)`, no RNG). The
-  soft tier thus does real work: the effective TTL is close to the full nominal
-  TTL instead of `stale_percent`% of it, and revalidation is spread out.
-- **TTL jitter** (deterministic, seeded by entry id) — avoids a thundering herd
-  when many entries expire together.
-- **Per-citation error tolerance** — failures are reported, not fatal. The
-  manager also enforces the source contract: a key a source silently omits (or
-  answers twice) is reported rather than vanishing from both cache and report.
-- **Bounded chains** — `max_chain_depth` (default 16, configurable) bounds
-  `retrieve` as well as `get`, so a cyclic or runaway chain cannot fan out.
-- **Start→start rate limiting** — `min_interval` is measured request-start to
-  request-start and the timestamp is carried *across* retrieval passes, so the
-  arXiv→DOI chain's second pass cannot hit doi.org with zero spacing.
-- **Automatic retry/backoff** — a transparent `RetryingFetcher` retries
-  transport errors and retryable statuses (429/5xx), honors `Retry-After`, and
-  backs off with deterministic jitter — applied to every source, no source code
-  changed. Configurable via `RetryPolicy`.
-- **Uniform I/O** — every source, including arXiv, goes through the one
-  `Fetcher`; rate-limit delays are actually awaited (the JS `sleep` no-op and
-  Python header-drop bugs are not reproduced).
-- **Incremental, committable persistence** — the `CacheStore` interface is
-  per-entry, so nothing rewrites the whole cache on every store. The bundled file
-  backend goes further: lock-free per-writer append logs, compacted under a lock
-  into one sorted, git-committable `citations.jsonl` (see above).
-- **Careful arXiv version resolution** — groups returned entries by base id and
-  prefers a versionless entry, else the highest version; explicitly-versioned
-  requests stay concrete (fixes the Python reference, which silently drops them).
-- **arXiv DOI overrides** — supplied as *data* (`with_override_dois`): `Some(doi)`
-  injects/replaces, `None` *suppresses* (keep arXiv metadata, don't chain) — a
-  capability the references lack. A JSON file convenience is also provided; other
-  formats are parsed host-side and passed as data.
-- **Prefixes are not baked into source types** — both references tie a source
-  class to one hard-coded prefix (and hard-code `'doi'` as arXiv's chain target).
-  Here the host names every source at `register` time and tells arXiv which
-  prefix to chain to (`chain_dois_to`), so one source type can serve several
-  prefixes and no source can dangle a pointer at a name nobody registered.
-- **Progress reporting** — neither reference reports anything; both go silent for
-  the length of a rate-limit gap or a backoff. Here every wait, request, chunk
-  and per-citation outcome is announced through an injected `Reporter`, with no
-  ambient logger and no allocation when nobody is listening.
-- **Host-parses I/O for config** — the library takes overrides as data, and the
-  `bib` source's byte→CSL step is a pluggable parser (`with_parser`), so any
-  serde format (YAML, TOML, …) works without the `no_std` core depending on it.
-  `BibliographyFileSource::from_entries` skips loading entirely.
 
 ## Usage sketch (std)
 
@@ -285,10 +100,12 @@ async runtime or in a browser, implement the trait yourself with
 a blocking driver (`pollster::block_on`, or the `Waker::noop()` poll loop the
 example and tests use).
 
+
 ## Command-line tool
 
-`autocitefetch-cli` builds an `autocitefetch` binary that reads a citation list
-— one `prefix:key` per line — and writes the resolved CSL-JSON as a JSON array:
+The `autocitefetch` command-line tool (`autocitefetch-cli` crate) reads a
+citation list and writes the resolved CSL-JSON as a JSON array. The input is
+read as one `prefix:key` string per line.  Usage:
 
 ```sh
 $ printf 'arxiv:1211.1037\ndoi:10.1103/PhysRev.47.777\n' | autocitefetch
@@ -296,62 +113,7 @@ $ autocitefetch cites.txt --bib refs.yaml -o bibliography.json
 $ autocitefetch --cite bib:knuth1984 --bib refs.yaml --enable bib
 ```
 
-The list may also come from `FILE` arguments or repeated `--cite` options;
-blank lines and `#` comments are skipped, and a line is split at its *first*
-colon so a `manual:` key can contain colons of its own.
-
-| Flag | |
-|---|---|
-| `--enable`/`--disable <SOURCE>` | narrow the registered sources (`arxiv`, `doi`, `bib`, `manual`); default is all four |
-| `--bib <FILE>`, `--bib-format` | bibliography files or URLs for the `bib` source — **JSON or YAML**, auto-detected |
-| `--arxiv-doi-overrides <FILE>` | JSON/YAML map of arXiv id → DOI; a `null` value suppresses the DOI |
-| `--no-arxiv-chaining` | keep arXiv metadata instead of chaining to doi.org |
-| `--manual-format <NAME>` | markup name a `manual:` text is emitted under — `{"_ready_formatted": {"<NAME>": …}}` (default `flm`) |
-| `--cache-dir`, `--cache-name` | where the cache lives (default: `.citations` in the working directory) |
-| `-v`/`-vv` | progress on stderr: `-v` for passes, per-source counters and long waits; `-vv` adds every HTTP request and resolved citation, unthrottled |
-| `--output`, `--compact`, `--user-agent` | |
-
-Exit status is `0` when every citation resolved, `1` when some did not (the
-rest are still written, and each failure is reported on stderr), `2` on a fatal
-error. YAML support lives entirely in this crate — the `no_std` core stays free
-of format crates, so the CLI parses `--bib` files through
-[`BibliographyFileSource::with_parser`] and hands arXiv overrides over as data.
-
-The cache is the `SingleFileCacheStore` described above, renamed to a dotted
-base so the whole family hides in the user's working directory. A finished run
-leaves `.citations.jsonl` and nothing else; commit it if you want the
-bibliography reproducible offline, and ignore the throwaway files a run creates
-while it is in flight — no un-ignoring needed, since they sit under their own
-`._` prefix:
-
-```gitignore
-._.citations*
-```
-
-[`BibliographyFileSource::with_parser`]: crates/autocitefetch/src/source/bibfile.rs
-
-## Status
-
-Implemented and tested end-to-end: the manager, routing, chaining, cache/TTL
-policy, the driver, transparent retry/backoff, progress reporting, the
-single-file JSONL cache, all four sources (`arxiv`, `doi`, `manual`, `bib`),
-concurrent within-pass source execution, the `std` backends including a
-`ureq`-based HTTP `Fetcher` (with `file:` support), and the `autocitefetch`
-command-line tool. The arXiv source parses the Atom feed with `xmlparser` (a
-verified `no_std` crate), decodes XML entity references, does version resolution,
-and chains to DOI. 220 tests pass; the core builds for `wasm32-unknown-unknown`;
-clippy and rustdoc are warning-free. CI (`.github/workflows/ci.yml`) enforces all
-of these on stable and on the MSRV (1.86).
-
-**Not yet implemented:**
-
-- A dedicated **WASM backend crate** (browser `fetch()` + IndexedDB + `setTimeout`
-  impls of the four traits). The core already compiles for wasm32.
-- **YAML in the library** — the CLI reads YAML bibliographies and override maps,
-  but it does so as a host, via `with_parser`. JSON stays the core's only
-  built-in format (YAML/TOML/… work the same way for any other host).
-- An async-runtime `Fetcher`/`Timer` (the bundled std ones are blocking, fine for
-  CLI/batch; on tokio, impl the traits with `reqwest` / `tokio::time::sleep`).
+Run `autocitefetch --help` for information about options.
 
 ## Building
 
@@ -366,4 +128,23 @@ cargo install --path crates/autocitefetch-cli                  # the `autocitefe
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
+
+The Unicode-to-LaTeX conversion table of `flm-latexencode` derives from
+[pylatexenc](https://github.com/phfaist/pylatexenc) and, through it, from
+[latexcodec](https://github.com/mcmtroffaes/latexcodec), both under the MIT
+license. Their copyright and permission notices are reproduced in full at the
+head of `flm-latexencode/src/tables.rs`. There is no separate third-party
+notices file.
+

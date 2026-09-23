@@ -1,13 +1,24 @@
 //! Progress reporting: the [`Reporter`] trait and the [`Event`]s the core emits.
 //!
-//! This is the fifth host capability, and the only *optional* one — a manager
-//! without a reporter behaves exactly as before. Unlike [`Fetcher`], [`Clock`],
-//! [`Timer`] and [`CacheStore`] it is not a generic parameter of
-//! [`CitationManager`](crate::manager::CitationManager) but an
-//! `Rc<dyn Reporter>` field: [`RetrieveCtx`](crate::source::RetrieveCtx) already
-//! erases the other backends to `&dyn`, so genericity would be erased one level
-//! down anyway, and an `Rc` lets one reporter be shared with anything else the
-//! host builds.
+//! Optional host capability for obtaining progress information while citations
+//! are being downloaded.  A manager without a reporter behaves exactly as
+//! before. Unlike [`Fetcher`], [`Clock`], [`Timer`] and [`CacheStore`] it is
+//! not a generic parameter of
+//! [`CitationManager`](crate::manager::CitationManager) but an `Rc<dyn
+//! Reporter>` field: [`RetrieveCtx`](crate::source::RetrieveCtx) already erases
+//! the other backends to `&dyn`, so genericity would be erased one level down
+//! anyway, and an `Rc` lets one reporter be shared with anything else the host
+//! builds.
+//!
+//! Example:
+//! 
+//! ```rust,ignore
+//! let mgr = CitationManager::new(fetcher, store, clock, timer)
+//!     .with_reporter(Rc::new(MyReporter))
+//!     .register("doi", DoiSource::new())?;
+//! ```
+//!
+//!
 //!
 //! # Why the trait is synchronous
 //!
