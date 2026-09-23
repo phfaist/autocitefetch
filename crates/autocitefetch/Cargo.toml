@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories = ["no-std", "wasm", "science", "text-processing"]
+# Tests stay in the repository; they are not needed to build or use the crate.
+exclude = ["tests/"]
 
 [dependencies]
 serde = { workspace = true }

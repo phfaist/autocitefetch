@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories = ["science", "caching", "text-processing"]
+# Tests stay in the repository; they are not needed to build or use the crate.
+exclude = ["tests/"]
 
 [dependencies]
 autocitefetch = { workspace = true }
@@ -31,3 +36,8 @@ http = ["dep:ureq"]
 [[example]]
 name = "resolve"
 required-features = ["http"]
+
+# docs.rs builds default features only; be explicit so feature-gated items
+# (the `http` feature's `UreqFetcher`) always appear in the published docs.
+[package.metadata.docs.rs]
+all-features = true

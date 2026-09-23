@@ -4,7 +4,8 @@ Automatic retrieval of bibliographic citations from multiple sources
 (arXiv, doi.org, local bibliography files, manual entries, …) into a canonical
 CSL-JSON representation.
 
-**Experimental development status:** This crate is still expermental and under active development; you can expect its API to change.
+**Experimental development status:** This crate is still experimental and under
+active development; you can expect its API to change.
 
 
 ## Library structure
@@ -18,16 +19,23 @@ that emits `\cite{arXiv:1211.1037}`-style commands (see
 
 **Components:**
 
-- `crates/autocitefetch` — the core library (`no_std` + `alloc`).
+- [`autocitefetch`](https://crates.io/crates/autocitefetch)
+  ([docs](https://docs.rs/autocitefetch)) — the core library (`no_std` + `alloc`).
 
-- `crates/autocitefetch-std` — simple trait implementations for a standard `std`
-  environment (clock, timer, filesystem cache, blocking HTTP fetcher).
+- [`autocitefetch-std`](https://crates.io/crates/autocitefetch-std)
+  ([docs](https://docs.rs/autocitefetch-std)) — simple trait implementations for
+  a standard `std` environment (clock, timer, filesystem cache, blocking HTTP
+  fetcher).
 
-- `crates/autocitefetch-cli` — a simple command-line interface to the library;
-  convert a list of `prefix:key` citation keys into CSL-JSON output.
+- [`autocitefetch-cli`](https://crates.io/crates/autocitefetch-cli) — a simple
+  command-line interface to the library; convert a list of `prefix:key` citation
+  keys into CSL-JSON output.
 
 
 ## Command-line tool
+
+You can install the command-line tool directly from *crates.io*: `cargo install
+autocitefetch-cli`.
 
 The `autocitefetch` command-line tool (`autocitefetch-cli` crate) reads a
 citation list and writes the resolved CSL-JSON as a JSON array. The input is
@@ -59,7 +67,7 @@ cargo install --path crates/autocitefetch-cli                  # the `autocitefe
 ## Model
 
 A citation is a `(prefix, key)` pair, e.g. `("arxiv", "1211.1037")`. The prefix
-selects a [`Source`]. Retrieval is two-phase:
+selects a `Source`. Retrieval is two-phase:
 
 1. `manager.retrieve(&cites).await` — routes each key to its source, fetches
    (chunked + rate-limited), writes results to the cache. Returns a
@@ -74,7 +82,7 @@ selects a [`Source`]. Retrieval is two-phase:
 
 The manager holds a list of `(prefix, source)` pairs, created by
 `manager.register(prefix, source)`.  Upon encountering a citation with a given
-prefix, it queries the corresponding citaiton source.
+prefix, it queries the corresponding citation source.
 
 The prefix is a non-empty string that may not contain the character `':'`.
 
