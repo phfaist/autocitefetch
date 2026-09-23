@@ -44,6 +44,8 @@ Run `autocitefetch --help` for information about options.
 
 ## Building
 
+In this repo:
+
 ```sh
 cargo build                                        # workspace (host)
 cargo test                                         # all tests
@@ -142,11 +144,3 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
-
-The Unicode-to-LaTeX conversion table of `flm-latexencode` derives from
-[pylatexenc](https://github.com/phfaist/pylatexenc) and, through it, from
-[latexcodec](https://github.com/mcmtroffaes/latexcodec), both under the MIT
-license. Their copyright and permission notices are reproduced in full at the
-head of `flm-latexencode/src/tables.rs`. There is no separate third-party
-notices file.
-
