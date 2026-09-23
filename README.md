@@ -27,6 +27,33 @@ that emits `\cite{arXiv:1211.1037}`-style commands (see
   convert a list of `prefix:key` citation keys into CSL-JSON output.
 
 
+## Command-line tool
+
+The `autocitefetch` command-line tool (`autocitefetch-cli` crate) reads a
+citation list and writes the resolved CSL-JSON as a JSON array. The input is
+read as one `prefix:key` string per line.  Usage:
+
+```sh
+$ printf 'arxiv:1211.1037\ndoi:10.1103/PhysRev.47.777\n' | autocitefetch
+$ autocitefetch cites.txt --bib refs.yaml -o bibliography.json
+$ autocitefetch --cite bib:knuth1984 --bib refs.yaml --enable bib
+```
+
+Run `autocitefetch --help` for information about options.
+
+
+## Building
+
+```sh
+cargo build                                        # workspace (host)
+cargo test                                         # all tests
+cargo build -p autocitefetch --target wasm32-unknown-unknown   # WASM core (no_std)
+cargo build -p autocitefetch-std --no-default-features         # std backends, no HTTP dep
+cargo run   -p autocitefetch-std --example resolve             # live demo (needs network)
+cargo install --path crates/autocitefetch-cli                  # the `autocitefetch` binary
+```
+
+
 ## Model
 
 A citation is a `(prefix, key)` pair, e.g. `("arxiv", "1211.1037")`. The prefix
@@ -69,7 +96,7 @@ Callers can be informed of progress of the citation fetching by registering a
 *reporter*; see `CitationManager::with_reporter(Rc<dyn Reporter>)`.
 
 
-## Usage sketch (std)
+### Library usage sketch (std)
 
 ```rust,ignore
 use autocitefetch::CitationManager;
@@ -100,31 +127,6 @@ async runtime or in a browser, implement the trait yourself with
 a blocking driver (`pollster::block_on`, or the `Waker::noop()` poll loop the
 example and tests use).
 
-
-## Command-line tool
-
-The `autocitefetch` command-line tool (`autocitefetch-cli` crate) reads a
-citation list and writes the resolved CSL-JSON as a JSON array. The input is
-read as one `prefix:key` string per line.  Usage:
-
-```sh
-$ printf 'arxiv:1211.1037\ndoi:10.1103/PhysRev.47.777\n' | autocitefetch
-$ autocitefetch cites.txt --bib refs.yaml -o bibliography.json
-$ autocitefetch --cite bib:knuth1984 --bib refs.yaml --enable bib
-```
-
-Run `autocitefetch --help` for information about options.
-
-## Building
-
-```sh
-cargo build                                        # workspace (host)
-cargo test                                         # all tests
-cargo build -p autocitefetch --target wasm32-unknown-unknown   # WASM core (no_std)
-cargo build -p autocitefetch-std --no-default-features         # std backends, no HTTP dep
-cargo run   -p autocitefetch-std --example resolve             # live demo (needs network)
-cargo install --path crates/autocitefetch-cli                  # the `autocitefetch` binary
-```
 
 ## License
 
