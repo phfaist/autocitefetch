@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "autocitefetch"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-util",
  "hashbrown 0.15.5",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "autocitefetch-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "autocitefetch",
  "autocitefetch-std",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "autocitefetch-std"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "autocitefetch",
  "fs4",

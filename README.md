@@ -100,6 +100,19 @@ different prefix to use instead of `doi`.)
 The manager's retrieval loop discovers chained targets and fetches them.
 
 
+### Refresh batching
+
+Cached entries go stale over time and are refetched. Rather than spending a
+whole rate-limited request on a handful of stale entries, a source can *defer*
+small amounts of refresh work (serving the cached copies meanwhile, for a
+bounded time), and *top up* a request that goes out anyway with entries that
+are nearly due. Each source declares a default (`Source::refresh_batching`;
+the arXiv and DOI sources batch, a custom source is eager); the host can
+override it per prefix with `CitationManager::with_refresh_batching`, or on the
+command line with `--refresh-batching PREFIX:SETTINGS` (e.g. `arxiv:min=50`,
+`doi:eager`).
+
+
 ### Progress reporting
 
 Callers can be informed of progress of the citation fetching by registering a

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/autocitefetch", "crates/autocitefetch-std", "crates/autocitefetch-cli"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.86"
@@ -17,5 +17,5 @@ hashbrown = { version = "0.15", default-features = false, features = ["default-h
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 xmlparser = { version = "0.13", default-features = false }
 
-autocitefetch = { path = "crates/autocitefetch", version = "0.1.0" }
-autocitefetch-std = { path = "crates/autocitefetch-std", version = "0.1.0" }
+autocitefetch = { path = "crates/autocitefetch", version = "0.1.1" }
+autocitefetch-std = { path = "crates/autocitefetch-std", version = "0.1.1" }
