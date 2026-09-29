@@ -184,12 +184,23 @@ pub enum Event<'a> {
     /// A retrieval pass has been planned. Emitted after the batch has been
     /// classified (which is when the counts exist) and before any source runs.
     /// `pass` is 1-based; `cached` is how many citations were served from a
-    /// record that did not need refetching, `to_fetch` how many keys were
-    /// bucketed for a source.
+    /// cached record without refetching (including any deferred by refresh
+    /// batching), `to_fetch` how many keys were bucketed for a source
+    /// (including any pulled forward).
     PassStarted {
         pass: usize,
         cached: usize,
         to_fetch: usize,
+    },
+    /// Refresh batching (see [`batching`](crate::batching)) changed what a
+    /// source fetches this pass: `deferred` stale/expired entries were left for
+    /// a later run (served from cache meanwhile), `pulled_forward` not-yet-due
+    /// entries were added to fill the request. Emitted per prefix, only when
+    /// either is non-zero, before [`Event::PassStarted`].
+    RefreshPlanned {
+        prefix: &'a str,
+        deferred: usize,
+        pulled_forward: usize,
     },
     /// A pass finished. `discovered` is how many chain targets it queued for the
     /// next pass — non-zero is exactly what makes a progress denominator grow.

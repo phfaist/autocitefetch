@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 
+use crate::batching::{self, BatchingSpec};
+
 /// One of the built-in sources, as named on the command line.
 ///
 /// The variants are exactly the built-in prefixes, so `--enable arxiv` reads
@@ -150,6 +152,18 @@ pub struct Cli {
     /// Entries already cached keep their fields until they are refetched.
     #[arg(long = "drop-field", value_name = "FIELD")]
     pub drop_field: Vec<String>,
+
+    /// Tune how a source batches cache refreshes. Repeatable.
+    ///
+    /// `PREFIX:SETTING[,SETTING...]`, applied in order on top of the source's
+    /// default: `eager` (fetch whatever is due, when due), `min=N` (don't query
+    /// for fewer than N stale entries unless something is needed), `defer=DUR`
+    /// (how long an expired entry may wait: `0`, `12h`, `2d`, ...),
+    /// `topup=P%` or `topup=off` (fill requests with entries at least P%
+    /// through their lifetime), `fill=chunk` or `fill=N` (how far to fill).
+    /// E.g. `--refresh-batching arxiv:min=50` or `--refresh-batching doi:eager`.
+    #[arg(long = "refresh-batching", value_name = "PREFIX:SETTINGS", value_parser = batching::parse_spec)]
+    pub refresh_batching: Vec<BatchingSpec>,
 
     /// Directory holding the cache files.
     #[arg(long, value_name = "DIR", default_value = ".")]

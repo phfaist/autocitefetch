@@ -34,6 +34,7 @@
 //! directory; the ignore rule covers the in-flight files and anything a crash
 //! strands.
 
+mod batching;
 mod cli;
 mod formats;
 mod input;
@@ -236,6 +237,15 @@ fn build_manager(
         }
         .map_err(|e| format!("registering the `{prefix}` source: {e}"))?;
     }
+    // `--refresh-batching`, on top of each source's own default (which is why
+    // it comes after registration). A disabled source's spec was warned about.
+    for spec in &cli.refresh_batching {
+        let prefix = spec.source.prefix();
+        if let Some(base) = manager.refresh_batching(prefix) {
+            let batching = spec.apply(base).map_err(|e| format!("--refresh-batching: {e}"))?;
+            manager = manager.with_refresh_batching(prefix, batching);
+        }
+    }
     Ok(manager)
 }
 
@@ -291,6 +301,14 @@ fn warn_about_unusable_options(cli: &Cli, cites: &[(String, String)], sources: &
         && (cli.arxiv_doi_overrides.is_some() || cli.no_arxiv_chaining)
     {
         warn("the `arxiv` source is disabled; its options will be ignored");
+    }
+    for spec in &cli.refresh_batching {
+        if !enabled(spec.source) {
+            warn(&format!(
+                "the `{}` source is disabled; its --refresh-batching will be ignored",
+                spec.source.prefix()
+            ));
+        }
     }
     if !enabled(SourceKind::Manual) && cli.manual_format.is_some() {
         warn("the `manual` source is disabled; --manual-format will be ignored");

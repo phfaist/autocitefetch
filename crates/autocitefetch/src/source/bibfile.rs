@@ -43,6 +43,7 @@ use core::time::Duration;
 
 use hashbrown::HashMap;
 
+use crate::batching::{Fill, RefreshBatching, TopUp};
 use crate::csl::CslValue;
 use crate::error::Error;
 use crate::fetch::Request;
@@ -125,6 +126,19 @@ impl Source for BibliographyFileSource {
 
     fn default_ttl(&self) -> Duration {
         self.ttl
+    }
+
+    /// Re-reading the files resolves every key at once, so whenever anything
+    /// is refetched, refresh every cached entry along with it.
+    fn refresh_batching(&self) -> RefreshBatching {
+        RefreshBatching {
+            min_batch: 0,
+            max_defer: Duration::ZERO,
+            top_up: Some(TopUp {
+                min_age_percent: 0,
+                fill: Fill::ChunkBoundary,
+            }),
+        }
     }
 
     fn normalize_key(&self, key: &str) -> String {

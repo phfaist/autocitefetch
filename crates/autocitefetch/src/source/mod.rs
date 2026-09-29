@@ -30,6 +30,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use crate::batching::RefreshBatching;
 use crate::csl::CslValue;
 use crate::env::{Clock, Timer};
 use crate::error::Error;
@@ -184,6 +185,18 @@ pub trait Source {
     /// Default lifetime for entries this source stores.
     fn default_ttl(&self) -> Duration {
         Duration::from_secs(30 * 24 * 60 * 60)
+    }
+
+    /// How this source's refresh work is batched: whether a few stale entries
+    /// are deferred until there are enough to be worth a request, and whether
+    /// a request going out anyway is topped up with entries that are nearly
+    /// due. See [`batching`](crate::batching).
+    ///
+    /// Default: [`RefreshBatching::EAGER`] — fetch exactly what is due. The
+    /// host can override this per prefix with
+    /// [`CitationManager::with_refresh_batching`](crate::manager::CitationManager::with_refresh_batching).
+    fn refresh_batching(&self) -> RefreshBatching {
+        RefreshBatching::EAGER
     }
 
     /// Canonicalize a requested key before anything is keyed on it.

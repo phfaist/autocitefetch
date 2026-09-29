@@ -20,6 +20,7 @@ crates/
         manual.rs         key-is-the-text escape hatch
         bibfile.rs        bibliography files (pluggable parser; JSON default)
       cache.rs            TTL policy: soft/hard expiry, jitter, freshness
+      batching.rs         refresh batching: defer small refreshes / top up requests
       driver.rs           per-source chunking + rate limiting
       retry.rs            RetryingFetcher: transparent retry/backoff wrapper
       report.rs           Reporter trait + Event vocabulary, NopReporter, throttle
@@ -352,11 +353,14 @@ A worklist loop, not a fixed pipeline:
   folded; CSL payload fields (notably `DOI`) keep their casing. Trimming is `str::trim` only —
   internal whitespace is deliberately *not* collapsed, so `doi.rs`'s validation can still reject a
   malformed key instead of it being silently repaired.
-- Per pass: dedup against `seen`, look each id up in the store, and bucket the ones due for a
-  (re)fetch by prefix — misses, plus anything `TtlPolicy::should_refetch` returns true for (hard-
-  expired always; soft-stale *probabilistically*, see Cache policy). A cached `Payload::Chained`
-  entry we are **keeping** (fresh, or stale but the probabilistic draw said serve-as-is) pushes its
-  target onto the worklist so the target is guaranteed present; one we are **refetching** does *not*
+- Per pass: dedup against `seen`, look each id up in the store, and classify it for refresh
+  batching (`RefreshBatching::classify`: misses and long-expired entries `Required`, anything else
+  `TtlPolicy::should_refetch` returns true for `Due` — hard-expired always; soft-stale
+  *probabilistically*, see Cache policy — and old-enough kept entries `Eligible`). Then, per
+  prefix, `batching::plan` decides which keys are bucketed (see Refresh batching). A cached
+  `Payload::Chained` entry we end up **keeping** (fresh, stale but the draw said serve-as-is, or
+  deferred by batching) pushes its target onto the worklist so the target is guaranteed present —
+  these are held until planning is done; one we are **refetching** (including one pulled forward) does *not*
   (it is about to be replaced, and pre-pushing a superseded pointer would fetch — and report a
   failure for — a citation nobody requested). When a refetch fails and the grace window keeps the
   old chained record, the target is pushed from the failure path instead.
@@ -484,9 +488,49 @@ target, whose `get()` then fails on the dead link — correct, the target really
 Hard TTL gets ±15% deterministic jitter seeded by FNV-1a over the entry id, so a batch fetched
 together doesn't expire together.
 
+### Refresh batching (`batching.rs`)
+
+`should_refetch` decides per entry; on a large database that trickles — each run finds a few
+entries newly stale, and each few costs a rate-limited request (arXiv answers 100 ids for the price
+of 3). Between the per-entry decision and the driver, `batching::plan` decides **per prefix, per
+pass** what actually goes on the wire, from four classes (`RefreshBatching::classify`):
+
+- **Required** — a miss, or hard-expired for ≥ `max_defer` (capped at `TtlPolicy::grace`, so a
+  deferred entry is never one `prune` may drop). Never deferred.
+- **Due** — `should_refetch` said yes, but deferrable (stale-window draw said refetch, or
+  hard-expired for < `max_defer`).
+- **Eligible** — kept, but with remaining life ≤ `(100 − min_age_percent)`% of the source's
+  nominal `default_ttl` (only when `top_up` is set). Ranked by `expires`, then key.
+- **Keep** — served as-is.
+
+The rule: nothing Required and 0 < Due < `min_batch` ⇒ top up to `min_batch` from Eligible if
+there are enough, else fetch **nothing** (the Due entries are served from cache, not reported —
+they are not failures). Otherwise a request is going out anyway ⇒ fetch Required + Due, then fill
+from Eligible: `Fill::ChunkBoundary` (free for a batched source; takes everything for an unbounded
+chunk) or `Fill::Extra(n)` (per-key sources, where each extra is a request). Eligible entries alone
+never trigger a fetch, so a run with no real work does not refresh ahead of time. Liveness: a
+deferred entry only ages until it is Required. The draw and the plan compose — the draw says an
+entry *wants* refreshing, the plan says *when*; a deferred Due entry re-rolls next run.
+
+Configuration is per **prefix**: `Source::refresh_batching()` gives the default (trait default
+`RefreshBatching::EAGER` = previous behavior, so third-party sources are unchanged), and
+`CitationManager::with_refresh_batching(prefix, …)` overrides it (keyed by prefix because one
+source type can serve several). The CLI exposes it as `--refresh-batching PREFIX:SETTINGS`.
+`Event::RefreshPlanned` announces deferred / pulled-forward counts when non-zero. Scope is the
+ids reached by this `retrieve` (requested + chained), never the whole store: pulling forward
+citations nobody cites any more would waste rate-limited requests. Because planning is per pass,
+`doi` is planned separately for direct cites (pass 1) and arXiv-chained targets (pass 2).
+
+| prefix | min_batch / max_defer / top-up |
+|---|---|
+| `arxiv` | 20 / 2 d / ≥ 50% age, fill to chunk boundary |
+| `doi` | 10 / 30 d / ≥ 80% age, only to reach `min_batch` (`Extra(0)`) |
+| `bib` | 0 / 0 / any age, chunk boundary (one file read refreshes everything) |
+| `manual` | `EAGER` (TTL 0: always a miss) |
+
 ### Sources (`source/`)
 
-Each `Source` declares `chunk_size`, `min_interval`, `default_ttl` (but **not** a prefix — see
+Each `Source` declares `chunk_size`, `min_interval`, `default_ttl`, `refresh_batching` (but **not** a prefix — see
 "Prefixes are host-chosen bindings" above), and implements
 `retrieve_chunk`. `driver.rs` does the chunking and paces requests **start→start**: it sleeps
 `min_interval - elapsed_since_previous_request`, and the manager threads that per-prefix timestamp
@@ -695,5 +739,6 @@ This is a port of two libraries with the same architecture, useful for behavior 
 
 Known reference bugs deliberately **not** reproduced here: the JS `sleep` no-op that defeated
 backoff, the JS dead arXiv TTL, Python's `fetch_url` dropping headers, Python's silent drop of
-explicitly-versioned arXiv requests. Neither reference has TTL jitter, stale-while-revalidate, or
-probabilistic stale revalidation (both refetch every entry the instant it goes soft-stale).
+explicitly-versioned arXiv requests. Neither reference has TTL jitter, stale-while-revalidate,
+probabilistic stale revalidation, or refresh batching (both refetch every entry the instant it goes
+soft-stale, however few).

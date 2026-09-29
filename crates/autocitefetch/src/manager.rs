@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use futures_util::stream::{StreamExt, iter};
 use hashbrown::{HashMap, HashSet};
 
+use crate::batching::{self, RefreshBatching, RefreshClass};
 use crate::cache::TtlPolicy;
 use crate::csl::{self, CslValue};
 use crate::driver::drive_source;
@@ -52,6 +53,16 @@ struct WorkItem {
 struct ItemMeta {
     depth: usize,
     origin: (String, String),
+}
+
+/// One source's share of a pass, classified for refresh batching (see
+/// [`batching`]) but not yet planned.
+#[derive(Default)]
+struct Pending {
+    required: Vec<String>,
+    due: Vec<String>,
+    /// With the record's hard expiry, so the most urgent can be taken first.
+    eligible: Vec<(Timestamp, String)>,
 }
 
 /// What one driven source contributes to a pass: its prefix, the keys it was
@@ -141,6 +152,9 @@ pub struct CitationManager<F, S, C, T> {
     clock: C,
     timer: T,
     policy: TtlPolicy,
+    /// Per-prefix overrides of [`Source::refresh_batching`] — see
+    /// [`CitationManager::with_refresh_batching`].
+    refresh_batching: HashMap<String, RefreshBatching>,
     /// Backoff/retry policy for the transparent retrying fetcher wrapper.
     retry_policy: RetryPolicy,
     /// Safety bound on chain length, applied both while *following* a chain in
@@ -177,6 +191,7 @@ where
             clock,
             timer,
             policy: TtlPolicy::default(),
+            refresh_batching: HashMap::new(),
             retry_policy: RetryPolicy::default(),
             max_chain_depth: 16,
             dropped_csl_fields: Vec::new(),
@@ -260,6 +275,44 @@ where
     pub fn with_policy(mut self, policy: TtlPolicy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Override the refresh batching of the source bound to `prefix` (see
+    /// [`batching`]). Builder-style; the source's own
+    /// [`Source::refresh_batching`] applies otherwise.
+    ///
+    /// Keyed by prefix rather than by source because the same source type can
+    /// be bound to several prefixes. It may be set before or after the prefix
+    /// is registered, and survives the source being replaced.
+    ///
+    /// ```ignore
+    /// let mgr = CitationManager::new(fetcher, store, clock, timer)
+    ///     .register("arxiv", ArxivSource::new())?
+    ///     // Always fetch what is due, as soon as it is due.
+    ///     .with_refresh_batching("arxiv", RefreshBatching::EAGER);
+    /// ```
+    pub fn with_refresh_batching(
+        mut self,
+        prefix: impl Into<String>,
+        batching: RefreshBatching,
+    ) -> Self {
+        self.refresh_batching.insert(prefix.into(), batching);
+        self
+    }
+
+    /// The refresh batching in effect for `prefix`: the host's override if any,
+    /// else the registered source's default. `None` if nothing is registered
+    /// under `prefix`.
+    pub fn refresh_batching(&self, prefix: &str) -> Option<RefreshBatching> {
+        let source = self.sources.get(prefix)?;
+        Some(self.batching_for(prefix, source.as_ref()))
+    }
+
+    fn batching_for(&self, prefix: &str, source: &dyn Source) -> RefreshBatching {
+        self.refresh_batching
+            .get(prefix)
+            .copied()
+            .unwrap_or_else(|| source.refresh_batching())
     }
 
     /// Override the retry/backoff policy applied to every fetch. Builder-style.
@@ -434,11 +487,23 @@ where
             // on a citation's position in the batch.
             let now = self.clock.now();
 
-            // Decide, per citation, what needs fetching this pass.
-            let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
-            // Progress bookkeeping only: how many of this batch were served
-            // from a record that did not need refetching.
-            let mut cached = 0usize;
+            // Classify each citation for refresh batching. Nothing is bucketed
+            // yet: which `Due`/`Eligible` keys actually go out is a per-source
+            // decision (`batching::plan`) that needs the whole batch.
+            let mut pending: HashMap<String, Pending> = HashMap::new();
+            // Chained pointers this pass may end up *keeping*, with their
+            // target. A kept pointer must pull its target in, or a later `get()`
+            // breaks on the missing link — but a *refetched* one must not: the
+            // refetch may replace the pointer (a retracted or override-
+            // suppressed DOI), and fetching the old target would waste a
+            // rate-limited request and report a failure for a citation nobody
+            // asked for if that dead target 404s (`store_resolutions` pushes the
+            // *new* target when it stores the pointer). So they are held until
+            // planning says which pointers are fetched.
+            let mut held: Vec<(String, WorkItem)> = Vec::new();
+            // Progress bookkeeping only: how many of this batch reached the
+            // cache lookup (the rest failed or were duplicates).
+            let mut classified = 0usize;
             for WorkItem {
                 prefix,
                 key,
@@ -479,60 +544,106 @@ where
                         .push(CiteFailure::new(&prefix, &key, message, &origin));
                     continue;
                 }
-                if !self.sources.contains_key(&prefix) {
+                let Some(source) = self.sources.get(&prefix) else {
                     let message = Error::UnknownPrefix(prefix.clone()).to_string();
                     report
                         .failures
                         .push(CiteFailure::new(&prefix, &key, message, &origin));
                     continue;
-                }
+                };
+                classified += 1;
 
-                match self.store.get(&id).await? {
+                let class = match self.store.get(&id).await? {
+                    None => RefreshClass::Required,
                     Some(rec) => {
-                        if self.policy.should_refetch(&rec, now, &id) {
-                            // Expired, or stale-and-the-draw-said-refetch: bucket
-                            // it. Do *not* pre-push a chained pointer's target
-                            // here — the refetch may replace the pointer (a
-                            // retracted or override-suppressed DOI), and fetching
-                            // the old target would waste a rate-limited request
-                            // and report a failure for a citation nobody asked
-                            // for if that dead target 404s. `store_resolutions`
-                            // pushes the *new* target when it stores the pointer.
-                            buckets.entry(prefix).or_default().push(key);
-                        } else {
-                            cached += 1;
+                        let class = self.batching_for(&prefix, source.as_ref()).classify(
+                            &self.policy,
+                            &rec,
+                            now,
+                            &id,
+                            source.default_ttl(),
+                        );
+                        if class != RefreshClass::Required {
                             if let Payload::Chained {
                                 prefix: tp,
                                 key: tk,
                                 ..
-                            } = &rec.payload
+                            } = rec.payload
                             {
-                                // A record we are keeping (Fresh, or Stale but
-                                // the draw said serve-as-is): a chained pointer
-                                // we keep must still pull its target in, or a
-                                // later `get()` breaks on the missing link. The
-                                // target inherits this item's origin so a
+                                // The target inherits this item's origin so a
                                 // failure on it still points back to the same
                                 // request.
-                                worklist.push(WorkItem {
-                                    prefix: tp.clone(),
-                                    key: tk.clone(),
-                                    depth: depth + 1,
-                                    origin,
-                                });
+                                held.push((
+                                    id.clone(),
+                                    WorkItem {
+                                        prefix: tp,
+                                        key: tk,
+                                        depth: depth + 1,
+                                        origin,
+                                    },
+                                ));
                             }
                         }
+                        if class == RefreshClass::Eligible {
+                            pending
+                                .entry(prefix)
+                                .or_default()
+                                .eligible
+                                .push((rec.expires, key));
+                            continue;
+                        }
+                        class
                     }
-                    None => {
-                        buckets.entry(prefix).or_default().push(key);
-                    }
+                };
+                let p = pending.entry(prefix).or_default();
+                match class {
+                    RefreshClass::Required => p.required.push(key),
+                    RefreshClass::Due => p.due.push(key),
+                    RefreshClass::Eligible | RefreshClass::Keep => {}
                 }
             }
 
+            // Plan each source's share: defer a too-small batch of `Due` keys,
+            // or top it up with the most urgent `Eligible` ones.
+            let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
+            let mut fetched: HashSet<String> = HashSet::new();
+            for (prefix, mut p) in pending {
+                let source = self
+                    .sources
+                    .get(&prefix)
+                    .expect("prefix presence checked above");
+                p.eligible.sort_unstable();
+                let plan = batching::plan(
+                    &self.batching_for(&prefix, source.as_ref()),
+                    source.chunk_size(),
+                    p.required,
+                    p.due,
+                    p.eligible.into_iter().map(|(_, key)| key).collect(),
+                );
+                if plan.deferred > 0 || plan.pulled_forward > 0 {
+                    self.reporter.report(&Event::RefreshPlanned {
+                        prefix: &prefix,
+                        deferred: plan.deferred,
+                        pulled_forward: plan.pulled_forward,
+                    });
+                }
+                if !plan.fetch.is_empty() {
+                    fetched.extend(plan.fetch.iter().map(|k| csl::cite_id(&prefix, k)));
+                    buckets.insert(prefix, plan.fetch);
+                }
+            }
+            // Kept pointers pull their targets in (in batch order, so `seen`'s
+            // first-writer-wins attribution is as before).
+            worklist.extend(
+                held.into_iter()
+                    .filter(|(id, _)| !fetched.contains(id))
+                    .map(|(_, target)| target),
+            );
+
             self.reporter.report(&Event::PassStarted {
                 pass,
-                cached,
-                to_fetch: buckets.values().map(Vec::len).sum(),
+                cached: classified - fetched.len(),
+                to_fetch: fetched.len(),
             });
 
             // Snapshot each source's pacing state before building the futures,

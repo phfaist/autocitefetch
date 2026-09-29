@@ -25,6 +25,7 @@
 
 extern crate alloc;
 
+pub mod batching;
 pub mod cache;
 pub mod csl;
 pub mod driver;
@@ -38,6 +39,7 @@ pub mod retry;
 pub mod source;
 pub mod store;
 
+pub use crate::batching::{Fill, RefreshBatching, TopUp};
 pub use crate::cache::{Freshness, TtlPolicy};
 pub use crate::csl::CslValue;
 pub use crate::env::{Clock, Timer, Timestamp};

@@ -19,8 +19,8 @@ use std::time::Duration;
 use autocitefetch::report::{Event, Reporter, Resolved, Wait};
 use autocitefetch::{
     BoxFuture, CacheRecord, CacheStore, CitationManager, Clock, CslValue, Error, FetchError,
-    Fetcher, Payload, Request, Resolution, Response, RetrieveCtx, Source, StoreError, Timer,
-    Timestamp,
+    Fetcher, Payload, RefreshBatching, Request, Resolution, Response, RetrieveCtx, Source,
+    StoreError, Timer, Timestamp,
 };
 
 // --- a minimal, always-ready block_on (mocks never truly pend) -------------
@@ -90,6 +90,11 @@ impl Reporter for RecordingReporter {
                 cached,
                 to_fetch,
             } => format!("pass{pass}:start cached={cached} fetch={to_fetch}"),
+            Event::RefreshPlanned {
+                prefix,
+                deferred,
+                pulled_forward,
+            } => format!("{prefix}:plan deferred={deferred} pulled={pulled_forward}"),
             Event::PassFinished { pass, discovered } => {
                 format!("pass{pass}:end discovered={discovered}")
             }
@@ -656,4 +661,45 @@ fn a_fully_cached_run_reports_cache_hits_and_drives_no_source() {
     rep.assert_lacks("doi:start");
     rep.assert_lacks("req:start");
     rep.assert_has("retrieve:end considered=1 failed=0");
+}
+
+#[test]
+fn a_deferred_refresh_is_announced_and_drives_no_source() {
+    // Refresh batching left a single expired entry for a later, bigger batch:
+    // the one event saying so is all a display sees — no failure, no source.
+    let now = 1_000_000_000i64;
+    let csl: CslValue = serde_json::from_str(&item("doi:10.1/x")).unwrap();
+    let expired = CacheRecord {
+        payload: Payload::Concrete(csl),
+        stale_after: Timestamp::from_millis(now - 20_000),
+        expires: Timestamp::from_millis(now - 10_000),
+    };
+
+    let rep = RecordingReporter::default();
+    let mgr = CitationManager::new(
+        MockFetcher::default(),
+        MemStore::default().seed("doi:10.1/x", expired),
+        FixedClock(now),
+        InstantTimer,
+    )
+    .with_reporter(Rc::new(rep.clone()))
+    .register("doi", FailingSource)
+    .unwrap()
+    .with_refresh_batching(
+        "doi",
+        RefreshBatching {
+            min_batch: 5,
+            max_defer: Duration::from_secs(60),
+            top_up: None,
+        },
+    );
+
+    let report = block_on(mgr.retrieve(&[cite("doi", "10.1/x")])).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+
+    rep.assert_has("doi:plan deferred=1 pulled=0");
+    rep.assert_has("pass1:start cached=1 fetch=0");
+    assert!(rep.index_of("doi:plan deferred=1 pulled=0") < rep.index_of("pass1:start cached=1 fetch=0"));
+    rep.assert_lacks("doi:start");
+    rep.assert_lacks("failed ");
 }

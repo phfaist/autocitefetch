@@ -34,6 +34,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use crate::batching::{Fill, RefreshBatching, TopUp};
 use crate::csl::CslValue;
 use crate::error::Error;
 use crate::fetch::Request;
@@ -63,6 +64,21 @@ impl Source for DoiSource {
 
     fn default_ttl(&self) -> Duration {
         Duration::from_secs(360 * 24 * 60 * 60)
+    }
+
+    /// One request per key, so topping up is never free: wait for 10 stale
+    /// entries (topping up to 10 from those in the last 20% of their
+    /// lifetime), but never add extras to a request that is going out anyway.
+    /// With a 360-day TTL, a hard-expired entry can wait up to 30 days.
+    fn refresh_batching(&self) -> RefreshBatching {
+        RefreshBatching {
+            min_batch: 10,
+            max_defer: Duration::from_secs(30 * 24 * 60 * 60),
+            top_up: Some(TopUp {
+                min_age_percent: 80,
+                fill: Fill::Extra(0),
+            }),
+        }
     }
 
     fn retrieve_chunk<'a>(

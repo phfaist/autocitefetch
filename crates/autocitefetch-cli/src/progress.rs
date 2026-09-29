@@ -72,6 +72,24 @@ impl Reporter for StderrReporter {
                 "pass {pass}: {cached} cached, {to_fetch} to fetch"
             )),
 
+            // Only emitted when batching changed something, so never noise.
+            Event::RefreshPlanned {
+                prefix,
+                deferred,
+                pulled_forward,
+            } => {
+                if deferred > 0 {
+                    self.line(&format!(
+                        "{prefix}: {deferred} stale citation(s) left for a larger batch later"
+                    ));
+                }
+                if pulled_forward > 0 {
+                    self.line(&format!(
+                        "{prefix}: refreshing {pulled_forward} citation(s) early to fill the request(s)"
+                    ));
+                }
+            }
+
             // Silent when nothing was discovered: "queued 0" every pass is
             // noise, and a non-zero count is the interesting thing (it is what
             // makes a progress denominator grow).

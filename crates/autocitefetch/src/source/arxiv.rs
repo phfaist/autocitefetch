@@ -95,6 +95,7 @@ use core::time::Duration;
 
 use hashbrown::HashMap;
 
+use crate::batching::{Fill, RefreshBatching, TopUp};
 use crate::csl::CslValue;
 use crate::error::Error;
 use crate::fetch::Request;
@@ -217,6 +218,20 @@ impl Source for ArxivSource {
     }
     fn default_ttl(&self) -> Duration {
         Duration::from_secs(TTL_SECS)
+    }
+    /// One request answers up to 100 ids at the same cost, and each
+    /// costs a 3 s pacing gap: wait for 20 stale entries (or one needed one)
+    /// before querying, and then fill the request with entries at least half
+    /// way through their lifetime. A hard-expired entry waits at most 2 days.
+    fn refresh_batching(&self) -> RefreshBatching {
+        RefreshBatching {
+            min_batch: 20,
+            max_defer: Duration::from_secs(2 * 24 * 60 * 60),
+            top_up: Some(TopUp {
+                min_age_percent: 50,
+                fill: Fill::ChunkBoundary,
+            }),
+        }
     }
     fn chains_to(&self) -> Vec<&str> {
         self.doi_prefix.as_deref().into_iter().collect()

@@ -14,10 +14,11 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use autocitefetch::source::ArxivSource;
 use autocitefetch::{
     BoxFuture, CacheRecord, CacheStore, CitationManager, Clock, CslValue, FetchError, Fetcher,
-    Freshness, Payload, Request, Resolution, Response, RetrieveCtx, Source, StoreError, Timer,
-    Timestamp, TtlPolicy,
+    Fill, Freshness, Payload, RefreshBatching, Request, Resolution, Response, RetrieveCtx, Source,
+    StoreError, Timer, Timestamp, TopUp, TtlPolicy,
 };
 
 // --- a minimal, always-ready block_on (mocks never truly pend) -------------
@@ -729,4 +730,189 @@ fn store_errors_abort_retrieve_but_still_flush() {
         "expected a store error, got {err}"
     );
     assert_eq!(flushes.get(), 1, "buffered writes must be flushed even on the error path");
+}
+
+// --- refresh batching --------------------------------------------------------
+//
+// `batching::plan` itself is unit-tested in the crate; these check the manager
+// wiring. Stale-window refetch is a coin flip per id, so `Due` work is made
+// deterministic here by using hard-expired entries within `max_defer`.
+
+fn batching(min_batch: usize, max_defer_ms: u64, top_up: Option<TopUp>) -> RefreshBatching {
+    RefreshBatching {
+        min_batch,
+        max_defer: Duration::from_millis(max_defer_ms),
+        top_up,
+    }
+}
+
+fn probe_cites(keys: &[&str]) -> Vec<(String, String)> {
+    keys.iter()
+        .map(|k| ("probe".to_string(), k.to_string()))
+        .collect()
+}
+
+fn sorted(calls: &RefCell<Vec<String>>) -> Vec<String> {
+    let mut v = calls.borrow().clone();
+    v.sort();
+    v
+}
+
+/// Too few expired entries to be worth a request are served from cache and not
+/// reported; once past `max_defer` they are fetched regardless.
+#[test]
+fn a_few_expired_entries_are_deferred_until_max_defer() {
+    let clock = MovableClock::new(0);
+    let src = ProbeSource::new(Duration::from_millis(1000));
+    let calls = src.calls.clone();
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .with_policy(no_jitter(Duration::from_secs(60)))
+        .register("probe", src).unwrap()
+        .with_refresh_batching("probe", batching(5, 500, None));
+
+    let keys = probe_cites(&["a", "b"]);
+    block_on(mgr.retrieve(&keys)).unwrap();
+    assert_eq!(calls.borrow().len(), 2, "misses are always fetched");
+
+    // Expired at 1000, 499 ms overdue: 2 < min_batch ⇒ deferred.
+    clock.set(1499);
+    let report = block_on(mgr.retrieve(&keys)).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+    assert_eq!(calls.borrow().len(), 2, "deferred entries must not be fetched");
+    assert_eq!(block_on(mgr.get("probe", "a")).unwrap()["title"], "item a");
+
+    // 500 ms overdue ⇒ Required.
+    clock.set(1500);
+    block_on(mgr.retrieve(&keys)).unwrap();
+    assert_eq!(sorted(&calls), ["a", "a", "b", "b"]);
+}
+
+/// A request going out anyway (a miss) takes along the entries far enough
+/// through their lifetime — and only those.
+#[test]
+fn a_needed_request_pulls_nearly_due_entries_forward() {
+    let clock = MovableClock::new(0);
+    let src = ProbeSource::new(Duration::from_millis(1000));
+    let calls = src.calls.clone();
+    let top_up = TopUp {
+        min_age_percent: 50,
+        fill: Fill::ChunkBoundary,
+    };
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .with_policy(no_jitter(Duration::from_secs(60)))
+        .register("probe", src).unwrap()
+        .with_refresh_batching("probe", batching(5, 0, Some(top_up)));
+
+    block_on(mgr.retrieve(&probe_cites(&["a", "b", "c"]))).unwrap();
+    calls.borrow_mut().clear();
+
+    // 600 ms left of 1000: not yet half way through their lifetime.
+    clock.set(400);
+    block_on(mgr.retrieve(&probe_cites(&["a", "b", "c", "new1"]))).unwrap();
+    assert_eq!(sorted(&calls), ["new1"]);
+    calls.borrow_mut().clear();
+
+    // 400 ms left: eligible, and the chunk has room for all of them. (`new1`,
+    // fetched at 400, is not.)
+    clock.set(600);
+    block_on(mgr.retrieve(&probe_cites(&["a", "b", "c", "new1", "new2"]))).unwrap();
+    assert_eq!(sorted(&calls), ["a", "b", "c", "new2"]);
+}
+
+/// With nothing required, a few due entries are topped up to `min_batch` from
+/// the most urgent eligible ones.
+#[test]
+fn a_few_due_entries_are_topped_up_to_min_batch() {
+    let clock = MovableClock::new(0);
+    let src = ProbeSource::new(Duration::from_millis(1000));
+    let calls = src.calls.clone();
+    let top_up = TopUp {
+        min_age_percent: 50,
+        fill: Fill::Extra(0),
+    };
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+        .with_policy(no_jitter(Duration::from_secs(60)))
+        .register("probe", src).unwrap()
+        .with_refresh_batching("probe", batching(5, 10_000, Some(top_up)));
+
+    block_on(mgr.retrieve(&probe_cites(&["d0", "d1", "d2"]))).unwrap();
+    clock.set(400);
+    block_on(mgr.retrieve(&probe_cites(&["e0", "e1", "e2"]))).unwrap();
+    clock.set(500);
+    block_on(mgr.retrieve(&probe_cites(&["f0"]))).unwrap();
+    calls.borrow_mut().clear();
+
+    // d*: expired ⇒ Due (3 < 5). e* (400 ms left) and f0 (500 ms left):
+    // eligible; the two most urgent are e0, e1 (ties broken by key).
+    clock.set(1000);
+    let all = probe_cites(&["d0", "d1", "d2", "e0", "e1", "e2", "f0"]);
+    block_on(mgr.retrieve(&all)).unwrap();
+    assert_eq!(sorted(&calls), ["d0", "d1", "d2", "e0", "e1"]);
+}
+
+/// A chained pointer that is deferred still pulls its target in; one that is
+/// pulled forward does not pre-fetch its old target (the refetch may replace
+/// the pointer).
+#[test]
+fn batching_keeps_or_drops_chain_targets_like_a_refetch_decision() {
+    let pointer = |stale_after: i64, expires: i64| CacheRecord {
+        payload: Payload::Chained {
+            prefix: "b".into(),
+            key: "t".into(),
+            set_properties: CslValue::Object(serde_json::Map::new()),
+        },
+        stale_after: Timestamp::from_millis(stale_after),
+        expires: Timestamp::from_millis(expires),
+    };
+    let setup = |policy: RefreshBatching, rec: CacheRecord| {
+        let a = RecordingSource::new("a");
+        let b = RecordingSource::new("b");
+        let (a_calls, b_calls) = (a.calls.clone(), b.calls.clone());
+        let mgr = CitationManager::new(NoopFetcher, MemStore::default(), MovableClock::new(1000), InstantTimer)
+            .with_policy(no_jitter(Duration::from_secs(600)))
+            .register(a.prefix, a).unwrap()
+            .register(b.prefix, b).unwrap()
+            .with_refresh_batching("a", policy);
+        block_on(mgr.store().put("a:x", rec)).unwrap();
+        (mgr, a_calls, b_calls)
+    };
+
+    // Deferred: expired exactly now, may wait 10 s.
+    let (mgr, a_calls, b_calls) = setup(batching(5, 10_000, None), pointer(500, 1000));
+    let report = block_on(mgr.retrieve(&[("a".to_string(), "x".to_string())])).unwrap();
+    assert!(report.is_complete(), "failures: {:?}", report.failures);
+    assert!(a_calls.borrow().is_empty());
+    assert_eq!(*b_calls.borrow(), ["t"], "a deferred pointer's target must be fetched");
+    assert_eq!(block_on(mgr.get("a", "x")).unwrap()["title"], "b:t");
+
+    // Pulled forward along with a miss: refetched as a concrete item, so the
+    // old target is never asked for.
+    let any_age = TopUp {
+        min_age_percent: 0,
+        fill: Fill::ChunkBoundary,
+    };
+    let (mgr, a_calls, b_calls) = setup(batching(0, 0, Some(any_age)), pointer(5000, 6000));
+    let cites = [
+        ("a".to_string(), "x".to_string()),
+        ("a".to_string(), "new".to_string()),
+    ];
+    block_on(mgr.retrieve(&cites)).unwrap();
+    assert_eq!(sorted(&a_calls), ["new", "x"]);
+    assert!(b_calls.borrow().is_empty(), "{:?}", b_calls.borrow());
+    assert_eq!(block_on(mgr.get("a", "x")).unwrap()["title"], "a:x");
+}
+
+/// The host override wins over the source default, per prefix.
+#[test]
+fn refresh_batching_override_is_per_prefix() {
+    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), MovableClock::new(0), InstantTimer)
+        .register("arxiv", ArxivSource::new()).unwrap()
+        .register("probe", ProbeSource::new(Duration::from_secs(1))).unwrap()
+        .with_refresh_batching("probe", batching(7, 0, None));
+    assert_eq!(mgr.refresh_batching("arxiv"), Some(ArxivSource::new().refresh_batching()));
+    assert_ne!(mgr.refresh_batching("arxiv"), Some(RefreshBatching::EAGER));
+    assert_eq!(mgr.refresh_batching("probe"), Some(batching(7, 0, None)));
+    assert_eq!(mgr.refresh_batching("nope"), None);
+    let mgr = mgr.with_refresh_batching("arxiv", RefreshBatching::EAGER);
+    assert_eq!(mgr.refresh_batching("arxiv"), Some(RefreshBatching::EAGER));
 }
