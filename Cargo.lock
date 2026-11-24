@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "autocitefetch"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "cachette",
  "futures-util",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "autocitefetch-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "autocitefetch",
  "autocitefetch-std",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "autocitefetch-std"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "autocitefetch",
  "cachette",
