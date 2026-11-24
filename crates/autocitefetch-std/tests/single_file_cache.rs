@@ -213,9 +213,10 @@ fn a_file_written_by_0_1_1_is_read_as_it_is() {
 
 // --- end to end, through the manager ---------------------------------------
 
-/// A time at which the fixture's DOI entry is fresh (before its
-/// `stale_after`).
-const FRESH: i64 = 1_710_000_000_000;
+/// A time at which every line of the fixture is fresh (before the arXiv
+/// pointer's `stale_after`, the earliest of them), so that a request for the
+/// arXiv id can only come from the pointer reading as absent.
+const FRESH: i64 = 1_700_000_000_000;
 
 /// The arXiv API URL for the fixture's arXiv id.
 const ARXIV_URL: &str = "https://export.arxiv.org/api/query?id_list=1211.1037&max_results=1";

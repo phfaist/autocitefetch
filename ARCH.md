@@ -490,8 +490,9 @@ deterministic FNV-1a hash of `(id, now)` (the same jitter family — no RNG, no 
 mixing `now` in re-rolls each `retrieve`, so an entry left alone now grows likelier to refetch as it
 drifts toward `expires`. Consequence: an entry's **effective TTL is close to its full nominal TTL**
 (arXiv's 10 d now really refetches near 10 d, not ~8.9 d), and a batch fetched together revalidates
-spread out rather than all at once. `classify` (Fresh/Stale/Expired) is unchanged and still used by
-`usable_within_grace` and `prune`; only the refetch decision is probabilistic. On top of that a `grace` window (14 days) during which a hard-expired entry is
+spread out rather than all at once. Grace and pruning are a plain comparison with `expires + grace`
+(`usable_within_grace` is `now < expires + grace`; `prune` applies `PruneRule::Volatile { grace }`);
+only the refetch decision is probabilistic. On top of that a `grace` window (14 days) during which a hard-expired entry is
 still served **if the source is currently unreachable** (stale-while-revalidate — see `store_resolutions`'
 `Outcome::Failed` arm →
 `note_failure`). Grace applies **only to `Outcome::Failed`** (transport/5xx/unloadable-file — "try
@@ -557,7 +558,7 @@ across passes, so the second pass of an arXiv→DOI chain cannot hit doi.org wit
 | prefix | chunk / interval / TTL | notes |
 |---|---|---|
 | `arxiv` | 100 / 3100 ms / 10 d | Atom feed parsed with `xmlparser`; version resolution; caches the arXiv metadata with the feed's DOI; on read, applies the DOI overrides and chains to the prefix set by `chain_dois_to` (default `Some("doi")`) |
-| `doi` | 1 / 1100 ms / 360 d | doi.org content negotiation returns CSL-JSON stored verbatim, values included — the only touch is `canonicalize_doi_key`, which renames a nonstandard lowercase `doi` key up to the CSL-standard uppercase `DOI` (doi.org already sends `DOI`, so it is normally a no-op) |
+| `doi` | 1 / 1100 ms / 360 d | doi.org content negotiation returns CSL-JSON, stored as returned minus the fields the `StoragePolicy` omits (`reference`/`abstract` by default, removed by the manager before `put`) — the source's only touch is `canonicalize_doi_key`, which renames a nonstandard lowercase `doi` key up to the CSL-standard uppercase `DOI` (doi.org already sends `DOI`, so it is normally a no-op) |
 | `manual` | ∞ / 0 / **0** | key *is* the formatted text, stored under `_ready_formatted: {<format_name>: <text>}` — the format name is a required `ManualSource::new` argument (host config, like a chain prefix; the CLI's `--manual-format` defaults to `flm`, matching JS); TTL 0 ⇒ ephemeral (readable for the life of the cache object, **never persisted** to `citations.jsonl` or a log, gone on restart — enforced by cachette's `WithEphemeral`, which `StoreCache` wraps around its store, keyed on the expiry times, not on the prefix) |
 | `bib` | ∞ / 0 / 60 s | file(s) fetched through the `Fetcher` (`file:` URLs), indexed by `id` |
 
@@ -589,9 +590,11 @@ implementation only stores what it is given.
 
 A record is the JSON text `{"concrete": <item>}` (`encode_item`/`decode_item`), exactly what 0.1.1
 wrote for a concrete entry, and no `id` is stamped into the item. So 0.1.1 files are reused without
-a conversion step: their DOI entries are read with their expiry times; their arXiv entries are 0.1.1
-chain pointers (`{"chained": …}`), which `decode_item` reads as absent, so they are fetched again
-(100 ids per request) and their lines replaced. 0.1.1 can still read a file written now.
+a conversion step: their concrete entries (DOI entries, and arXiv entries 0.1.1 stored with full
+metadata — versioned keys, entries without a DOI, chaining off, DOI suppressed by an override) are
+read with their expiry times; only the arXiv entries 0.1.1 stored as pointers to a DOI
+(`{"chained": …}`) read as absent (`decode_item`), so they are fetched again (100 ids per request)
+and their lines replaced. 0.1.1 can still read a file written now.
 
 Three ways to get a cache:
 
@@ -689,7 +692,8 @@ anywhere**, still). Things worth keeping straight:
 
 There is **no async runtime anywhere** — not in tests, examples, or the std crate. Every test defines
 a local `block_on` that polls with `Waker::noop()` and panics after ~1M polls ("a mock unexpectedly
-pended"). All std backends are blocking-in-a-future (`UreqFetcher` blocks the thread, `BlockingTimer`
+pended"). The std caches (`SingleFileCacheStore`, `SessionCache`) and the clock are synchronous; the
+async std backends are blocking-in-a-future (`UreqFetcher` blocks the thread, `BlockingTimer`
 sleeps it), so they resolve on first poll. Mocks (`MockFetcher` with a URL→response route table,
 `FixedClock`, `InstantTimer`) are **deliberately duplicated per test file** rather than shared —
 follow that pattern; copy from `tests/integration.rs` or `tests/arxiv.rs`. The in-memory cache is
@@ -719,13 +723,13 @@ can also register their own source at runtime; nothing about the built-ins is pr
 
 ## Docs convention
 
-`README.md` is the design document (workspace layout, design-decision table,
+`ARCH.md` (this file) is the design document (workspace layout, design-decision table,
 improvements-over-references list, status) and is updated in its own commits when architecture
-changes. It has drifted before — if you add a module, a source, or a backend, update the layout tree
+changes; `README.md` is the user-facing overview. It has drifted before — if you add a module, a source, or a backend, update the layout tree
 and the status paragraph in the same change.
 
-Module-level `//!` docs carry the real design rationale (why `BoxFuture` is `!Send`, why compaction
-locks, why jitter is deterministic). Read them before changing behavior; extend them when you do.
+Module-level `//!` docs carry the real design rationale (why `BoxFuture` is `!Send`, why jitter is
+deterministic); why compaction locks is in cachette's `engine/jsonl.rs`. Read them before changing behavior; extend them when you do.
 
 ## Reference implementations
 

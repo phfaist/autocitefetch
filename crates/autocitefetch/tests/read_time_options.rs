@@ -247,9 +247,11 @@ fn the_options_of_a_run_do_not_change_the_cache() {
     drop(mgr);
 
     // Run 2: A suppressed, B's override gone, chaining off, `author` dropped
-    // instead of `issued`; every request fails.
+    // instead of `issued`; every request fails. An hour later, when every
+    // item is still fresh: a rewrite of an unchanged item would now give it
+    // new expiry times, and so change the contents.
     fetcher.fail_everything();
-    let mgr = CitationManager::new(fetcher.clone(), cache.clone(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher.clone(), cache.clone(), FixedClock(3_600_000), InstantTimer)
         .with_dropped_csl_fields(["author"])
         .register("arxiv", ArxivSource::new().chain_dois_to(None).with_override_dois([(a.into(), None)])).unwrap()
         .register("doi", DoiSource::new()).unwrap();

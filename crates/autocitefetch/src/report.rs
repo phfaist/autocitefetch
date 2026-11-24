@@ -163,8 +163,8 @@ pub enum Wait<'a> {
     /// index of the attempt that just failed, so the retry about to happen is
     /// number `attempt + 1`.
     Backoff { url: &'a str, attempt: u32 },
-    /// Compacting the cache: taking the compaction lock and folding sidecars
-    /// into the committed file.
+    /// Flushing the cache: the cache backend makes its writes durable (for
+    /// the JSONL file, cachette merges the writer's log into the main file).
     CacheFlush,
 }
 

@@ -94,6 +94,10 @@ struct Instance<'a, T: ?Sized> {
 /// # }
 /// ```
 ///
+/// Give the `CitationManager` the same clock as the cachette [`Manager`]: the
+/// session stores expiry times computed with the manager's clock, while the
+/// `CitationManager` judges freshness with its own.
+///
 /// See the [module docs](self) for what it keeps, and why `get` always
 /// answers what this object stored.
 pub struct SessionCache {
@@ -180,11 +184,6 @@ impl SessionCache {
     /// [`Manager::none`], or one whose instance could not be opened.
     pub fn has_cache(&self) -> bool {
         self.session.has_cache()
-    }
-
-    /// The session, for a host that wants to inspect it.
-    pub fn session(&self) -> &ValuesSession {
-        &self.session
     }
 }
 

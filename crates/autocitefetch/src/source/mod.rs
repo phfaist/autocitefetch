@@ -325,8 +325,10 @@ pub trait Source {
     ///   That outcome is **the item that is cached**, so it must not depend on
     ///   the per-run configuration of the source: options belong here.
     /// * `interpret` is called at **every read** of a cached item, possibly
-    ///   several times in one run: during `retrieve`, for every cached or
-    ///   newly-fetched item (to find chain targets), and in every
+    ///   several times in one run: during `retrieve`, for every cached item
+    ///   it may keep (at classification, or within the grace period when its
+    ///   refetch fails) and every newly fetched one (to find chain targets),
+    ///   and in every
     ///   [`get`](crate::manager::CitationManager::get). It must give the same
     ///   answer for the same key, item and configuration.
     /// * It must accept **every item this source has cached**, including items

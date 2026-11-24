@@ -17,9 +17,11 @@
 //! simply absent) and supply your own — e.g. `reqwest` on an async runtime, or
 //! a browser `fetch()` on WASM.
 //!
-//! Every backend here is **blocking-in-a-future**: it does its work during the
-//! first poll and returns `Poll::Ready`, so a `Waker::noop()` poll loop drives
-//! it and no async runtime is pulled in. The catch is that nothing ever pends,
+//! The caches ([`SingleFileCacheStore`], [`SessionCache`]) and the clock are
+//! synchronous. The async backends ([`UreqFetcher`], [`BlockingTimer`]) are
+//! **blocking-in-a-future**: each does its work during the first poll and
+//! returns `Poll::Ready`, so a `Waker::noop()` poll loop drives it and no async
+//! runtime is pulled in. The catch is that nothing ever pends,
 //! so the manager's per-source concurrency degenerates to sequential execution
 //! — see the [`timer`] module docs.
 //!

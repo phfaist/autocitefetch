@@ -213,7 +213,7 @@ fn parse_retry_after(resp: &Response) -> Option<Duration> {
 }
 
 /// FNV-1a 64-bit over the url and attempt — a dependency-free deterministic
-/// seed for jitter (mirrors the cache module's `fnv1a` idea).
+/// seed for jitter, so the same url and attempt always get the same delay.
 fn seed(url: &str, attempt: u32) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in url.as_bytes() {

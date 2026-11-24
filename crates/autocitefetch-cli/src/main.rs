@@ -12,8 +12,9 @@
 //!
 //! Three shapes are worth knowing about when reading this file.
 //!
-//! **No async runtime.** Every `std` backend is *blocking-in-a-future*: it does
-//! its work on the first poll and returns `Poll::Ready`. So `retrieve` is
+//! **No async runtime.** The async `std` backends (the fetcher and the timer)
+//! are *blocking-in-a-future*: each does its work on the first poll and returns
+//! `Poll::Ready`. So `retrieve` is
 //! driven by a `Waker::noop()` poll loop ([`block_on`]) and the binary pulls in
 //! no executor — the same convention the library tests and the `resolve`
 //! example follow. The cache and `get` are synchronous and need no driver.
