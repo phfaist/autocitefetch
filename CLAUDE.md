@@ -32,4 +32,4 @@ Architecture information in `ARCH.md`.
 
 ## Specific instructions
 
-- Updating Changelog: one 2-3-sentence bullet point per *significant* change, no code details.
+- No changelog.
