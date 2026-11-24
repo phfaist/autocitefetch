@@ -34,6 +34,11 @@ jobs:
         run: cargo build --workspace --locked
       - name: Test workspace
         run: cargo test --workspace --locked
+      # The workspace build unifies `serde_json/std` (through cachette's `std`
+      # feature, enabled by autocitefetch-std); testing the core on its own
+      # still resolves its alloc-only features.
+      - name: Test the core alone (alloc-only features)
+        run: cargo test -p autocitefetch --locked
       - name: Core builds for wasm32 (no_std)
         run: cargo build --locked -p autocitefetch --target wasm32-unknown-unknown
       - name: std backends build without ureq/TLS

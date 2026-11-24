@@ -13,21 +13,27 @@
 //! Three shapes are worth knowing about when reading this file.
 //!
 //! **No async runtime.** Every `std` backend is *blocking-in-a-future*: it does
-//! its work on the first poll and returns `Poll::Ready`. So the whole binary is
-//! driven by a `Waker::noop()` poll loop ([`block_on`]) and pulls in no
-//! executor — the same convention the library tests and the `resolve` example
-//! follow.
+//! its work on the first poll and returns `Poll::Ready`. So `retrieve` is
+//! driven by a `Waker::noop()` poll loop ([`block_on`]) and the binary pulls in
+//! no executor — the same convention the library tests and the `resolve`
+//! example follow. The cache and `get` are synchronous and need no driver.
 //!
 //! **Two-phase retrieval.** [`CitationManager::retrieve`] populates the cache
 //! and returns only a failure report; [`CitationManager::get`] reads items back
-//! (following arXiv → DOI chain pointers). A citation can therefore fail in two
+//! (following arXiv → DOI chains). A citation can therefore fail in two
 //! places, and both are reported.
+//!
+//! **What the cache keeps.** `.citations.jsonl` holds what each source
+//! returned, minus `reference` and `abstract` unless `--keep-references` /
+//! `--keep-abstract` ask for them. The other options — `--drop-field`,
+//! `--arxiv-doi-overrides`, `--no-arxiv-chaining` — apply when items are read
+//! back, so they never change the file and take effect at once.
 //!
 //! **The cache is a directory of files, not one file.** While a run is in
 //! progress the committable `.citations.jsonl` is joined by
 //! `._.citations.<writer>.log` sidecars, their `.log.lock` companions,
 //! `._.citations.lock` and `._.citations.jsonl.tmp` — every throwaway file
-//! carrying the `._` prefix the core store puts in front of the base name, so
+//! carrying the `._` prefix the store puts in front of the base name, so
 //! `._.citations*` gitignores all of them and `.citations.jsonl` (the one file
 //! worth committing) needs no un-ignoring. Each is unlinked by whoever created
 //! it, so a finished run leaves only `.citations.jsonl` in the user's working
@@ -49,7 +55,7 @@ use std::time::Duration;
 
 use autocitefetch::report::{Reporter, ThrottledReporter};
 use autocitefetch::source::{ArxivSource, BibliographyFileSource, DoiSource, ManualSource};
-use autocitefetch::{CitationManager, CslValue};
+use autocitefetch::{CitationManager, CslValue, StoragePolicy};
 use autocitefetch_std::{BlockingTimer, SingleFileCacheStore, SystemClock, UreqFetcher};
 use clap::Parser;
 
@@ -146,14 +152,14 @@ fn run(cli: &Cli) -> Result<usize, String> {
         }
     }
 
-    // Phase 2: read the items back, following chain pointers. `get` can fail
+    // Phase 2: read the items back, following chains. `get` can fail
     // for a citation `retrieve` reported nothing about (a chain whose target
     // was dropped as authoritatively gone), so report those too.
     let mut items: Vec<CslValue> = Vec::with_capacity(cites.len());
     let mut emitted: Vec<String> = Vec::new();
     let mut unresolved = 0usize;
     for (prefix, key) in &cites {
-        match block_on(manager.get(prefix, key)) {
+        match manager.get(prefix, key) {
             Ok(item) => {
                 // `get` rewrites `id` to the *normalized* `prefix:key`, so two
                 // spellings of one citation (`doi:10.1103/PhysRevA…` and
@@ -200,11 +206,14 @@ fn build_manager(
     // `.citations` rather than the library default `citations`: the cache lands
     // in the user's working directory, so every file it creates should be
     // hidden and cover-able by one `.citations*` ignore rule.
-    let store = block_on(SingleFileCacheStore::with_base(
-        &cli.cache_dir,
-        &cli.cache_name,
-    ))
-    .map_err(|e| format!("cache in {}: {e}", cli.cache_dir.display()))?;
+    let store = SingleFileCacheStore::with_base(&cli.cache_dir, &cli.cache_name)
+        .map_err(|e| format!("cache in {}: {e}", cli.cache_dir.display()))?
+        // `--keep-references` / `--keep-abstract`: what the cache keeps.
+        .with_policy(StoragePolicy {
+            keep_reference: cli.keep_references,
+            keep_abstract: cli.keep_abstract,
+            ..StoragePolicy::default()
+        });
 
     let fetcher = match &cli.user_agent {
         Some(ua) => UreqFetcher::with_user_agent(ua.clone()),
@@ -215,8 +224,7 @@ fn build_manager(
     // declares, so this is where the CLI's fixed `arxiv:`/`doi:`/`bib:`/
     // `manual:` vocabulary is decided — `SourceKind::prefix` is the whole of it.
     let mut manager = CitationManager::new(fetcher, store, SystemClock, BlockingTimer)
-        // `--drop-field`: stripped on the way into the cache, so a dropped
-        // field never reaches `.citations.jsonl` either.
+        // `--drop-field`: removed from the output only; the cache is untouched.
         .with_dropped_csl_fields(cli.drop_field.iter().cloned())
         // Progress is a host capability like the other four, just optional: at
         // `-v` off it is a `NopReporter` and costs an empty vtable call.
@@ -319,6 +327,13 @@ fn warn_about_unusable_options(cli: &Cli, cites: &[(String, String)], sources: &
         // without an `id`.
         warn("--drop-field id is ignored: every entry is keyed on its `id`");
     }
+    for (field, keep) in [("reference", cli.keep_references), ("abstract", cli.keep_abstract)] {
+        if keep && cli.drop_field.iter().any(|f| f == field) {
+            warn(&format!(
+                "--drop-field {field} hides the `{field}` field that the cache keeps"
+            ));
+        }
+    }
     for prefix in requested {
         if !sources.iter().any(|s| s.prefix() == prefix) {
             warn(&format!(
@@ -365,8 +380,8 @@ fn note(msg: &str) {
 /// Drive a future to completion on this thread, with no async runtime.
 ///
 /// Every backend used here resolves on the first poll (`UreqFetcher` blocks the
-/// thread, `BlockingTimer` sleeps it, the cache store does blocking I/O), so a
-/// no-op waker suffices. The poll budget is the safety net: with `Waker::noop()`
+/// thread, `BlockingTimer` sleeps it, the cache is synchronous), so a no-op
+/// waker suffices. The poll budget is the safety net: with `Waker::noop()`
 /// nothing can wake this loop, so a future that genuinely pends would spin
 /// forever — fail loudly instead of hanging.
 fn block_on<F: Future>(fut: F) -> F::Output {

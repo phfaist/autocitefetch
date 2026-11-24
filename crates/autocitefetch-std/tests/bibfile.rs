@@ -51,7 +51,7 @@ fn bibliography_file_resolves_offline_through_the_fetcher() {
     // a temp path containing a literal `%` would then resolve elsewhere.
     let bib_url = bib_path.display().to_string();
 
-    let store = block_on(SingleFileCacheStore::new(dir.join("cache"))).expect("open cache dir");
+    let store = SingleFileCacheStore::new(dir.join("cache")).expect("open cache dir");
     let manager = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
         .register("bib", BibliographyFileSource::new([bib_url])).unwrap();
 
@@ -63,7 +63,7 @@ fn bibliography_file_resolves_offline_through_the_fetcher() {
         report.failures
     );
 
-    let item = block_on(manager.get("bib", "knuth1984")).expect("entry should resolve");
+    let item = manager.get("bib", "knuth1984").expect("entry should resolve");
     assert_eq!(item["id"], "bib:knuth1984");
     assert_eq!(item["title"], "The TeXbook");
     assert_eq!(item["type"], "book");
@@ -83,7 +83,7 @@ fn a_directory_instead_of_a_file_fails_without_retrying() {
 
     let tmp = tempfile::tempdir().expect("create temp dir");
     let dir = tmp.path();
-    let store = block_on(SingleFileCacheStore::new(dir.join("cache"))).expect("open cache dir");
+    let store = SingleFileCacheStore::new(dir.join("cache")).expect("open cache dir");
     let bibdir = dir.join("bibdir");
     std::fs::create_dir_all(&bibdir).expect("create bib dir");
 

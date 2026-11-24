@@ -7,10 +7,11 @@ use std::future::Future;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+use autocitefetch::cachette::{MemoryStore, Store as _};
 use autocitefetch::source::{ArxivSource, DoiSource, Source};
 use autocitefetch::{
-    BoxFuture, CacheRecord, CacheStore, CitationManager, Clock, FetchError, Fetcher, Request,
-    Response, StoreError, Timer, Timestamp,
+    BoxFuture, CitationManager, Clock, Fetcher, FetchError, Request, Response, StoreCache, Timer,
+    Timestamp,
 };
 
 // --- a minimal, always-ready block_on (mocks never truly pend) -------------
@@ -68,33 +69,22 @@ impl Fetcher for MockFetcher {
     }
 }
 
-#[derive(Default)]
-struct MemStore {
-    map: RefCell<StdMap<String, CacheRecord>>,
+/// The in-memory cache: cachette's `MemoryStore` behind `StoreCache`, as a
+/// host would wire it.
+type MemStore = StoreCache<MemoryStore>;
+
+fn mem_store() -> MemStore {
+    StoreCache::new(MemoryStore::new())
 }
 
-impl CacheStore for MemStore {
-    fn get(&self, id: &str) -> BoxFuture<'_, Result<Option<CacheRecord>, StoreError>> {
-        let v = self.map.borrow().get(id).cloned();
-        Box::pin(async move { Ok(v) })
-    }
-    fn put(&self, id: &str, record: CacheRecord) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().insert(id.into(), record);
-        Box::pin(async move { Ok(()) })
-    }
-    fn remove(&self, id: &str) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().remove(id);
-        Box::pin(async move { Ok(()) })
-    }
-    fn entries(&self) -> BoxFuture<'_, Result<Vec<(String, CacheRecord)>, StoreError>> {
-        let all: Vec<_> = self
-            .map
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        Box::pin(async move { Ok(all) })
-    }
+/// The ids the cache holds, sorted (ephemeral items excluded).
+fn stored_ids(cache: &MemStore) -> Vec<String> {
+    cache.with_store(|s| {
+        let mut ids = Vec::new();
+        s.list(&mut |info| ids.push(info.key)).unwrap();
+        ids.sort();
+        ids
+    })
 }
 
 struct FixedClock(i64);
@@ -161,9 +151,9 @@ fn arxiv_versionless_with_doi_chains_and_merges() {
     let arxiv_url = "https://export.arxiv.org/api/query?id_list=1211.1037&max_results=1";
     // The arXiv source emits the feed's mixed-case DOI as the chain target
     // verbatim; the manager normalizes that target key through the `doi`
-    // source's `normalize_key` (trim + lowercase) both when storing the pointer
-    // and when `get()` walks it — so doi.org is asked for the lower form and
-    // arXiv itself needs no DOI special-casing.
+    // source's `normalize_key` (trim + lowercase) every time the chain is
+    // derived (in `retrieve` and when `get()` walks it) — so doi.org is asked
+    // for the lower form and arXiv itself needs no DOI special-casing.
     let doi_url = "https://doi.org/10.1103/physrevlett.109.170502";
 
     let fetcher = MockFetcher::new()
@@ -174,7 +164,7 @@ fn arxiv_versionless_with_doi_chains_and_merges() {
             r#"{"type":"article-journal","title":"Resolved via DOI","DOI":"10.1103/PhysRevLett.109.170502"}"#,
         );
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
@@ -184,7 +174,7 @@ fn arxiv_versionless_with_doi_chains_and_merges() {
 
     // Reading the arXiv key follows the chain to the DOI entry, rewrites the id
     // back to the requested one, and merges the chained `arxivid`.
-    let item = block_on(mgr.get("arxiv", "1211.1037")).unwrap();
+    let item = mgr.get("arxiv", "1211.1037").unwrap();
     assert_eq!(item["id"], "arxiv:1211.1037");
     assert_eq!(item["title"], "Resolved via DOI");
     assert_eq!(item["arxivid"], "1211.1037", "chained set_properties merged in");
@@ -195,15 +185,10 @@ fn arxiv_versionless_with_doi_chains_and_merges() {
     assert_eq!(item["DOI"], "10.1103/PhysRevLett.109.170502");
     assert_eq!(item.get("doi"), None, "lowercase doi key must not survive");
 
-    // The stored pointer and its target agree on ONE lowercased `doi:` id — if
-    // the chain arm and the target's own storage normalized differently, `get`
-    // above would have broken on a dangling link.
-    let mut ids: Vec<String> = block_on(mgr.store().entries())
-        .unwrap()
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
-    ids.sort();
+    // The arXiv item's chain target (derived on read) and the target's own
+    // storage agree on ONE lowercased `doi:` id — if the two normalized
+    // differently, `get` above would have broken on a dangling link.
+    let ids = stored_ids(mgr.store());
     assert_eq!(
         ids,
         vec![
@@ -223,14 +208,14 @@ fn arxiv_built_csl_uses_uppercase_doi_key_with_verbatim_value() {
     let arxiv_url = "https://export.arxiv.org/api/query?id_list=1211.1037&max_results=1";
     let fetcher = MockFetcher::new().route(arxiv_url, 200, FEED_CHAINED);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new().chain_dois_to(None)).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1211.1037".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "1211.1037")).unwrap();
+    let item = mgr.get("arxiv", "1211.1037").unwrap();
     assert_eq!(item["title"], "A Chained arXiv Paper", "concrete arXiv metadata");
     assert_eq!(item["DOI"], "10.1103/PhysRevLett.109.170502", "verbatim, mixed case");
     assert_eq!(item.get("doi"), None, "lowercase doi key must not survive");
@@ -242,7 +227,7 @@ fn arxiv_concrete_parses_title_authors_and_issued() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, FEED_CONCRETE);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new().chain_dois_to(None)).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
@@ -250,7 +235,7 @@ fn arxiv_concrete_parses_title_authors_and_issued() {
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "0905.2794")).unwrap();
+    let item = mgr.get("arxiv", "0905.2794").unwrap();
 
     assert_eq!(item["id"], "arxiv:0905.2794");
     assert_eq!(item["type"], "article-journal");
@@ -296,14 +281,14 @@ fn issued_falls_back_to_published_when_no_updated() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new().chain_dois_to(None)).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1601.00007".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "1601.00007")).unwrap();
+    let item = mgr.get("arxiv", "1601.00007").unwrap();
     let dp = &item["issued"]["date-parts"][0];
     assert_eq!(dp[0], 2016);
     assert_eq!(dp[1], 7);
@@ -329,7 +314,7 @@ fn versioned_request_uses_that_versions_updated_date() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
@@ -337,7 +322,7 @@ fn versioned_request_uses_that_versions_updated_date() {
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "1211.1037v2")).unwrap();
+    let item = mgr.get("arxiv", "1211.1037v2").unwrap();
     assert_eq!(item["arxiv_version_number"], 2, "exact version, concrete");
     // issued is v2's `<updated>` (2012-12-14), NOT v1's `<published>` (2012-11-05).
     let dp = &item["issued"]["date-parts"][0];
@@ -363,14 +348,14 @@ fn arxiv_unknown_id_is_reported_not_fatal() {
 </feed>"#,
     );
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "9999.99999".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert_eq!(report.failures.len(), 1);
     assert_eq!(report.failures[0].prefix, "arxiv");
-    assert!(block_on(mgr.get("arxiv", "9999.99999")).is_err());
+    assert!(mgr.get("arxiv", "9999.99999").is_err());
 }
 
 // --- entity / character references -----------------------------------------
@@ -398,7 +383,7 @@ fn entity_references_are_decoded_in_titles_and_authors() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![
@@ -408,7 +393,7 @@ fn entity_references_are_decoded_in_titles_and_authors() {
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "1234.5678")).unwrap();
+    let item = mgr.get("arxiv", "1234.5678").unwrap();
     assert_eq!(item["title"], "A & B, $x < y$, &, &");
 
     // An undecoded `&amp;` would be a whitespace-free token that shifts this
@@ -419,7 +404,7 @@ fn entity_references_are_decoded_in_titles_and_authors() {
     assert_eq!(authors[0]["given"], "Ann &");
 
     // The remaining predefined names, plus a multi-byte numeric reference.
-    let other = block_on(mgr.get("arxiv", "1234.5679")).unwrap();
+    let other = mgr.get("arxiv", "1234.5679").unwrap();
     assert_eq!(other["title"], ">\"' and \u{2014} dash");
 }
 
@@ -440,14 +425,14 @@ fn malformed_entity_references_are_left_verbatim() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1234.5680".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "1234.5680")).unwrap();
+    let item = mgr.get("arxiv", "1234.5680").unwrap();
     assert_eq!(
         item["title"],
         "A &foo; B &#; C &amp D &#xZZ; E &#99999999999; F &"
@@ -475,14 +460,14 @@ fn cdata_content_stays_raw() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1234.5681".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "1234.5681")).unwrap();
+    let item = mgr.get("arxiv", "1234.5681").unwrap();
     assert_eq!(item["title"], "raw &amp; text");
 }
 
@@ -524,7 +509,7 @@ fn blank_arxiv_doi_does_not_chain_to_the_empty_doi_key() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
@@ -545,7 +530,7 @@ fn blank_arxiv_doi_does_not_chain_to_the_empty_doi_key() {
         ("2100.00002", "Self Closing"),
         ("2100.00003", "Whitespace Only"),
     ] {
-        let item = block_on(mgr.get("arxiv", key)).unwrap();
+        let item = mgr.get("arxiv", key).unwrap();
         assert_eq!(item["title"], title, "{key}: concrete arXiv metadata");
         assert_eq!(item["arxivid"], key);
         assert!(item.get("DOI").is_none(), "{key}: no empty `DOI` field");
@@ -579,7 +564,7 @@ fn old_style_ids_and_multi_key_chunks_build_the_expected_url() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![
@@ -590,12 +575,12 @@ fn old_style_ids_and_multi_key_chunks_build_the_expected_url() {
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
     // The `/` in an old-style id is not a version separator.
-    let old = block_on(mgr.get("arxiv", "math/0309136")).unwrap();
+    let old = mgr.get("arxiv", "math/0309136").unwrap();
     assert_eq!(old["arxivid"], "math/0309136");
     assert_eq!(old["arxiv_version_number"], 1);
     assert_eq!(old["title"], "An Old Style Preprint");
 
-    let versioned = block_on(mgr.get("arxiv", "hep-th/9901001v2")).unwrap();
+    let versioned = mgr.get("arxiv", "hep-th/9901001v2").unwrap();
     assert_eq!(versioned["arxivid"], "hep-th/9901001");
     assert_eq!(versioned["arxiv_version_number"], 2);
 }
@@ -622,7 +607,7 @@ fn old_style_subject_class_case_is_preserved_end_to_end() {
 </feed>"#;
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     // Padded, to show trimming still happens — just not case folding.
@@ -630,14 +615,14 @@ fn old_style_subject_class_case_is_preserved_end_to_end() {
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let entries = block_on(mgr.store().entries()).unwrap();
+    let entries = stored_ids(mgr.store());
     assert_eq!(entries.len(), 1);
     assert_eq!(
-        entries[0].0, "arxiv:math.AG/0601001",
+        entries[0], "arxiv:math.AG/0601001",
         "the cache id keeps the subject class's case"
     );
 
-    let item = block_on(mgr.get("arxiv", "math.AG/0601001")).unwrap();
+    let item = mgr.get("arxiv", "math.AG/0601001").unwrap();
     assert_eq!(item["id"], "arxiv:math.AG/0601001");
     assert_eq!(item["title"], "An Algebraic Geometry Preprint");
     // Sliced out of the feed's own `<id>`: `parse_arxiv_id` lowercases only to
@@ -648,7 +633,7 @@ fn old_style_subject_class_case_is_preserved_end_to_end() {
     // The lowercased spelling is a different citation, and nothing was stored
     // for it — the manager did not fold the two together.
     assert!(
-        block_on(mgr.get("arxiv", "math.ag/0601001")).is_err(),
+        mgr.get("arxiv", "math.ag/0601001").is_err(),
         "arXiv keys are not case-folded"
     );
 }
@@ -675,7 +660,7 @@ fn whitespace_padded_arxiv_keys_dedup_to_one_fetch_and_entry() {
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
     let calls = fetcher.calls();
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![
@@ -695,13 +680,13 @@ fn whitespace_padded_arxiv_keys_dedup_to_one_fetch_and_entry() {
     );
 
     // And exactly one cache entry, keyed by the trimmed id.
-    let entries = block_on(mgr.store().entries()).unwrap();
+    let entries = stored_ids(mgr.store());
     assert_eq!(entries.len(), 1, "one cache entry expected");
-    assert_eq!(entries[0].0, "arxiv:1211.1037", "stored under the trimmed id");
+    assert_eq!(entries[0], "arxiv:1211.1037", "stored under the trimmed id");
 
     // Every whitespace variant reads that one entry; the echoed id is canonical.
     for k in [" 1211.1037 ", "1211.1037", "1211.1037 ", " 1211.1037"] {
-        let item = block_on(mgr.get("arxiv", k)).unwrap();
+        let item = mgr.get("arxiv", k).unwrap();
         assert_eq!(item["id"], "arxiv:1211.1037", "canonical trimmed id for {k:?}");
         assert_eq!(item["title"], "A Padded Request");
         assert_eq!(item["arxivid"], "1211.1037");
@@ -723,14 +708,14 @@ fn version_suffix_matching_is_case_insensitive() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1211.1037V2".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "1211.1037V2")).unwrap();
+    let item = mgr.get("arxiv", "1211.1037V2").unwrap();
     assert_eq!(item["arxivid"], "1211.1037");
     assert_eq!(item["arxiv_version_number"], 2, "`V2` is `v2`");
 }
@@ -743,7 +728,7 @@ fn http_error_status_fails_every_key_in_the_chunk() {
     // 400 is not retryable, so the retrying fetcher passes it straight through.
     let fetcher = MockFetcher::new().route(arxiv_url, 400, "id_list is malformed");
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![
@@ -767,7 +752,7 @@ fn malformed_xml_fails_every_key_in_the_chunk() {
     let arxiv_url = "https://export.arxiv.org/api/query?id_list=1234.5678,1234.5679&max_results=2";
     let fetcher = MockFetcher::new().route(arxiv_url, 200, "<feed><entry><<</entry></feed>");
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![
@@ -820,7 +805,7 @@ fn arxiv_source_declares_its_rate_limits_and_chaining() {
 /// neither end is baked in: here the whole vocabulary is renamed — the arXiv
 /// source is registered as `preprint`, the DOI source as `dx` — and the chain
 /// still resolves end to end. A source hard-coding `"doi"` as its chain target
-/// (or its own prefix) would leave a dangling pointer.
+/// (or its own prefix) would leave a dangling chain.
 #[test]
 fn arxiv_chains_to_the_doi_prefix_it_was_configured_with() {
     let arxiv_url = "https://export.arxiv.org/api/query?id_list=1211.1037&max_results=1";
@@ -834,7 +819,7 @@ fn arxiv_chains_to_the_doi_prefix_it_was_configured_with() {
             r#"{"type":"article-journal","title":"Resolved via DOI","DOI":"10.1103/PhysRevLett.109.170502"}"#,
         );
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("preprint", ArxivSource::new().chain_dois_to(Some("dx")))
         .unwrap()
         .register("dx", DoiSource::new())
@@ -844,19 +829,14 @@ fn arxiv_chains_to_the_doi_prefix_it_was_configured_with() {
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("preprint", "1211.1037")).unwrap();
+    let item = mgr.get("preprint", "1211.1037").unwrap();
     assert_eq!(item["id"], "preprint:1211.1037", "the id echoes the host's prefix");
     assert_eq!(item["title"], "Resolved via DOI", "the chain was followed");
     assert_eq!(item["arxivid"], "1211.1037", "chained set_properties merged in");
 
-    // Both entries are stored under the host's names, and the pointer's target
-    // id matches the one the DOI source landed under.
-    let mut ids: Vec<String> = block_on(mgr.store().entries())
-        .unwrap()
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
-    ids.sort();
+    // Both entries are stored under the host's names, and the chain target id
+    // matches the one the DOI source landed under.
+    let ids = stored_ids(mgr.store());
     assert_eq!(
         ids,
         vec![
@@ -874,7 +854,7 @@ fn chaining_to_an_unregistered_prefix_is_reported_against_the_requested_cite() {
     let arxiv_url = "https://export.arxiv.org/api/query?id_list=1211.1037&max_results=1";
     let fetcher = MockFetcher::new().route(arxiv_url, 200, FEED_CHAINED);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new().chain_dois_to(Some("nowhere")))
         .unwrap();
 

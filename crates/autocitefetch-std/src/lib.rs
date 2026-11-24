@@ -1,9 +1,10 @@
 //! `std`-backed backends for [`autocitefetch`], for consumers that are *not*
 //! targeting a browser/WASM: a system [`Clock`](autocitefetch::Clock)
-//! ([`SystemClock`]), a blocking [`Timer`](autocitefetch::Timer)
-//! ([`BlockingTimer`]), and a filesystem
+//! ([`SystemClock`], cachette's, re-exported), a blocking
+//! [`Timer`](autocitefetch::Timer) ([`BlockingTimer`]), and a filesystem
 //! [`CacheStore`](autocitefetch::CacheStore) ([`SingleFileCacheStore`], a
-//! single committable JSONL file plus per-writer append logs).
+//! single committable JSONL file plus per-writer append logs, from cachette's
+//! `JsonlStore`).
 //!
 //! A blocking network [`Fetcher`](autocitefetch::Fetcher), [`UreqFetcher`], is
 //! provided behind the default-on `http` feature (backed by `ureq`). Disable
@@ -18,20 +19,22 @@
 //! — see the [`timer`] module docs.
 //!
 //! The backend modules are public so their design rationale (the
-//! blocking-in-a-future contract, the `file:` URL handling, why the clock is a
-//! wall clock) is reachable from the docs; the types are also re-exported at
+//! blocking-in-a-future contract, the `file:` URL handling) is reachable from
+//! the docs; the types are also re-exported at
 //! the crate root, which is the preferred path.
 
 #![forbid(unsafe_code)]
 
-pub mod clock;
 #[cfg(feature = "http")]
 pub mod fetcher;
 pub mod store;
 pub mod timer;
 
-pub use clock::SystemClock;
-pub use store::{DEFAULT_BASE, SingleFileCacheStore, StdCacheFs};
+/// The system wall clock: cachette's, made with `SystemClock::new()`. Wall
+/// clock, not monotonic, because the expiry times it feeds are persisted and
+/// must keep their meaning across restarts and machines.
+pub use autocitefetch::cachette::SystemClock;
+pub use store::{DEFAULT_BASE, SingleFileCacheStore};
 pub use timer::BlockingTimer;
 
 #[cfg(feature = "http")]

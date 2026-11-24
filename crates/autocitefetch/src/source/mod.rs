@@ -1,8 +1,8 @@
 //! The [`Source`] trait and the types a source returns.
 //!
 //! A source is a provider of bibliographic info (arXiv, DOI, …). It implements
-//! a single method, [`Source::retrieve_chunk`]; the manager handles routing,
-//! cache lookup, chunking, rate-limiting, and chaining.
+//! [`Source::retrieve_chunk`], and optionally [`Source::interpret`]; the
+//! manager handles routing, cache lookup, chunking, rate-limiting, and chaining.
 //!
 //! **A source does not own a prefix.** The prefix is chosen by the *host*, at
 //! [`register`](crate::manager::CitationManager::register) time: `(prefix,
@@ -13,8 +13,25 @@
 //! registered under a different one (`DoiSource` as `dx`). A source that needs to
 //! know the prefix it is currently answering for — to build an id for an error
 //! message, say — reads [`RetrieveCtx::prefix`]; one that *points* at another
-//! source ([`Outcome::Chained`]) must be told that target prefix as
+//! source ([`Interpreted::Chained`]) must be told that target prefix as
 //! configuration, the way [`ArxivSource::chain_dois_to`] does.
+//!
+//! # Fetch step and read step
+//!
+//! A source works in two steps, and the cache sits between them:
+//!
+//! 1. **Fetch** ([`Source::retrieve_chunk`], async): the answer of the
+//!    upstream for each key. An [`Outcome::Concrete`] item is what the cache
+//!    stores, so it must not depend on the per-run configuration of the source.
+//! 2. **Read** ([`Source::interpret`], synchronous and pure): turns a cached
+//!    item into what the citation resolves to, by applying that configuration
+//!    — a concrete item ([`Interpreted::Concrete`]), or a pointer to another
+//!    citation ([`Interpreted::Chained`]). The manager calls it at every read
+//!    of a cached item, during `retrieve` (to find chain targets) and in `get`.
+//!
+//! Splitting the two is what keeps the cache independent of the options of a
+//! run: changing arXiv's DOI overrides or its chain target changes what is
+//! read, never what is stored, and needs no request for entries already cached.
 
 pub mod arxiv;
 pub mod bibfile;
@@ -43,24 +60,13 @@ use crate::BoxFuture;
 pub enum Outcome {
     /// Concrete CSL-JSON metadata, with an optional per-entry TTL override
     /// (falls back to the source's [`Source::default_ttl`] when `None`).
+    ///
+    /// This is **the item that is cached** — it must be a JSON object, and must
+    /// not depend on the per-run configuration of the source; apply such
+    /// configuration in [`Source::interpret`] instead.
     Concrete {
         csl: CslValue,
         ttl: Option<Duration>,
-    },
-    /// A pointer to another `(prefix, key)`. `set_properties` is merged into
-    /// the resolved target at read time, **overriding** any colliding target
-    /// field (e.g. re-attaching `arxivid`).
-    ///
-    /// `prefix` is a prefix in the *host's* namespace, so a source that chains
-    /// must take it as configuration rather than hard-coding one: nothing
-    /// guarantees the target source was registered under the name this source
-    /// would have guessed (see [`ArxivSource::chain_dois_to`]). A
-    /// prefix with no registered source is reported as a failure on the target,
-    /// attributed back to the citation that pulled it in.
-    Chained {
-        prefix: String,
-        key: String,
-        set_properties: CslValue,
     },
     /// This key could not be resolved because the source was *unreachable* or
     /// erroring (transport failure, 5xx/timeout, a whole file that would not
@@ -95,25 +101,6 @@ impl Resolution {
         }
     }
 
-    /// Resolved to a pointer at `(target_prefix, target_key)`; `set_properties`
-    /// is merged into the target at read time, overriding colliding target
-    /// fields (see [`Outcome::Chained`]).
-    pub fn chained(
-        key: impl Into<String>,
-        target_prefix: impl Into<String>,
-        target_key: impl Into<String>,
-        set_properties: CslValue,
-    ) -> Self {
-        Resolution {
-            key: key.into(),
-            outcome: Outcome::Chained {
-                prefix: target_prefix.into(),
-                key: target_key.into(),
-                set_properties,
-            },
-        }
-    }
-
     /// Could not be resolved because the source was unreachable / erroring
     /// (transport, 5xx, an unloadable file). Grace-served if a cached copy is
     /// still within its window — see [`Outcome::Failed`]. Still counts as "one
@@ -134,6 +121,30 @@ impl Resolution {
             outcome: Outcome::Missing(err),
         }
     }
+}
+
+/// What a cached item resolves to, as [`Source::interpret`] answers it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Interpreted {
+    /// The citation resolves to this item.
+    Concrete(CslValue),
+    /// The citation resolves to another `(prefix, key)`. `set_properties` is
+    /// merged into the resolved target at read time, **overriding** any
+    /// colliding target field (e.g. re-attaching `arxivid`).
+    ///
+    /// `prefix` is a prefix in the *host's* namespace, so a source that chains
+    /// must take it as configuration rather than hard-coding one: nothing
+    /// guarantees the target source was registered under the name this source
+    /// would have guessed (see [`ArxivSource::chain_dois_to`]). A prefix with
+    /// no registered source is reported as a failure on the target, attributed
+    /// back to the citation that pulled it in. `key` may be given in any
+    /// spelling: the manager normalizes it with the target source's
+    /// [`Source::normalize_key`].
+    Chained {
+        prefix: String,
+        key: String,
+        set_properties: CslValue,
+    },
 }
 
 /// Everything a source needs from the host to do its work for one batch.
@@ -253,7 +264,7 @@ pub trait Source {
     /// DOI lookups to `doi` → `["doi"]`).
     ///
     /// **Advisory / introspection only** — the manager does not consult it.
-    /// Chain discovery is dynamic: an [`Outcome::Chained`] resolution pushes
+    /// Chain discovery is dynamic: an [`Interpreted::Chained`] answer pushes
     /// its target onto the retrieval worklist, which is drained in further
     /// passes, so ordering needs no static declaration. Declare it anyway to
     /// document the source's shape — and so a host can check, up front, that
@@ -292,9 +303,39 @@ pub trait Source {
     /// Do **not** implement retries here: the `ctx.fetcher` handed to a source
     /// is already wrapped in a
     /// [`RetryingFetcher`](crate::retry::RetryingFetcher).
+    ///
+    /// An [`Outcome::Concrete`] item is **what is cached**: it must not depend
+    /// on the per-run configuration of the source (see [`Source::interpret`]).
     fn retrieve_chunk<'a>(
         &'a self,
         keys: Vec<String>,
         ctx: &'a RetrieveCtx<'a>,
     ) -> BoxFuture<'a, Vec<Resolution>>;
+
+    /// Turns a cached item into what the citation resolves to, by applying
+    /// this source's configuration. Pure and synchronous: no I/O, no clock.
+    ///
+    /// The default answers the item unchanged ([`Interpreted::Concrete`]).
+    ///
+    /// # Contract
+    ///
+    /// * The item is one that [`retrieve_chunk`](Source::retrieve_chunk)
+    ///   returned as [`Outcome::Concrete`] for `key` (the normalized key), and
+    ///   that the cache stored — minus the fields the storage policy omits.
+    ///   That outcome is **the item that is cached**, so it must not depend on
+    ///   the per-run configuration of the source: options belong here.
+    /// * `interpret` is called at **every read** of a cached item, possibly
+    ///   several times in one run: during `retrieve`, for every cached or
+    ///   newly-fetched item (to find chain targets), and in every
+    ///   [`get`](crate::manager::CitationManager::get). It must give the same
+    ///   answer for the same key, item and configuration.
+    /// * It must accept **every item this source has cached**, including items
+    ///   cached by autocitefetch 0.1.1 (which may carry an `id`, and fields a
+    ///   0.1.1 source wrote after applying its options).
+    /// * A [`Interpreted::Chained`] answer to the citation's own id is a
+    ///   failure, reported by the manager.
+    fn interpret(&self, key: &str, item: CslValue) -> Interpreted {
+        let _ = key;
+        Interpreted::Concrete(item)
+    }
 }

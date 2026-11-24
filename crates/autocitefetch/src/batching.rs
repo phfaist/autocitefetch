@@ -1,6 +1,6 @@
 //! Refresh batching: shaping a source's refetch work into worthwhile requests.
 //!
-//! [`TtlPolicy::should_refetch`] decides, *per entry*, whether a cached record
+//! [`TtlPolicy::should_refresh`] decides, *per entry*, whether a cached item
 //! wants refreshing. On a large citation database that trickles: each
 //! `retrieve` finds a handful of entries that went stale since the last run, and
 //! refetching them costs a whole rate-limited request apiece (arXiv answers 100
@@ -29,14 +29,15 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use cachette::Expiry;
+
 use crate::cache::{Freshness, TtlPolicy};
 use crate::env::{Timestamp, millis_i64};
-use crate::store::CacheRecord;
 
 /// How a source's refresh work is shaped into requests.
 ///
 /// The [`Default`] is [`RefreshBatching::EAGER`]: fetch exactly what
-/// [`TtlPolicy::should_refetch`] asks for, when it asks — the behavior of a
+/// [`TtlPolicy::should_refresh`] asks for, when it asks — the behavior of a
 /// source that declares nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RefreshBatching {
@@ -114,11 +115,11 @@ pub enum RefreshClass {
 }
 
 impl RefreshBatching {
-    /// Classify a cached record at `now`.
+    /// Classify a cached item, with the expiry times `expiry`, at `now`.
     ///
     /// * Hard-expired for at least `max_defer` (capped at `ttl.grace`) ⇒
     ///   `Required`; for less ⇒ `Due`.
-    /// * Stale and [`TtlPolicy::should_refetch`] draws "refetch" ⇒ `Due`.
+    /// * Stale and [`TtlPolicy::should_refresh`] draws "refetch" ⇒ `Due`.
     /// * Otherwise `Eligible` if [`top_up`](Self::top_up) is set and the entry
     ///   is old enough (see [`TopUp::min_age_percent`]), else `Keep`.
     ///
@@ -127,13 +128,13 @@ impl RefreshBatching {
     pub fn classify(
         &self,
         ttl: &TtlPolicy,
-        record: &CacheRecord,
+        expiry: &Expiry,
         now: Timestamp,
         id: &str,
         nominal_ttl: Duration,
     ) -> RefreshClass {
-        if ttl.classify(record, now) == Freshness::Expired {
-            let overdue = now.as_millis().saturating_sub(record.expires.as_millis());
+        if ttl.classify(expiry, now) == Freshness::Expired {
+            let overdue = now.as_millis().saturating_sub(expiry.expires.as_millis());
             let max_defer = millis_i64(self.max_defer.min(ttl.grace));
             return if overdue >= max_defer {
                 RefreshClass::Required
@@ -141,11 +142,11 @@ impl RefreshBatching {
                 RefreshClass::Due
             };
         }
-        if ttl.should_refetch(record, now, id) {
+        if ttl.should_refresh(expiry, now, id) {
             return RefreshClass::Due;
         }
         match self.top_up {
-            Some(t) if is_old_enough(t.min_age_percent, record, now, nominal_ttl) => {
+            Some(t) if is_old_enough(t.min_age_percent, expiry, now, nominal_ttl) => {
                 RefreshClass::Eligible
             }
             _ => RefreshClass::Keep,
@@ -153,16 +154,16 @@ impl RefreshBatching {
     }
 }
 
-/// Whether a not-expired record's remaining life is within the last
+/// Whether a not-expired item's remaining life is within the last
 /// `(100 − min_age_percent)`% of `nominal_ttl`.
-fn is_old_enough(min_age_percent: u32, record: &CacheRecord, now: Timestamp, nominal_ttl: Duration) -> bool {
+fn is_old_enough(min_age_percent: u32, expiry: &Expiry, now: Timestamp, nominal_ttl: Duration) -> bool {
     let min_age_percent = min_age_percent.min(100);
     if min_age_percent == 0 {
         // Checked separately: TTL jitter can leave a just-fetched entry with
         // *more* than `nominal_ttl` to live, and 0% means "any age".
         return true;
     }
-    let remaining = record.expires.as_millis().saturating_sub(now.as_millis());
+    let remaining = expiry.expires.as_millis().saturating_sub(now.as_millis());
     let horizon = (millis_i64(nominal_ttl) as i128 * (100 - min_age_percent) as i128) / 100;
     (remaining as i128) <= horizon
 }
@@ -370,9 +371,8 @@ mod tests {
         assert_eq!(p.fetch.len(), 41);
     }
 
-    fn record(stale_after: i64, expires: i64) -> CacheRecord {
-        CacheRecord {
-            payload: crate::store::Payload::Concrete(serde_json::json!({})),
+    fn record(stale_after: i64, expires: i64) -> Expiry {
+        Expiry {
             stale_after: Timestamp(stale_after),
             expires: Timestamp(expires),
         }

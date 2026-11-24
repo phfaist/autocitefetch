@@ -9,15 +9,15 @@
 //! log below becomes `enter/exit/enter/exit` and the test fails.
 
 use std::cell::RefCell;
-use std::collections::HashMap as StdMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+use autocitefetch::cachette::MemoryStore;
 use autocitefetch::{
-    BoxFuture, CacheRecord, CacheStore, CitationManager, Clock, CslValue, FetchError, Fetcher,
-    Request, Resolution, Response, RetrieveCtx, Source, StoreError, Timer, Timestamp,
+    BoxFuture, CitationManager, Clock, CslValue, Fetcher, FetchError, Request, Resolution, Response,
+    RetrieveCtx, Source, StoreCache, Timer, Timestamp,
 };
 
 // --- a minimal, always-ready block_on (mocks never truly pend) -------------
@@ -43,33 +43,12 @@ impl Fetcher for NoopFetcher {
     }
 }
 
-#[derive(Default)]
-struct MemStore {
-    map: RefCell<StdMap<String, CacheRecord>>,
-}
+/// The in-memory cache: cachette's `MemoryStore` behind `StoreCache`, as a
+/// host would wire it.
+type MemStore = StoreCache<MemoryStore>;
 
-impl CacheStore for MemStore {
-    fn get(&self, id: &str) -> BoxFuture<'_, Result<Option<CacheRecord>, StoreError>> {
-        let v = self.map.borrow().get(id).cloned();
-        Box::pin(async move { Ok(v) })
-    }
-    fn put(&self, id: &str, record: CacheRecord) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().insert(id.into(), record);
-        Box::pin(async move { Ok(()) })
-    }
-    fn remove(&self, id: &str) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().remove(id);
-        Box::pin(async move { Ok(()) })
-    }
-    fn entries(&self) -> BoxFuture<'_, Result<Vec<(String, CacheRecord)>, StoreError>> {
-        let all: Vec<_> = self
-            .map
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        Box::pin(async move { Ok(all) })
-    }
+fn mem_store() -> MemStore {
+    StoreCache::new(MemoryStore::new())
 }
 
 struct FixedClock(i64);
@@ -152,7 +131,7 @@ impl Source for TagSource {
 #[test]
 fn two_sources_resolve_concurrently_in_one_pass() {
     let events: EventLog = Rc::new(RefCell::new(Vec::new()));
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), FixedClock(0), YieldingTimer)
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), FixedClock(0), YieldingTimer)
         .register(
             "alpha",
             TagSource {
@@ -194,17 +173,17 @@ fn two_sources_resolve_concurrently_in_one_pass() {
     assert_eq!(log[3].1, "exit", "log: {log:?}");
 
     // Both sources resolved their keys.
-    let a1 = block_on(mgr.get("alpha", "k1")).unwrap();
+    let a1 = mgr.get("alpha", "k1").unwrap();
     assert_eq!(a1["id"], "alpha:k1");
     assert_eq!(a1["title"], "alpha k1");
     assert_eq!(a1["source"], "alpha");
 
-    let b2 = block_on(mgr.get("beta", "k2")).unwrap();
+    let b2 = mgr.get("beta", "k2").unwrap();
     assert_eq!(b2["id"], "beta:k2");
     assert_eq!(b2["title"], "beta k2");
     assert_eq!(b2["source"], "beta");
 
-    let a3 = block_on(mgr.get("alpha", "k3")).unwrap();
+    let a3 = mgr.get("alpha", "k3").unwrap();
     assert_eq!(a3["id"], "alpha:k3");
     assert_eq!(a3["source"], "alpha");
 }

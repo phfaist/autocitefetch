@@ -15,11 +15,10 @@ exclude = ["tests/"]
 [dependencies]
 autocitefetch = { workspace = true }
 serde_json = { workspace = true }
-# The single-file cache is a core feature of this crate, so `fs4` (the advisory
-# compaction lock) is not optional. Note `atomic_replace` deliberately does *not*
-# use `tempfile` — it needs to carry the destination's permissions onto the temp
-# file, which `NamedTempFile`'s hard-coded 0600 would clobber.
-fs4 = "0.6"
+# The storage engine (the JSONL store, locks and merges) and the manager layer
+# for host-managed caches. `std` gives the real filesystem (`StdFs`), the system
+# clock and `cachette::Manager`.
+cachette = { workspace = true, features = ["std"] }
 # Optional blocking HTTP backend. Gated behind the `http` feature so the crate
 # still builds with no network/TLS dependency (see `UreqFetcher`).
 ureq = { version = "2", optional = true }

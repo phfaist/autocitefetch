@@ -7,10 +7,12 @@ use std::collections::HashMap as StdMap;
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
+use autocitefetch::cachette::MemoryStore;
+use autocitefetch::source::arxiv::load_override_dois;
 use autocitefetch::source::{ArxivSource, DoiSource};
 use autocitefetch::{
-    BoxFuture, CacheRecord, CacheStore, CitationManager, Clock, FetchError, Fetcher, Request,
-    Response, StoreError, Timer, Timestamp,
+    BoxFuture, CitationManager, Clock, Error, Fetcher, FetchError, Request, Response, StoreCache,
+    Timer, Timestamp,
 };
 
 // --- a minimal, always-ready block_on (mocks never truly pend) -------------
@@ -63,33 +65,12 @@ impl Fetcher for MockFetcher {
     }
 }
 
-#[derive(Default)]
-struct MemStore {
-    map: RefCell<StdMap<String, CacheRecord>>,
-}
+/// The in-memory cache: cachette's `MemoryStore` behind `StoreCache`, as a
+/// host would wire it.
+type MemStore = StoreCache<MemoryStore>;
 
-impl CacheStore for MemStore {
-    fn get(&self, id: &str) -> BoxFuture<'_, Result<Option<CacheRecord>, StoreError>> {
-        let v = self.map.borrow().get(id).cloned();
-        Box::pin(async move { Ok(v) })
-    }
-    fn put(&self, id: &str, record: CacheRecord) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().insert(id.into(), record);
-        Box::pin(async move { Ok(()) })
-    }
-    fn remove(&self, id: &str) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().remove(id);
-        Box::pin(async move { Ok(()) })
-    }
-    fn entries(&self) -> BoxFuture<'_, Result<Vec<(String, CacheRecord)>, StoreError>> {
-        let all: Vec<_> = self
-            .map
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        Box::pin(async move { Ok(all) })
-    }
+fn mem_store() -> MemStore {
+    StoreCache::new(MemoryStore::new())
 }
 
 struct FixedClock(i64);
@@ -158,7 +139,7 @@ fn override_map_injects_doi_when_feed_has_none() {
         r#"{"type":"article-journal","title":"Resolved Via Override","DOI":"10.9999/OVERRIDE.abc"}"#,
     );
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new().with_override_dois([kv("2001.00001", "10.9999/override.abc")])).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
@@ -166,7 +147,7 @@ fn override_map_injects_doi_when_feed_has_none() {
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "2001.00001")).unwrap();
+    let item = mgr.get("arxiv", "2001.00001").unwrap();
     assert_eq!(item["id"], "arxiv:2001.00001");
     assert_eq!(item["title"], "Resolved Via Override");
     assert_eq!(item["arxivid"], "2001.00001", "chained set_properties merged in");
@@ -192,7 +173,7 @@ fn override_map_beats_feed_doi() {
         r#"{"type":"article-journal","title":"Override Wins"}"#,
     );
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new().with_override_dois([kv("2002.00002", "10.9999/override.win")])).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
@@ -204,7 +185,7 @@ fn override_map_beats_feed_doi() {
         report.failures
     );
 
-    let item = block_on(mgr.get("arxiv", "2002.00002")).unwrap();
+    let item = mgr.get("arxiv", "2002.00002").unwrap();
     assert_eq!(item["title"], "Override Wins");
     assert_eq!(item["arxivid"], "2002.00002");
 }
@@ -226,23 +207,26 @@ fn override_file_entry_drives_chaining() {
             r#"{"type":"article-journal","title":"From File"}"#,
         );
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register("arxiv", ArxivSource::new().with_override_dois_file(file_url)).unwrap()
+    // Loaded once, at setup, and handed to the source as data.
+    let overrides = block_on(load_override_dois(&fetcher, file_url)).unwrap();
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
+        .register("arxiv", ArxivSource::new().with_override_dois(overrides)).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "4001.00004".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "4001.00004")).unwrap();
+    let item = mgr.get("arxiv", "4001.00004").unwrap();
     assert_eq!(item["title"], "From File");
     assert_eq!(item["arxivid"], "4001.00004");
 }
 
 #[test]
-fn inline_override_beats_file_override() {
-    // Both the file and the inline map name a DOI for 3001.00003; the INLINE one
-    // must win. Only the inline doi.org URL is routed, so success proves it.
+fn later_inline_override_beats_file_override() {
+    // Both the file and a later inline map name a DOI for 3001.00003; the later
+    // (inline) one must win. Only the inline doi.org URL is routed, so success
+    // proves it.
     let file_url = "https://host.example/arxiv-dois.json";
     let arxiv_url = "https://export.arxiv.org/api/query?id_list=3001.00003&max_results=1";
     let inline_doi_url = "https://doi.org/10.7777/inline.wins";
@@ -257,11 +241,12 @@ fn inline_override_beats_file_override() {
             r#"{"type":"article-journal","title":"Inline Wins"}"#,
         );
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let from_file = block_on(load_override_dois(&fetcher, file_url)).unwrap();
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register(
             "arxiv",
             ArxivSource::new()
-                .with_override_dois_file(file_url)
+                .with_override_dois(from_file)
                 .with_override_dois([kv("3001.00003", "10.7777/inline.wins")]),
         ).unwrap()
         .register("doi", DoiSource::new()).unwrap();
@@ -274,84 +259,62 @@ fn inline_override_beats_file_override() {
         report.failures
     );
 
-    let item = block_on(mgr.get("arxiv", "3001.00003")).unwrap();
+    let item = mgr.get("arxiv", "3001.00003").unwrap();
     assert_eq!(item["title"], "Inline Wins");
 }
 
 #[test]
-fn override_file_load_failure_fails_keys_gracefully() {
-    // A missing override file must degrade to per-key failures, not a panic.
+fn override_file_load_failure_is_an_error_at_setup() {
+    // A missing override file is an error of `load_override_dois`, at setup —
+    // not a panic, and no longer a failure of every arXiv key at retrieval.
     let file_url = "https://host.example/missing.json";
-    let arxiv_url = "https://export.arxiv.org/api/query?id_list=5001.00005&max_results=1";
-    let feed = make_feed(&[("5001.00005v1", None)]);
 
     // Note: the file URL is deliberately NOT routed (404).
-    let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
+    let fetcher = MockFetcher::new();
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register("arxiv", ArxivSource::new().with_override_dois_file(file_url)).unwrap()
-        .register("doi", DoiSource::new()).unwrap();
-
-    let cites = vec![("arxiv".to_string(), "5001.00005".to_string())];
-    let report = block_on(mgr.retrieve(&cites)).unwrap();
-    assert_eq!(report.failures.len(), 1);
-    assert_eq!(report.failures[0].prefix, "arxiv");
-    // Pin *which* fetch failed: the arXiv feed itself is routed and healthy, so
-    // a regression that broke the feed fetch instead must not pass this test.
+    let err = block_on(load_override_dois(&fetcher, file_url)).unwrap_err();
+    assert!(matches!(err, Error::Source(_)), "{err:?}");
+    // Pin *which* fetch failed: the override file must be named as the cause.
     assert!(
-        report.failures[0].message.contains("DOI-override file"),
-        "the override file must be named as the cause: {}",
-        report.failures[0].message
+        err.to_string().contains("DOI-override file"),
+        "the override file must be named as the cause: {err}"
     );
-    assert!(block_on(mgr.get("arxiv", "5001.00005")).is_err());
 }
 
 #[test]
 fn override_file_must_be_a_json_object() {
-    // A JSON array is not a `{id: doi}` map. The arXiv feed IS routed, so only
-    // the shape error can fail this key — and it must not panic.
+    // A JSON array is not a `{id: doi}` map; the shape error must not panic.
     let file_url = "https://host.example/bad-shape.json";
-    let arxiv_url = "https://export.arxiv.org/api/query?id_list=5002.00005&max_results=1";
-    let feed = make_feed(&[("5002.00005v1", None)]);
+    let fetcher = MockFetcher::new().route(file_url, 200, "[1,2]");
 
-    let fetcher = MockFetcher::new()
-        .route(file_url, 200, "[1,2]")
-        .route(arxiv_url, 200, &feed);
-
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register("arxiv", ArxivSource::new().with_override_dois_file(file_url)).unwrap();
-
-    let cites = vec![("arxiv".to_string(), "5002.00005".to_string())];
-    let report = block_on(mgr.retrieve(&cites)).unwrap();
-    assert_eq!(report.failures.len(), 1);
+    let err = block_on(load_override_dois(&fetcher, file_url)).unwrap_err();
     assert!(
-        report.failures[0].message.contains("not a JSON object"),
-        "unexpected message: {}",
-        report.failures[0].message
+        err.to_string().contains("not a JSON object"),
+        "unexpected message: {err}"
     );
 }
 
 #[test]
 fn override_file_values_must_be_string_or_null() {
     let file_url = "https://host.example/bad-value.json";
-    let arxiv_url = "https://export.arxiv.org/api/query?id_list=5003.00005&max_results=1";
-    let feed = make_feed(&[("5003.00005v1", None)]);
+    let fetcher = MockFetcher::new().route(file_url, 200, r#"{"x": 5}"#);
 
-    let fetcher = MockFetcher::new()
-        .route(file_url, 200, r#"{"x": 5}"#)
-        .route(arxiv_url, 200, &feed);
-
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register("arxiv", ArxivSource::new().with_override_dois_file(file_url)).unwrap();
-
-    let cites = vec![("arxiv".to_string(), "5003.00005".to_string())];
-    let report = block_on(mgr.retrieve(&cites)).unwrap();
-    assert_eq!(report.failures.len(), 1);
+    let err = block_on(load_override_dois(&fetcher, file_url)).unwrap_err();
     assert!(
-        report.failures[0].message.contains("must be a string or null"),
-        "unexpected message: {}",
-        report.failures[0].message
+        err.to_string().contains("must be a string or null"),
+        "unexpected message: {err}"
     );
+}
+
+#[test]
+fn override_file_pairs_are_what_with_override_dois_accepts() {
+    // A string injects, `null` suppresses; every entry of the object is kept.
+    let file_url = "https://host.example/arxiv-dois.json";
+    let fetcher = MockFetcher::new().route(file_url, 200, r#"{"1":"10.1/a","2":null}"#);
+
+    let mut pairs = block_on(load_override_dois(&fetcher, file_url)).unwrap();
+    pairs.sort();
+    assert_eq!(pairs, vec![kv("1", "10.1/a"), suppress("2")]);
 }
 
 // --- Task 2: careful multi-version resolution ------------------------------
@@ -365,14 +328,14 @@ fn versionless_request_selects_highest_version() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1801.00002".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "1801.00002")).unwrap();
+    let item = mgr.get("arxiv", "1801.00002").unwrap();
     assert_eq!(item["id"], "arxiv:1801.00002");
     assert_eq!(item["arxiv_version_number"], 2, "highest version selected");
     assert_eq!(item["title"], "Title 1801.00002v2");
@@ -387,14 +350,14 @@ fn versionless_request_prefers_a_versionless_entry() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1802.00003".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "1802.00003")).unwrap();
+    let item = mgr.get("arxiv", "1802.00003").unwrap();
     assert_eq!(
         item["arxiv_version_number"],
         serde_json::Value::Null,
@@ -419,14 +382,14 @@ fn versionless_request_compares_versions_numerically() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1803.00004".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "1803.00004")).unwrap();
+    let item = mgr.get("arxiv", "1803.00004").unwrap();
     assert_eq!(item["arxiv_version_number"], 11, "11 > 2, numerically");
     assert_eq!(item["title"], "Title 1803.00004v11");
 }
@@ -440,7 +403,7 @@ fn explicit_version_missing_from_the_feed_fails_rather_than_substituting() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
@@ -456,7 +419,7 @@ fn explicit_version_missing_from_the_feed_fails_rather_than_substituting() {
         "unexpected message: {}",
         report.failures[0].message
     );
-    assert!(block_on(mgr.get("arxiv", "1804.00005v2")).is_err());
+    assert!(mgr.get("arxiv", "1804.00005v2").is_err());
 }
 
 #[test]
@@ -478,7 +441,7 @@ fn versionless_and_versioned_requests_for_one_paper_coexist_in_a_batch() {
         r#"{"type":"article-journal","title":"Latest Version Via DOI"}"#,
     );
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
@@ -489,12 +452,12 @@ fn versionless_and_versioned_requests_for_one_paper_coexist_in_a_batch() {
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let latest = block_on(mgr.get("arxiv", "1805.00006")).unwrap();
+    let latest = mgr.get("arxiv", "1805.00006").unwrap();
     assert_eq!(latest["id"], "arxiv:1805.00006");
     assert_eq!(latest["title"], "Latest Version Via DOI");
     assert_eq!(latest["arxivid"], "1805.00006");
 
-    let pinned = block_on(mgr.get("arxiv", "1805.00006v2")).unwrap();
+    let pinned = mgr.get("arxiv", "1805.00006v2").unwrap();
     assert_eq!(pinned["id"], "arxiv:1805.00006v2");
     assert_eq!(pinned["title"], "Title 1805.00006v2");
     assert_eq!(pinned["arxiv_version_number"], 2);
@@ -517,7 +480,7 @@ fn explicit_version_selects_that_version_and_stays_concrete() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
@@ -529,7 +492,7 @@ fn explicit_version_selects_that_version_and_stays_concrete() {
         report.failures
     );
 
-    let item = block_on(mgr.get("arxiv", "1801.00002v1")).unwrap();
+    let item = mgr.get("arxiv", "1801.00002v1").unwrap();
     assert_eq!(item["id"], "arxiv:1801.00002v1");
     assert_eq!(item["arxiv_version_number"], 1, "exact version preserved");
     assert_eq!(item["title"], "Title 1801.00002v1");
@@ -549,14 +512,14 @@ fn versionless_highest_version_is_numeric_not_lexicographic() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1807.00008".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "1807.00008")).unwrap();
+    let item = mgr.get("arxiv", "1807.00008").unwrap();
     assert_eq!(item["arxiv_version_number"], 10, "10 > 2, numerically");
     assert_eq!(item["title"], "Title 1807.00008v10");
 }
@@ -573,14 +536,14 @@ fn versionless_entry_wins_even_when_seen_before_versioned_ones() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "1808.00009".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "1808.00009")).unwrap();
+    let item = mgr.get("arxiv", "1808.00009").unwrap();
     assert_eq!(
         item["arxiv_version_number"],
         serde_json::Value::Null,
@@ -610,7 +573,7 @@ fn versionless_ties_take_the_later_seen_entry() {
         r#"{"type":"article-journal","title":"Later Entry Won"}"#,
     );
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
@@ -622,7 +585,7 @@ fn versionless_ties_take_the_later_seen_entry() {
         report.failures
     );
 
-    let item = block_on(mgr.get("arxiv", "1806.00007")).unwrap();
+    let item = mgr.get("arxiv", "1806.00007").unwrap();
     assert_eq!(item["title"], "Later Entry Won", "feed order decides the tie");
     assert_eq!(item["arxivid"], "1806.00007");
 }
@@ -638,7 +601,7 @@ fn versionless_no_data_reports_missing_without_substituting_another_id() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
@@ -654,9 +617,9 @@ fn versionless_no_data_reports_missing_without_substituting_another_id() {
         "unexpected message: {}",
         report.failures[0].message
     );
-    assert!(block_on(mgr.get("arxiv", "1809.00010")).is_err());
+    assert!(mgr.get("arxiv", "1809.00010").is_err());
     // The unrelated entry must not have leaked in under our requested key.
-    assert!(block_on(mgr.get("arxiv", "1899.99999")).is_err());
+    assert!(mgr.get("arxiv", "1899.99999").is_err());
 }
 
 // --- Task 1b: DOI suppression (None) ---------------------------------------
@@ -671,7 +634,7 @@ fn override_none_suppresses_feed_doi() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new().with_override_dois([suppress("6001.00006")])).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
@@ -683,7 +646,7 @@ fn override_none_suppresses_feed_doi() {
         report.failures
     );
 
-    let item = block_on(mgr.get("arxiv", "6001.00006")).unwrap();
+    let item = mgr.get("arxiv", "6001.00006").unwrap();
     // Concrete arXiv metadata, NOT a chained DOI entry.
     assert_eq!(item["id"], "arxiv:6001.00006");
     assert_eq!(item["title"], "Title 6001.00006v1");
@@ -703,15 +666,17 @@ fn override_file_null_suppresses_doi() {
         .route(file_url, 200, r#"{"7001.00007":null}"#)
         .route(arxiv_url, 200, &feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register("arxiv", ArxivSource::new().with_override_dois_file(file_url)).unwrap()
+    // Loaded once, at setup, and handed to the source as data.
+    let overrides = block_on(load_override_dois(&fetcher, file_url)).unwrap();
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
+        .register("arxiv", ArxivSource::new().with_override_dois(overrides)).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "7001.00007".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("arxiv", "7001.00007")).unwrap();
+    let item = mgr.get("arxiv", "7001.00007").unwrap();
     assert_eq!(item["title"], "Title 7001.00007v1");
     assert!(item.get("DOI").is_none(), "null in file suppresses the DOI");
     assert!(item.get("doi").is_none(), "no lowercase `doi` key either");
@@ -730,7 +695,7 @@ fn empty_string_override_does_not_chain_to_the_empty_doi_key() {
 
     let fetcher = MockFetcher::new().route(arxiv_url, 200, &feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ArxivSource::new().with_override_dois([kv("8001.00008", "")])).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
@@ -742,7 +707,7 @@ fn empty_string_override_does_not_chain_to_the_empty_doi_key() {
         report.failures
     );
 
-    let item = block_on(mgr.get("arxiv", "8001.00008")).unwrap();
+    let item = mgr.get("arxiv", "8001.00008").unwrap();
     assert_eq!(item["id"], "arxiv:8001.00008");
     assert_eq!(item["title"], "Title 8001.00008v1");
     assert!(item.get("DOI").is_none(), "a blank DOI is no DOI");
@@ -760,8 +725,10 @@ fn empty_string_in_override_file_does_not_chain_to_the_empty_doi_key() {
         .route(file_url, 200, r#"{"8002.00008":""}"#)
         .route(arxiv_url, 200, &feed);
 
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
-        .register("arxiv", ArxivSource::new().with_override_dois_file(file_url)).unwrap()
+    // Loaded once, at setup, and handed to the source as data.
+    let overrides = block_on(load_override_dois(&fetcher, file_url)).unwrap();
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
+        .register("arxiv", ArxivSource::new().with_override_dois(overrides)).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("arxiv".to_string(), "8002.00008".to_string())];
@@ -772,7 +739,7 @@ fn empty_string_in_override_file_does_not_chain_to_the_empty_doi_key() {
         report.failures
     );
 
-    let item = block_on(mgr.get("arxiv", "8002.00008")).unwrap();
+    let item = mgr.get("arxiv", "8002.00008").unwrap();
     assert_eq!(item["title"], "Title 8002.00008v1");
     assert!(item.get("DOI").is_none(), "a blank DOI is no DOI");
     assert!(item.get("doi").is_none(), "no lowercase `doi` key either");

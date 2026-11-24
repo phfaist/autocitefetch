@@ -24,10 +24,10 @@ use autocitefetch::CitationManager;
 use autocitefetch::source::{BibliographyFileSource, DoiSource, ManualSource};
 use autocitefetch_std::{BlockingTimer, SingleFileCacheStore, SystemClock, UreqFetcher};
 
-/// A minimal blocking driver. Every backend here (`UreqFetcher` blocks the
-/// thread, `BlockingTimer` sleeps it, `SingleFileCacheStore` does blocking I/O)
-/// resolves its future on the first poll, so a no-op waker suffices — no async
-/// runtime is pulled in. On a real async runtime, use that runtime's `block_on`
+/// A minimal blocking driver for `retrieve`, the one async call. Every backend
+/// here (`UreqFetcher` blocks the thread, `BlockingTimer` sleeps it) resolves
+/// its future on the first poll, so a no-op waker suffices — no async runtime
+/// is pulled in. The cache and `get` are synchronous. On a real async runtime, use that runtime's `block_on`
 /// and async `Fetcher`/`Timer` instead.
 ///
 /// The poll budget matters: with a `Waker::noop()` there is nothing to wake
@@ -71,7 +71,10 @@ fn main() {
     let bib_url = bib_path.display().to_string();
 
     let cache_dir = tmp.join("cache");
-    let store = block_on(SingleFileCacheStore::new(&cache_dir)).expect("open cache dir");
+    // The default storage policy leaves the bulky `reference` and `abstract`
+    // fields out of the cache (and so out of the output); pass a
+    // `StoragePolicy` to `with_policy` to keep them.
+    let store = SingleFileCacheStore::new(&cache_dir).expect("open cache dir");
 
     let manager = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
         .register("doi", DoiSource::new())
@@ -109,7 +112,7 @@ fn main() {
 
     for (prefix, key) in &cites {
         println!("\n=== {prefix}:{key} ===");
-        match block_on(manager.get(prefix, key)) {
+        match manager.get(prefix, key) {
             Ok(item) => match serde_json::to_string_pretty(&item) {
                 Ok(json) => println!("{json}"),
                 Err(e) => eprintln!("(could not serialize: {e})"),

@@ -76,11 +76,10 @@
 //! [`get`](crate::manager::CitationManager::get) emits nothing: it is a local
 //! cache read with no waiting in it. And the events for cache compaction are
 //! emitted by the *manager*, around its [`CacheStore::flush`] calls, rather than
-//! from inside [`FileCacheStore`](crate::filecache::FileCacheStore) — putting an
-//! `Rc` in the store would make it `!Send`, and the concurrency regression tests
-//! move stores across threads. `flush` is the only operation that locks, so
-//! wrapping the call site loses nothing but the ability to distinguish "blocked
-//! on the lock" from "folding the sidecars".
+//! from inside the store — the store is any `cachette` store, which knows
+//! nothing of this crate's reporter. `flush` is the operation that takes the
+//! merge lock of a JSONL store, so wrapping the call site loses nothing but the
+//! ability to distinguish "blocked on the lock" from "merging the logs".
 //!
 //! [`Fetcher`]: crate::fetch::Fetcher
 //! [`Clock`]: crate::env::Clock
@@ -143,8 +142,9 @@ impl Reporter for NopReporter {
 pub enum Resolved<'a> {
     /// Concrete CSL-JSON was stored for this citation.
     Concrete,
-    /// A pointer to another citation was stored; the target is fetched in a
-    /// later pass (and reaches this reporter as its own events).
+    /// The item was stored, and it resolves to another citation (see
+    /// [`Source::interpret`](crate::source::Source::interpret)); the target is
+    /// fetched in a later pass (and reaches this reporter as its own events).
     Chained { prefix: &'a str, key: &'a str },
 }
 

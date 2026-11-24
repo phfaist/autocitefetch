@@ -8,17 +8,18 @@
 //! constant, which is why none of them can reach time-dependent behavior.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap as StdMap;
 use std::future::Future;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use autocitefetch::cachette::{Expiry, Fields, MemoryStore, NewValue, Store as _, StoreErrorKind};
 use autocitefetch::source::ArxivSource;
+use autocitefetch::store::encode_item;
 use autocitefetch::{
-    BoxFuture, CacheRecord, CacheStore, CitationManager, Clock, CslValue, FetchError, Fetcher,
-    Fill, Freshness, Payload, RefreshBatching, Request, Resolution, Response, RetrieveCtx, Source,
-    StoreError, Timer, Timestamp, TopUp, TtlPolicy,
+    BoxFuture, CachedItem, CacheStore, CitationManager, Clock, CslValue, Fetcher, FetchError, Fill,
+    Freshness, Interpreted, RefreshBatching, Request, Resolution, Response, RetrieveCtx, Source,
+    StoragePolicy, StoreCache, StoreError, Timer, Timestamp, TopUp, TtlPolicy,
 };
 
 // --- a minimal, always-ready block_on (mocks never truly pend) -------------
@@ -44,33 +45,51 @@ impl Fetcher for NoopFetcher {
     }
 }
 
-#[derive(Default)]
-struct MemStore {
-    map: RefCell<StdMap<String, CacheRecord>>,
+/// The in-memory cache: cachette's `MemoryStore` behind `StoreCache`, as a
+/// host would wire it.
+type MemStore = StoreCache<MemoryStore>;
+
+fn mem_store() -> MemStore {
+    StoreCache::new(MemoryStore::new())
 }
 
-impl CacheStore for MemStore {
-    fn get(&self, id: &str) -> BoxFuture<'_, Result<Option<CacheRecord>, StoreError>> {
-        let v = self.map.borrow().get(id).cloned();
-        Box::pin(async move { Ok(v) })
-    }
-    fn put(&self, id: &str, record: CacheRecord) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().insert(id.into(), record);
-        Box::pin(async move { Ok(()) })
-    }
-    fn remove(&self, id: &str) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().remove(id);
-        Box::pin(async move { Ok(()) })
-    }
-    fn entries(&self) -> BoxFuture<'_, Result<Vec<(String, CacheRecord)>, StoreError>> {
-        let all: Vec<_> = self
-            .map
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        Box::pin(async move { Ok(all) })
-    }
+/// An in-memory cache with the TTL policy `ttl` (the TTL policy belongs to the
+/// cache's storage policy, not to the manager).
+fn store_with(ttl: TtlPolicy) -> MemStore {
+    mem_store().with_policy(StoragePolicy {
+        ttl,
+        ..StoragePolicy::default()
+    })
+}
+
+/// Store `item` under `id` with the expiry times `[stale_after, expires)`, as
+/// an earlier run would have left it.
+fn seed(store: &MemStore, id: &str, item: CslValue, stale_after: i64, expires: i64) {
+    let fields = Fields {
+        expiry: Some(Expiry {
+            stale_after: Timestamp::from_millis(stale_after),
+            expires: Timestamp::from_millis(expires),
+        }),
+        ..Fields::default()
+    };
+    let value = NewValue::new(encode_item(&item).unwrap(), fields);
+    store.with_store(|s| s.put(id, value)).unwrap();
+}
+
+/// An item that [`RecordingSource::interpret`] reads as a chain to
+/// `(prefix, key)`: chaining is derived on read, so a chaining item is an
+/// ordinary cached item that says where it points.
+fn chain_item(prefix: &str, key: &str) -> CslValue {
+    serde_json::json!({"_chain_to": {"prefix": prefix, "key": key}})
+}
+
+/// How many values the cache holds (ephemeral items excluded).
+fn stored_count(store: &MemStore) -> usize {
+    store.with_store(|s| {
+        let mut n = 0;
+        s.list(&mut |_| n += 1).unwrap();
+        n
+    })
 }
 
 /// A store whose `put` always fails, so the "only store errors abort" boundary
@@ -82,21 +101,27 @@ struct FailingStore {
 }
 
 impl CacheStore for FailingStore {
-    fn get(&self, _id: &str) -> BoxFuture<'_, Result<Option<CacheRecord>, StoreError>> {
-        Box::pin(async { Ok(None) })
+    fn policy(&self) -> StoragePolicy {
+        StoragePolicy {
+            ttl: no_jitter(Duration::from_secs(60)),
+            ..StoragePolicy::default()
+        }
     }
-    fn put(&self, _id: &str, _record: CacheRecord) -> BoxFuture<'_, Result<(), StoreError>> {
-        Box::pin(async { Err(StoreError("disk on fire".into())) })
+    fn get(&self, _id: &str) -> Result<Option<CachedItem>, StoreError> {
+        Ok(None)
     }
-    fn remove(&self, _id: &str) -> BoxFuture<'_, Result<(), StoreError>> {
-        Box::pin(async { Ok(()) })
+    fn put(&self, _id: &str, _item: &CslValue, _ttl: Duration, _now: Timestamp) -> Result<(), StoreError> {
+        Err(StoreError::new(StoreErrorKind::Storage, "disk on fire"))
     }
-    fn entries(&self) -> BoxFuture<'_, Result<Vec<(String, CacheRecord)>, StoreError>> {
-        Box::pin(async { Ok(Vec::new()) })
+    fn remove(&self, _id: &str) -> Result<(), StoreError> {
+        Ok(())
     }
-    fn flush(&self) -> BoxFuture<'_, Result<(), StoreError>> {
+    fn flush(&self) -> Result<(), StoreError> {
         self.flushes.set(self.flushes.get() + 1);
-        Box::pin(async { Ok(()) })
+        Ok(())
+    }
+    fn prune(&self, _now: Timestamp) -> Result<usize, StoreError> {
+        Ok(0)
     }
 }
 
@@ -180,7 +205,7 @@ impl Source for ProbeSource {
 /// A source with a configurable prefix that records every key it is asked for
 /// and returns one concrete item per key. Used to observe whether the manager
 /// actually drives a source (a not-refetched entry leaves the log empty) and to
-/// stand in as a chain target.
+/// stand in as a chain target. A cached item made by [`chain_item`] chains.
 struct RecordingSource {
     prefix: &'static str,
     calls: Rc<RefCell<Vec<String>>>,
@@ -221,6 +246,16 @@ impl Source for RecordingSource {
                 .collect()
         })
     }
+    fn interpret(&self, _key: &str, item: CslValue) -> Interpreted {
+        match item.get("_chain_to") {
+            Some(c) => Interpreted::Chained {
+                prefix: c["prefix"].as_str().unwrap().into(),
+                key: c["key"].as_str().unwrap().into(),
+                set_properties: CslValue::Object(serde_json::Map::new()),
+            },
+            None => Interpreted::Concrete(item),
+        }
+    }
 }
 
 fn no_jitter(grace: Duration) -> TtlPolicy {
@@ -239,15 +274,14 @@ fn cites(key: &str) -> Vec<(String, String)> {
 
 /// A fresh entry is served from the cache without touching the source; once it
 /// is hard-expired the source is always asked again. (Stale-window refetch is
-/// probabilistic — covered by the `should_refetch` tests below — so it is not
+/// probabilistic — covered by the `should_refresh` tests below — so it is not
 /// asserted here where a single id/instant would be a coin flip.)
 #[test]
 fn fresh_is_not_refetched_expired_is() {
     let clock = MovableClock::new(0);
     let src = ProbeSource::new(Duration::from_millis(1000));
     let calls = src.calls.clone();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .with_policy(no_jitter(Duration::from_secs(60)))
+    let mgr = CitationManager::new(NoopFetcher, store_with(no_jitter(Duration::from_secs(60))), clock.clone(), InstantTimer)
         .register("probe", src).unwrap();
 
     block_on(mgr.retrieve(&cites("k"))).unwrap();
@@ -263,7 +297,7 @@ fn fresh_is_not_refetched_expired_is() {
     assert_eq!(calls.borrow().len(), 2, "a hard-expired entry must be refetched");
 }
 
-// --- probabilistic stale-window refetch (`should_refetch`) -----------------
+// --- probabilistic stale-window refetch (`should_refresh`) -----------------
 
 /// The stale-window refetch probability ramps with the stale fraction `f`: near
 /// `stale_after` (f≈0) almost nothing is refetched; near `expires` (f≈1) almost
@@ -273,8 +307,7 @@ fn fresh_is_not_refetched_expired_is() {
 fn stale_refetch_rate_ramps_with_the_stale_fraction() {
     let policy = no_jitter(Duration::from_secs(60));
     // stale_after = 800, expires = 1000 (a 200 ms-wide stale window).
-    let rec = policy.make_record(
-        Payload::Concrete(CslValue::Null),
+    let rec = policy.expiry(
         Timestamp::from_millis(0),
         Duration::from_millis(1000),
         "seed",
@@ -283,7 +316,7 @@ fn stale_refetch_rate_ramps_with_the_stale_fraction() {
         let now = Timestamp::from_millis(now_ms);
         let n = 2000;
         let hits = (0..n)
-            .filter(|i| policy.should_refetch(&rec, now, &format!("id{i}")))
+            .filter(|i| policy.should_refresh(&rec, now, &format!("id{i}")))
             .count();
         hits as f64 / n as f64
     };
@@ -303,20 +336,19 @@ fn stale_refetch_rate_ramps_with_the_stale_fraction() {
 #[test]
 fn fresh_never_and_expired_always_refetch() {
     let policy = no_jitter(Duration::from_secs(60));
-    let rec = policy.make_record(
-        Payload::Concrete(CslValue::Null),
+    let rec = policy.expiry(
         Timestamp::from_millis(0),
         Duration::from_millis(1000),
         "seed",
     );
     // Fresh: now < stale_after (800).
-    assert!(!policy.should_refetch(&rec, Timestamp::from_millis(0), "any"));
-    assert!(!policy.should_refetch(&rec, Timestamp::from_millis(799), "any"));
+    assert!(!policy.should_refresh(&rec, Timestamp::from_millis(0), "any"));
+    assert!(!policy.should_refresh(&rec, Timestamp::from_millis(799), "any"));
     // Expired: now >= expires (1000), regardless of the id's draw.
     for i in 0..100 {
         let id = format!("id{i}");
-        assert!(policy.should_refetch(&rec, Timestamp::from_millis(1000), &id), "{id}");
-        assert!(policy.should_refetch(&rec, Timestamp::from_millis(5000), &id), "{id}");
+        assert!(policy.should_refresh(&rec, Timestamp::from_millis(1000), &id), "{id}");
+        assert!(policy.should_refresh(&rec, Timestamp::from_millis(5000), &id), "{id}");
     }
 }
 
@@ -326,8 +358,7 @@ fn fresh_never_and_expired_always_refetch() {
 #[test]
 fn at_the_soft_edge_nothing_refetches() {
     let policy = no_jitter(Duration::from_secs(60));
-    let rec = policy.make_record(
-        Payload::Concrete(CslValue::Null),
+    let rec = policy.expiry(
         Timestamp::from_millis(0),
         Duration::from_millis(1000),
         "seed",
@@ -335,7 +366,7 @@ fn at_the_soft_edge_nothing_refetches() {
     assert_eq!(policy.classify(&rec, Timestamp::from_millis(800)), Freshness::Stale);
     for i in 0..100 {
         assert!(
-            !policy.should_refetch(&rec, Timestamp::from_millis(800), &format!("id{i}")),
+            !policy.should_refresh(&rec, Timestamp::from_millis(800), &format!("id{i}")),
             "f == 0 must never refetch"
         );
     }
@@ -347,18 +378,17 @@ fn at_the_soft_edge_nothing_refetches() {
 #[test]
 fn ephemeral_zero_window_is_never_probabilistic() {
     let policy = TtlPolicy::default();
-    let rec = policy.make_record(
-        Payload::Concrete(CslValue::Null),
+    let rec = policy.expiry(
         Timestamp::from_millis(500),
         Duration::ZERO,
         "manual:x",
     );
     assert_eq!(rec.stale_after, rec.expires);
-    assert!(!policy.should_refetch(&rec, Timestamp::from_millis(499), "manual:x"));
+    assert!(!policy.should_refresh(&rec, Timestamp::from_millis(499), "manual:x"));
     // At/after the instant it is Expired → always refetch, for any id.
     for i in 0..50 {
-        assert!(policy.should_refetch(&rec, Timestamp::from_millis(500), &format!("m{i}")));
-        assert!(policy.should_refetch(&rec, Timestamp::from_millis(9999), &format!("m{i}")));
+        assert!(policy.should_refresh(&rec, Timestamp::from_millis(500), &format!("m{i}")));
+        assert!(policy.should_refresh(&rec, Timestamp::from_millis(9999), &format!("m{i}")));
     }
 }
 
@@ -366,26 +396,25 @@ fn ephemeral_zero_window_is_never_probabilistic() {
 /// way every call, and distinct ids at one instant disagree (a real per-entry
 /// coin, not a global flag).
 #[test]
-fn should_refetch_is_deterministic_per_id_and_now() {
+fn should_refresh_is_deterministic_per_id_and_now() {
     let policy = no_jitter(Duration::from_secs(60));
-    let rec = policy.make_record(
-        Payload::Concrete(CslValue::Null),
+    let rec = policy.expiry(
         Timestamp::from_millis(0),
         Duration::from_millis(1000),
         "seed",
     );
     let now = Timestamp::from_millis(900); // f = 0.5, deep in the stale window.
-    let first = policy.should_refetch(&rec, now, "determinism:probe");
+    let first = policy.should_refresh(&rec, now, "determinism:probe");
     for _ in 0..8 {
         assert_eq!(
-            policy.should_refetch(&rec, now, "determinism:probe"),
+            policy.should_refresh(&rec, now, "determinism:probe"),
             first,
             "same (id, now) must decide the same way"
         );
     }
     // Different ids at the same instant do not all agree.
     let decisions: Vec<bool> = (0..64)
-        .map(|i| policy.should_refetch(&rec, now, &format!("id{i}")))
+        .map(|i| policy.should_refresh(&rec, now, &format!("id{i}")))
         .collect();
     assert!(
         decisions.iter().any(|&d| d) && decisions.iter().any(|&d| !d),
@@ -401,8 +430,7 @@ fn a_stale_batch_is_only_partly_refetched() {
     let clock = MovableClock::new(0);
     let src = ProbeSource::new(Duration::from_millis(1000));
     let calls = src.calls.clone();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .with_policy(no_jitter(Duration::from_secs(600)))
+    let mgr = CitationManager::new(NoopFetcher, store_with(no_jitter(Duration::from_secs(600))), clock.clone(), InstantTimer)
         .register("probe", src).unwrap();
 
     let n = 200;
@@ -425,10 +453,11 @@ fn a_stale_batch_is_only_partly_refetched() {
     );
 }
 
-/// Manager-level: a stale chained pointer that is *not* refetched this pass must
-/// still have its target pulled in, or a later `get()` breaks on the missing
-/// link. Forced deterministically by aging the pointer to exactly `stale_after`
-/// (f = 0 ⇒ never refetched, whatever the id hashes to).
+/// Manager-level: a stale item whose interpretation chains, and that is *not*
+/// refetched this pass, must still have its target pulled in, or a later
+/// `get()` breaks on the missing link. Forced deterministically by aging the
+/// item to exactly `stale_after` (f = 0 ⇒ never refetched, whatever the id
+/// hashes to).
 #[test]
 fn a_not_refetched_stale_pointer_keeps_its_target() {
     let clock = MovableClock::new(1000);
@@ -436,38 +465,25 @@ fn a_not_refetched_stale_pointer_keeps_its_target() {
     let a_calls = a.calls.clone();
     let b = RecordingSource::new("b");
     let b_calls = b.calls.clone();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .with_policy(no_jitter(Duration::from_secs(600)))
+    let mgr = CitationManager::new(NoopFetcher, store_with(no_jitter(Duration::from_secs(600))), clock.clone(), InstantTimer)
         .register(a.prefix, a).unwrap()
         .register(b.prefix, b).unwrap();
 
-    // Seed `a:x` as a stale pointer to a `b:t` that is not yet cached.
+    // Seed `a:x` as a stale item chaining to a `b:t` that is not yet cached.
     // stale_after == now (1000) < expires (2000) ⇒ Stale with f = 0.
-    block_on(mgr.store().put(
-        "a:x",
-        CacheRecord {
-            payload: Payload::Chained {
-                prefix: "b".into(),
-                key: "t".into(),
-                set_properties: CslValue::Object(serde_json::Map::new()),
-            },
-            stale_after: Timestamp::from_millis(1000),
-            expires: Timestamp::from_millis(2000),
-        },
-    ))
-    .unwrap();
+    seed(mgr.store(), "a:x", chain_item("b", "t"), 1000, 2000);
 
     let report = block_on(mgr.retrieve(&[("a".to_string(), "x".to_string())])).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
     assert!(
         a_calls.borrow().is_empty(),
-        "the stale pointer must not be refetched at f = 0: {:?}",
+        "the stale item must not be refetched at f = 0: {:?}",
         a_calls.borrow()
     );
-    assert_eq!(b_calls.borrow().len(), 1, "the kept pointer's target must be fetched");
+    assert_eq!(b_calls.borrow().len(), 1, "the kept item's chain target must be fetched");
     assert_eq!(b_calls.borrow()[0], "t");
     assert_eq!(
-        block_on(mgr.get("a", "x")).unwrap()["title"],
+        mgr.get("a", "x").unwrap()["title"],
         "b:t",
         "get() must still resolve the chain"
     );
@@ -478,8 +494,7 @@ fn a_not_refetched_stale_pointer_keeps_its_target() {
 #[test]
 fn freshness_boundaries_are_half_open() {
     let policy = no_jitter(Duration::from_secs(60));
-    let rec = policy.make_record(
-        Payload::Concrete(CslValue::Null),
+    let rec = policy.expiry(
         Timestamp::from_millis(0),
         Duration::from_millis(1000),
         "probe:k",
@@ -500,8 +515,7 @@ fn freshness_boundaries_are_half_open() {
 fn zero_ttl_entries_are_born_expired() {
     let policy = TtlPolicy::default();
     let now = Timestamp::from_millis(12_345);
-    let rec = policy.make_record(
-        Payload::Concrete(CslValue::Null),
+    let rec = policy.expiry(
         now,
         Duration::ZERO,
         "manual:whatever",
@@ -528,7 +542,7 @@ fn jitter_is_bounded_deterministic_and_spreading() {
 
     for n in 0..24 {
         let id = format!("probe:{n}");
-        let rec = policy.make_record(Payload::Concrete(CslValue::Null), now, ttl, &id);
+        let rec = policy.expiry(now, ttl, &id);
         let hard = rec.expires.as_millis();
         assert!(
             (850_000..=1_150_000).contains(&hard),
@@ -537,7 +551,7 @@ fn jitter_is_bounded_deterministic_and_spreading() {
         // Soft expiry is 80% *of the jittered hard TTL*, never past it.
         assert_eq!(rec.stale_after.as_millis(), hard * 80 / 100);
 
-        let again = policy.make_record(Payload::Concrete(CslValue::Null), now, ttl, &id);
+        let again = policy.expiry(now, ttl, &id);
         assert_eq!(again.expires, rec.expires, "jitter must be deterministic");
 
         seen.push(hard);
@@ -565,7 +579,7 @@ fn absurd_jitter_percent_cannot_create_born_expired_entries() {
     let ttl = Duration::from_secs(10);
     for n in 0..64 {
         let id = format!("probe:{n}");
-        let rec = policy.make_record(Payload::Concrete(CslValue::Null), now, ttl, &id);
+        let rec = policy.expiry(now, ttl, &id);
         assert!(
             rec.expires > now,
             "`{id}` was born expired ({:?})",
@@ -607,8 +621,7 @@ fn absurd_ttls_do_not_panic_or_expire_immediately() {
     let now = Timestamp::from_millis(1_000_000);
     for policy in [TtlPolicy::default(), no_jitter(Duration::from_secs(60))] {
         for ttl in [Duration::MAX, Duration::from_secs(u64::MAX)] {
-            let rec = policy.make_record(
-                Payload::Concrete(CslValue::Null),
+            let rec = policy.expiry(
                 now,
                 ttl,
                 "probe:forever",
@@ -633,8 +646,7 @@ fn absurd_grace_keeps_expired_entries_usable() {
         jitter_percent: 0,
         grace: Duration::MAX,
     };
-    let rec = policy.make_record(
-        Payload::Concrete(CslValue::Null),
+    let rec = policy.expiry(
         Timestamp::from_millis(0),
         Duration::from_millis(1000),
         "probe:k",
@@ -652,12 +664,11 @@ fn expired_entry_within_grace_is_kept_and_not_reported() {
     let clock = MovableClock::new(0);
     let src = ProbeSource::new(Duration::from_millis(1000));
     let down = src.down.clone();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .with_policy(no_jitter(Duration::from_secs(60)))
+    let mgr = CitationManager::new(NoopFetcher, store_with(no_jitter(Duration::from_secs(60))), clock.clone(), InstantTimer)
         .register("probe", src).unwrap();
 
     block_on(mgr.retrieve(&cites("k"))).unwrap();
-    assert_eq!(block_on(mgr.get("probe", "k")).unwrap()["title"], "item k");
+    assert_eq!(mgr.get("probe", "k").unwrap()["title"], "item k");
 
     // Hard-expired (expires = 1000) but well inside the 60 s grace window.
     down.set(true);
@@ -669,7 +680,7 @@ fn expired_entry_within_grace_is_kept_and_not_reported() {
         report.failures
     );
     assert_eq!(
-        block_on(mgr.get("probe", "k")).unwrap()["title"],
+        mgr.get("probe", "k").unwrap()["title"],
         "item k",
         "the stale copy must still be served"
     );
@@ -688,8 +699,7 @@ fn expired_entry_within_grace_is_kept_and_not_reported() {
 fn prune_drops_only_entries_past_the_grace_window() {
     let clock = MovableClock::new(0);
     let src = ProbeSource::new(Duration::from_millis(1000));
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .with_policy(no_jitter(Duration::from_secs(60)))
+    let mgr = CitationManager::new(NoopFetcher, store_with(no_jitter(Duration::from_secs(60))), clock.clone(), InstantTimer)
         .register("probe", src).unwrap();
 
     block_on(mgr.retrieve(&cites("old"))).unwrap();
@@ -698,16 +708,16 @@ fn prune_drops_only_entries_past_the_grace_window() {
 
     // `old` expires at 1000, `new` at 31_000; grace is 60 s.
     clock.set(61_500);
-    assert_eq!(block_on(mgr.prune()).unwrap(), 1);
-    assert!(block_on(mgr.get("probe", "old")).is_err());
-    assert!(block_on(mgr.get("probe", "new")).is_ok());
+    assert_eq!(mgr.prune().unwrap(), 1);
+    assert!(mgr.get("probe", "old").is_err());
+    assert!(mgr.get("probe", "new").is_ok());
 
     // Nothing left to drop while `new` is still within grace.
-    assert_eq!(block_on(mgr.prune()).unwrap(), 0);
+    assert_eq!(mgr.prune().unwrap(), 0);
 
     clock.set(91_001);
-    assert_eq!(block_on(mgr.prune()).unwrap(), 1);
-    assert_eq!(block_on(mgr.store().entries()).unwrap().len(), 0);
+    assert_eq!(mgr.prune().unwrap(), 1);
+    assert_eq!(stored_count(mgr.store()), 0);
 }
 
 // --- the store-error boundary ----------------------------------------------
@@ -721,7 +731,6 @@ fn store_errors_abort_retrieve_but_still_flush() {
     let flushes = store.flushes.clone();
     let src = ProbeSource::new(Duration::from_millis(1000));
     let mgr = CitationManager::new(NoopFetcher, store, MovableClock::new(0), InstantTimer)
-        .with_policy(no_jitter(Duration::from_secs(60)))
         .register("probe", src).unwrap();
 
     let err = block_on(mgr.retrieve(&cites("k"))).unwrap_err();
@@ -765,8 +774,7 @@ fn a_few_expired_entries_are_deferred_until_max_defer() {
     let clock = MovableClock::new(0);
     let src = ProbeSource::new(Duration::from_millis(1000));
     let calls = src.calls.clone();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .with_policy(no_jitter(Duration::from_secs(60)))
+    let mgr = CitationManager::new(NoopFetcher, store_with(no_jitter(Duration::from_secs(60))), clock.clone(), InstantTimer)
         .register("probe", src).unwrap()
         .with_refresh_batching("probe", batching(5, 500, None));
 
@@ -779,7 +787,7 @@ fn a_few_expired_entries_are_deferred_until_max_defer() {
     let report = block_on(mgr.retrieve(&keys)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
     assert_eq!(calls.borrow().len(), 2, "deferred entries must not be fetched");
-    assert_eq!(block_on(mgr.get("probe", "a")).unwrap()["title"], "item a");
+    assert_eq!(mgr.get("probe", "a").unwrap()["title"], "item a");
 
     // 500 ms overdue ⇒ Required.
     clock.set(1500);
@@ -798,8 +806,7 @@ fn a_needed_request_pulls_nearly_due_entries_forward() {
         min_age_percent: 50,
         fill: Fill::ChunkBoundary,
     };
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .with_policy(no_jitter(Duration::from_secs(60)))
+    let mgr = CitationManager::new(NoopFetcher, store_with(no_jitter(Duration::from_secs(60))), clock.clone(), InstantTimer)
         .register("probe", src).unwrap()
         .with_refresh_batching("probe", batching(5, 0, Some(top_up)));
 
@@ -830,8 +837,7 @@ fn a_few_due_entries_are_topped_up_to_min_batch() {
         min_age_percent: 50,
         fill: Fill::Extra(0),
     };
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .with_policy(no_jitter(Duration::from_secs(60)))
+    let mgr = CitationManager::new(NoopFetcher, store_with(no_jitter(Duration::from_secs(60))), clock.clone(), InstantTimer)
         .register("probe", src).unwrap()
         .with_refresh_batching("probe", batching(5, 10_000, Some(top_up)));
 
@@ -850,30 +856,22 @@ fn a_few_due_entries_are_topped_up_to_min_batch() {
     assert_eq!(sorted(&calls), ["d0", "d1", "d2", "e0", "e1"]);
 }
 
-/// A chained pointer that is deferred still pulls its target in; one that is
-/// pulled forward does not pre-fetch its old target (the refetch may replace
-/// the pointer).
+/// A chaining item that is deferred still pulls its target in; one that is
+/// pulled forward does not pre-fetch its old target (the refetch may change
+/// where it points).
 #[test]
 fn batching_keeps_or_drops_chain_targets_like_a_refetch_decision() {
-    let pointer = |stale_after: i64, expires: i64| CacheRecord {
-        payload: Payload::Chained {
-            prefix: "b".into(),
-            key: "t".into(),
-            set_properties: CslValue::Object(serde_json::Map::new()),
-        },
-        stale_after: Timestamp::from_millis(stale_after),
-        expires: Timestamp::from_millis(expires),
-    };
-    let setup = |policy: RefreshBatching, rec: CacheRecord| {
+    // The expiry times of the cached `a:x`, which chains to `b:t`.
+    let pointer = |stale_after: i64, expires: i64| (stale_after, expires);
+    let setup = |policy: RefreshBatching, (stale_after, expires): (i64, i64)| {
         let a = RecordingSource::new("a");
         let b = RecordingSource::new("b");
         let (a_calls, b_calls) = (a.calls.clone(), b.calls.clone());
-        let mgr = CitationManager::new(NoopFetcher, MemStore::default(), MovableClock::new(1000), InstantTimer)
-            .with_policy(no_jitter(Duration::from_secs(600)))
+        let mgr = CitationManager::new(NoopFetcher, store_with(no_jitter(Duration::from_secs(600))), MovableClock::new(1000), InstantTimer)
             .register(a.prefix, a).unwrap()
             .register(b.prefix, b).unwrap()
             .with_refresh_batching("a", policy);
-        block_on(mgr.store().put("a:x", rec)).unwrap();
+        seed(mgr.store(), "a:x", chain_item("b", "t"), stale_after, expires);
         (mgr, a_calls, b_calls)
     };
 
@@ -882,8 +880,8 @@ fn batching_keeps_or_drops_chain_targets_like_a_refetch_decision() {
     let report = block_on(mgr.retrieve(&[("a".to_string(), "x".to_string())])).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
     assert!(a_calls.borrow().is_empty());
-    assert_eq!(*b_calls.borrow(), ["t"], "a deferred pointer's target must be fetched");
-    assert_eq!(block_on(mgr.get("a", "x")).unwrap()["title"], "b:t");
+    assert_eq!(*b_calls.borrow(), ["t"], "a deferred chaining item's target must be fetched");
+    assert_eq!(mgr.get("a", "x").unwrap()["title"], "b:t");
 
     // Pulled forward along with a miss: refetched as a concrete item, so the
     // old target is never asked for.
@@ -899,13 +897,13 @@ fn batching_keeps_or_drops_chain_targets_like_a_refetch_decision() {
     block_on(mgr.retrieve(&cites)).unwrap();
     assert_eq!(sorted(&a_calls), ["new", "x"]);
     assert!(b_calls.borrow().is_empty(), "{:?}", b_calls.borrow());
-    assert_eq!(block_on(mgr.get("a", "x")).unwrap()["title"], "a:x");
+    assert_eq!(mgr.get("a", "x").unwrap()["title"], "a:x");
 }
 
 /// The host override wins over the source default, per prefix.
 #[test]
 fn refresh_batching_override_is_per_prefix() {
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), MovableClock::new(0), InstantTimer)
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), MovableClock::new(0), InstantTimer)
         .register("arxiv", ArxivSource::new()).unwrap()
         .register("probe", ProbeSource::new(Duration::from_secs(1))).unwrap()
         .with_refresh_batching("probe", batching(7, 0, None));

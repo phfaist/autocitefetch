@@ -1,4 +1,29 @@
 //! [`CitationManager`] — routing, the retrieval driver, and chain resolution.
+//!
+//! # What is stored, and what is derived
+//!
+//! The cache ([`CacheStore`]) holds one item per citation id: what the source
+//! returned for it ([`Outcome::Concrete`]), minus the fields the cache's
+//! [`StoragePolicy`](crate::store::StoragePolicy) omits. Everything else is
+//! derived when an item is read:
+//!
+//! * **Chaining.** [`Source::interpret`] turns a cached item into what the
+//!   citation resolves to under the source's current configuration — the item
+//!   itself, or a pointer to another citation ([`Interpreted::Chained`]). No
+//!   pointer is stored. `retrieve` interprets every item it keeps or stores, to
+//!   find the chain targets it must make present; [`get`](CitationManager::get)
+//!   interprets each link it follows.
+//! * **Output fields.** `get` merges the accumulated `set_properties` over the
+//!   concrete item, removes the fields the storage policy omits and the fields
+//!   of [`with_dropped_csl_fields`](CitationManager::with_dropped_csl_fields),
+//!   and sets the requested `id` last.
+//!
+//! So the options of a run — arXiv's DOI overrides and chain target, the
+//! dropped fields — never change the cache, and changing them takes effect at
+//! once for every cached item.
+//!
+//! `retrieve` is async (it drives the sources); `get`, `get_by_id` and `prune`
+//! only touch the cache, which is synchronous, and are synchronous too.
 
 use alloc::boxed::Box;
 use alloc::rc::Rc;
@@ -9,7 +34,6 @@ use futures_util::stream::{StreamExt, iter};
 use hashbrown::{HashMap, HashSet};
 
 use crate::batching::{self, RefreshBatching, RefreshClass};
-use crate::cache::TtlPolicy;
 use crate::csl::{self, CslValue};
 use crate::driver::drive_source;
 use crate::env::{Clock, Timer, Timestamp};
@@ -17,8 +41,8 @@ use crate::error::{Error, Result};
 use crate::fetch::Fetcher;
 use crate::report::{Event, NopReporter, Reporter, Resolved, Wait};
 use crate::retry::{RetryPolicy, RetryingFetcher};
-use crate::source::{Outcome, Resolution, RetrieveCtx, Source};
-use crate::store::{CacheStore, Payload};
+use crate::source::{Interpreted, Outcome, Resolution, RetrieveCtx, Source};
+use crate::store::CacheStore;
 
 /// Upper bound on how many sources' `drive_source` calls run concurrently
 /// within a single retrieval pass.
@@ -61,7 +85,7 @@ struct ItemMeta {
 struct Pending {
     required: Vec<String>,
     due: Vec<String>,
-    /// With the record's hard expiry, so the most urgent can be taken first.
+    /// With the item's hard expiry, so the most urgent can be taken first.
     eligible: Vec<(Timestamp, String)>,
 }
 
@@ -142,16 +166,16 @@ impl RetrieveReport {
     }
 }
 
-/// The central orchestrator: owns the sources, the injected backends, and the
-/// TTL policy. Generic over the four host capabilities so any of them can be
-/// mixed independently.
+/// The central orchestrator: owns the sources and the injected backends.
+/// Generic over the four host capabilities so any of them can be mixed
+/// independently. The TTL policy is the cache's
+/// ([`StoragePolicy::ttl`](crate::store::StoragePolicy::ttl)).
 pub struct CitationManager<F, S, C, T> {
     sources: HashMap<String, Box<dyn Source>>,
     fetcher: F,
     store: S,
     clock: C,
     timer: T,
-    policy: TtlPolicy,
     /// Per-prefix overrides of [`Source::refresh_batching`] — see
     /// [`CitationManager::with_refresh_batching`].
     refresh_batching: HashMap<String, RefreshBatching>,
@@ -161,8 +185,8 @@ pub struct CitationManager<F, S, C, T> {
     /// [`CitationManager::get`] and while *discovering* one in
     /// [`CitationManager::retrieve`].
     max_chain_depth: usize,
-    /// Top-level CSL fields stripped from every item on its way into the store
-    /// — see [`CitationManager::with_dropped_csl_fields`]. Empty by default.
+    /// Top-level CSL fields stripped from every item `get` answers — see
+    /// [`CitationManager::with_dropped_csl_fields`]. Empty by default.
     dropped_csl_fields: Vec<String>,
     /// Where progress is announced — see [`CitationManager::with_reporter`].
     /// A [`NopReporter`] by default.
@@ -190,7 +214,6 @@ where
             store,
             clock,
             timer,
-            policy: TtlPolicy::default(),
             refresh_batching: HashMap::new(),
             retry_policy: RetryPolicy::default(),
             max_chain_depth: 16,
@@ -271,12 +294,6 @@ where
         Ok(self)
     }
 
-    /// Override the TTL policy. Builder-style.
-    pub fn with_policy(mut self, policy: TtlPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
     /// Override the refresh batching of the source bound to `prefix` (see
     /// [`batching`]). Builder-style; the source's own
     /// [`Source::refresh_batching`] applies otherwise.
@@ -331,38 +348,31 @@ where
         self
     }
 
-    /// Drop these **top-level** CSL fields from every item before it is stored.
-    /// Builder-style; empty by default (nothing is dropped).
+    /// Drop these **top-level** CSL fields from every item [`get`](Self::get)
+    /// answers. Builder-style; empty by default (nothing is dropped).
     ///
     /// ```ignore
     /// let mgr = CitationManager::new(fetcher, store, clock, timer)
-    ///     .with_dropped_csl_fields(["reference", "abstract"])
+    ///     .with_dropped_csl_fields(["note", "language"])
     ///     .register("doi", DoiSource::new())?;
     /// ```
     ///
-    /// Sources hand back whatever their upstream returned, verbatim — doi.org's
-    /// CSL-JSON in particular often carries a `reference` array holding the
-    /// paper's *entire* bibliography, dwarfing the metadata anyone actually
-    /// cites. This is the one place to throw such fields away.
+    /// **This affects the output only.** The cache is untouched: an item keeps
+    /// the field in the store, and a later run without the option answers it
+    /// again, without a request. What the cache keeps is the business of its
+    /// [`StoragePolicy`](crate::store::StoragePolicy) — the bulky `reference`
+    /// (doi.org's copy of a paper's entire bibliography) and `abstract` are
+    /// omitted from the cache, and so from the output, by default.
     ///
     /// Two things are worth being precise about:
     ///
-    /// * **When.** The fields are removed inside `retrieve`, on the way from a
-    ///   source's [`Outcome`] into [`CacheStore::put`] — so they reach neither
-    ///   the store's in-memory view nor its persisted file, and never come back
-    ///   from `get`. Removal happens *before* the `id` is stamped on, so listing
-    ///   `"id"` here cannot strip the id the entry is keyed on and echoed under.
-    /// * **What.** Only top-level keys of the item, and — equally — of a chained
-    ///   pointer's `set_properties`, which would otherwise re-introduce a
-    ///   dropped field when it is merged over the target at read time. Nested
-    ///   occurrences are untouched, as is anything a source does *internally*
-    ///   with the field before returning (arXiv's DOI extraction, say).
-    ///
-    /// This only affects entries written from here on. Items already in a
-    /// persistent cache keep their fields until they expire and are refetched;
-    /// clear the cache if that matters.
-    ///
-    /// [`Outcome`]: crate::source::Outcome
+    /// * **When.** The fields are removed in `get`, after the `set_properties`
+    ///   of a chain are merged over the concrete item — so a chain cannot bring
+    ///   a dropped field back — and *before* the requested `id` is set, so
+    ///   listing `"id"` here cannot strip the id an item is answered under.
+    /// * **What.** Only top-level keys of the answered item. Nested occurrences
+    ///   are untouched, as is anything a source does with the field when it
+    ///   interprets an item (arXiv's DOI, say).
     pub fn with_dropped_csl_fields<I, K>(mut self, fields: I) -> Self
     where
         I: IntoIterator<Item = K>,
@@ -398,8 +408,8 @@ where
     }
 
     /// Populate the cache for every `(prefix, key)` in `cites` that is missing
-    /// or stale, following chained pointers. Returns per-citation failures;
-    /// only backend (store) errors abort with `Err`.
+    /// or stale, following chains (see [`Source::interpret`]). Returns
+    /// per-citation failures; only backend (store) errors abort with `Err`.
     ///
     /// A store error discards the report (the per-citation failures collected
     /// so far are lost) — but the buffered writes are still flushed, so a
@@ -411,15 +421,14 @@ where
         // Durably compact buffered writes *even if* a pass aborted: everything
         // written before the error is still worth keeping.
         //
-        // Bracketed with the wait events here rather than inside
-        // `FileCacheStore`: `flush` is the only operation that locks, and giving
-        // the store an `Rc<dyn Reporter>` would make it `!Send` — the
-        // concurrency regression tests move stores across threads.
+        // Bracketed with the wait events here rather than inside the store:
+        // `flush` is what takes a JSONL store's merge lock, and the store is any
+        // cachette store, which knows nothing of this crate's reporter.
         self.reporter.report(&Event::WaitStarted {
             what: Wait::CacheFlush,
             expected: None,
         });
-        let flushed = self.store.flush().await;
+        let flushed = self.store.flush();
         self.reporter.report(&Event::WaitFinished {
             what: Wait::CacheFlush,
         });
@@ -486,21 +495,23 @@ where
             // against a drifting `now` would make the freshness cutoff depend
             // on a citation's position in the batch.
             let now = self.clock.now();
+            let ttl_policy = self.store.policy().ttl;
 
             // Classify each citation for refresh batching. Nothing is bucketed
             // yet: which `Due`/`Eligible` keys actually go out is a per-source
             // decision (`batching::plan`) that needs the whole batch.
             let mut pending: HashMap<String, Pending> = HashMap::new();
-            // Chained pointers this pass may end up *keeping*, with their
-            // target. A kept pointer must pull its target in, or a later `get()`
-            // breaks on the missing link — but a *refetched* one must not: the
-            // refetch may replace the pointer (a retracted or override-
-            // suppressed DOI), and fetching the old target would waste a
-            // rate-limited request and report a failure for a citation nobody
-            // asked for if that dead target 404s (`store_resolutions` pushes the
-            // *new* target when it stores the pointer). So they are held until
-            // planning says which pointers are fetched.
-            let mut held: Vec<(String, WorkItem)> = Vec::new();
+            // Cached items this pass may end up *keeping* whose interpretation
+            // chains, with their target. A kept item must pull its target in, or
+            // a later `get()` breaks on the missing link — but a *refetched* one
+            // must not: the refetch may change the target (a retracted DOI), and
+            // fetching the old target would waste a rate-limited request and
+            // report a failure for a citation nobody asked for if that dead
+            // target 404s (`store_resolutions` pushes the *new* target when it
+            // stores the item). So they are held until planning says which items
+            // are fetched. A kept item that chains to itself is held as `None`
+            // and reported as a failure.
+            let mut held: Vec<(String, Option<WorkItem>)> = Vec::new();
             // Progress bookkeeping only: how many of this batch reached the
             // cache lookup (the rest failed or were duplicates).
             let mut classified = 0usize;
@@ -553,35 +564,38 @@ where
                 };
                 classified += 1;
 
-                let class = match self.store.get(&id).await? {
+                let class = match self.store.get(&id)? {
                     None => RefreshClass::Required,
-                    Some(rec) => {
+                    Some(cached) => {
                         let class = self.batching_for(&prefix, source.as_ref()).classify(
-                            &self.policy,
-                            &rec,
+                            &ttl_policy,
+                            &cached.expiry,
                             now,
                             &id,
                             source.default_ttl(),
                         );
                         if class != RefreshClass::Required {
-                            if let Payload::Chained {
+                            // Interpreted under the current configuration, so a
+                            // changed override or chain target is followed
+                            // without refetching the item.
+                            if let Interpreted::Chained {
                                 prefix: tp,
                                 key: tk,
                                 ..
-                            } = rec.payload
+                            } = self.interpret(source.as_ref(), &key, cached.item)
                             {
-                                // The target inherits this item's origin so a
-                                // failure on it still points back to the same
-                                // request.
-                                held.push((
-                                    id.clone(),
+                                let target = (tp != prefix || tk != key).then(|| {
+                                    // The target inherits this item's origin so
+                                    // a failure on it still points back to the
+                                    // same request.
                                     WorkItem {
                                         prefix: tp,
                                         key: tk,
                                         depth: depth + 1,
-                                        origin,
-                                    },
-                                ));
+                                        origin: origin.clone(),
+                                    }
+                                });
+                                held.push((id.clone(), target));
                             }
                         }
                         if class == RefreshClass::Eligible {
@@ -589,7 +603,7 @@ where
                                 .entry(prefix)
                                 .or_default()
                                 .eligible
-                                .push((rec.expires, key));
+                                .push((cached.expiry.expires, key));
                             continue;
                         }
                         class
@@ -632,13 +646,28 @@ where
                     buckets.insert(prefix, plan.fetch);
                 }
             }
-            // Kept pointers pull their targets in (in batch order, so `seen`'s
-            // first-writer-wins attribution is as before).
-            worklist.extend(
-                held.into_iter()
-                    .filter(|(id, _)| !fetched.contains(id))
-                    .map(|(_, target)| target),
-            );
+            // Kept chaining items pull their targets in (in batch order, so
+            // `seen`'s first-writer-wins attribution is as before).
+            for (id, target) in held {
+                if fetched.contains(&id) {
+                    continue;
+                }
+                match target {
+                    Some(target) => worklist.push(target),
+                    None => {
+                        let (prefix, key) = id.split_once(':').unwrap_or((&id, ""));
+                        let origin = seen
+                            .get(&id)
+                            .map(|m| m.origin.clone())
+                            .unwrap_or_else(|| (prefix.to_string(), key.to_string()));
+                        let message =
+                            Error::Chain(alloc::format!("`{id}` chains to itself")).to_string();
+                        report
+                            .failures
+                            .push(CiteFailure::new(prefix, key, message, &origin));
+                    }
+                }
+            }
 
             self.reporter.report(&Event::PassStarted {
                 pass,
@@ -741,8 +770,7 @@ where
                     resolutions,
                     &seen,
                     &mut sink,
-                )
-                .await?;
+                )?;
             }
 
             // `worklist` was drained into `batch` at the top of the pass, so
@@ -757,7 +785,31 @@ where
         Ok(seen.len())
     }
 
-    async fn store_resolutions(
+    /// Interpret a cached item with `source` ([`Source::interpret`]), and
+    /// normalize the key of a chain target with the *target* source's policy,
+    /// so the target id matches exactly the id the target lands under: a chained
+    /// `doi` key with incidental whitespace, or in the DOI's registered mixed
+    /// case, must not spawn a duplicate entry. This is why a source emitting a
+    /// chain needs no case/whitespace handling of its own.
+    fn interpret(&self, source: &dyn Source, key: &str, item: CslValue) -> Interpreted {
+        match source.interpret(key, item) {
+            Interpreted::Chained {
+                prefix,
+                key,
+                set_properties,
+            } => {
+                let key = self.normalize_key(&prefix, key);
+                Interpreted::Chained {
+                    prefix,
+                    key,
+                    set_properties,
+                }
+            }
+            concrete => concrete,
+        }
+    }
+
+    fn store_resolutions(
         &self,
         prefix: &str,
         source: &dyn Source,
@@ -767,6 +819,7 @@ where
         sink: &mut PassSink<'_>,
     ) -> Result<()> {
         let now = self.clock.now();
+        let policy = self.store.policy();
         let mut handled: HashSet<String> = HashSet::new();
 
         for res in resolutions {
@@ -787,94 +840,67 @@ where
 
             match res.outcome {
                 Outcome::Concrete { mut csl, ttl } => {
-                    // Strip the host's unwanted fields (`reference`, …) here, so
-                    // they never reach the store — see
-                    // `with_dropped_csl_fields`. Deliberately *before* `set_id`:
-                    // a host that lists `"id"` must not be able to remove the id
-                    // this entry is keyed on.
-                    csl::remove_fields(&mut csl, &self.dropped_csl_fields);
-                    if !csl::set_id(&mut csl, &id) {
-                        // A bare array/string/number/null is not a CSL item.
-                        // Storing it used to silently replace the payload with
-                        // a `{"id": …}` stub and report success.
+                    if !csl.is_object() {
+                        // A bare array/string/number/null is not a CSL item, and
+                        // nothing is stored for it.
                         let err = Error::Source(alloc::format!(
                             "source returned a non-object CSL payload for `{id}`"
                         ));
-                        self.note_failure(prefix, &res.key, err, now, &meta, sink)
-                            .await?;
+                        self.note_failure(prefix, source, &res.key, err, now, &meta, sink)?;
                         continue;
                     }
+                    // The cache holds what the source returned, minus the fields
+                    // its storage policy omits. No `id` is set: `get` sets the
+                    // requested one on read.
+                    policy.strip(&mut csl);
                     let ttl = ttl.unwrap_or_else(|| source.default_ttl());
-                    let record = self
-                        .policy
-                        .make_record(Payload::Concrete(csl), now, ttl, &id);
-                    self.store.put(&id, record).await?;
-                    self.reporter.report(&Event::CiteResolved {
-                        prefix,
-                        key: &res.key,
-                        how: Resolved::Concrete,
-                    });
-                }
-                Outcome::Chained {
-                    prefix: tp,
-                    key: tk,
-                    mut set_properties,
-                } => {
-                    // Normalize the target key by the *target* source's policy so
-                    // the stored pointer references exactly the id its target
-                    // will land under (the worklist push below normalizes it
-                    // again at the loop top — the policy is idempotent): a
-                    // chained `doi` key with incidental whitespace, or in the
-                    // DOI's registered mixed case, must not spawn a duplicate
-                    // entry. This is why a source emitting a chain pointer needs
-                    // no case/whitespace handling of its own.
-                    let tk = self.normalize_key(&tp, tk);
-                    if tp == prefix && tk == res.key {
-                        // Would otherwise be stored happily and only surface
-                        // as "chain too deep" `max_chain_depth` reads later.
-                        let err = Error::Chain(alloc::format!("`{id}` chains to itself"));
-                        self.note_failure(prefix, &res.key, err, now, &meta, sink)
-                            .await?;
-                        continue;
+                    self.store.put(&id, &csl, ttl, now)?;
+                    match self.interpret(source, &res.key, csl) {
+                        Interpreted::Concrete(_) => {
+                            self.reporter.report(&Event::CiteResolved {
+                                prefix,
+                                key: &res.key,
+                                how: Resolved::Concrete,
+                            });
+                        }
+                        Interpreted::Chained {
+                            prefix: tp,
+                            key: tk,
+                            ..
+                        } => {
+                            if tp == prefix && tk == res.key {
+                                // Would otherwise be kept happily and only
+                                // surface as "chain too deep" reads later.
+                                self.store.remove(&id)?;
+                                let err = Error::Chain(alloc::format!("`{id}` chains to itself"));
+                                self.note_failure(prefix, source, &res.key, err, now, &meta, sink)?;
+                                continue;
+                            }
+                            self.reporter.report(&Event::CiteResolved {
+                                prefix,
+                                key: &res.key,
+                                how: Resolved::Chained {
+                                    prefix: &tp,
+                                    key: &tk,
+                                },
+                            });
+                            // The newly discovered target inherits this item's
+                            // origin, so a failure further down the chain still
+                            // points back to the original request.
+                            sink.worklist.push(WorkItem {
+                                prefix: tp,
+                                key: tk,
+                                depth: meta.depth + 1,
+                                origin: meta.origin,
+                            });
+                        }
                     }
-                    // A pointer's `set_properties` override the concrete target
-                    // at read time, so a dropped field left in here would come
-                    // straight back out of `get`.
-                    csl::remove_fields(&mut set_properties, &self.dropped_csl_fields);
-                    let payload = Payload::Chained {
-                        prefix: tp.clone(),
-                        key: tk.clone(),
-                        set_properties,
-                    };
-                    let record = self
-                        .policy
-                        .make_record(payload, now, source.default_ttl(), &id);
-                    self.store.put(&id, record).await?;
-                    self.reporter.report(&Event::CiteResolved {
-                        prefix,
-                        key: &res.key,
-                        how: Resolved::Chained {
-                            prefix: &tp,
-                            key: &tk,
-                        },
-                    });
-                    // The newly discovered target inherits this item's origin, so
-                    // a failure further down the chain still points back to the
-                    // original request.
-                    sink.worklist.push(WorkItem {
-                        prefix: tp,
-                        key: tk,
-                        depth: meta.depth + 1,
-                        origin: meta.origin,
-                    });
                 }
                 Outcome::Failed(err) => {
-                    self.note_failure(prefix, &res.key, err, now, &meta, sink)
-                        .await?;
+                    self.note_failure(prefix, source, &res.key, err, now, &meta, sink)?;
                 }
                 Outcome::Missing(err) => {
-                    self.note_missing(prefix, &res.key, err, &meta, sink)
-                        .await?;
+                    self.note_missing(prefix, &res.key, err, &meta, sink)?;
                 }
             }
         }
@@ -895,8 +921,7 @@ where
             let err = Error::Source(alloc::format!(
                 "source `{prefix}` returned no resolution for key `{key}`"
             ));
-            self.note_failure(prefix, &key, err, now, &meta, sink)
-                .await?;
+            self.note_failure(prefix, source, &key, err, now, &meta, sink)?;
         }
 
         Ok(())
@@ -905,9 +930,11 @@ where
     /// Record a per-citation failure — unless a cached copy is still within the
     /// grace window, in which case the stale entry keeps being used and nothing
     /// is reported (stale-while-revalidate).
-    async fn note_failure(
+    #[allow(clippy::too_many_arguments)]
+    fn note_failure(
         &self,
         prefix: &str,
+        source: &dyn Source,
         key: &str,
         err: Error,
         now: Timestamp,
@@ -915,8 +942,19 @@ where
         sink: &mut PassSink<'_>,
     ) -> Result<()> {
         let id = csl::cite_id(prefix, key);
-        let kept = match self.store.get(&id).await? {
-            Some(rec) if self.policy.usable_within_grace(&rec, now) => Some(rec),
+        let ttl_policy = self.store.policy().ttl;
+        // The kept item, interpreted: `Some(None)` when it resolves to itself,
+        // `Some(Some(target))` when it chains. An item that chains to its own id
+        // is no usable copy.
+        let kept = match self.store.get(&id)? {
+            Some(cached) if ttl_policy.usable_within_grace(&cached.expiry, now) => {
+                match self.interpret(source, key, cached.item) {
+                    Interpreted::Concrete(_) => Some(None),
+                    Interpreted::Chained { prefix: tp, key: tk, .. } => {
+                        (tp != prefix || tk != key).then_some(Some((tp, tk)))
+                    }
+                }
+            }
             _ => None,
         };
         // Announced either way: a grace-served failure never reaches the
@@ -929,25 +967,19 @@ where
             grace_served: kept.is_some(),
         });
         match kept {
-            // Keeping a chained pointer alive means its target must be present
-            // too, otherwise `get()` breaks on the next link. Nothing else
-            // pushes it: the pointer was stale, so it was not pre-pushed during
-            // bucketing. The target inherits this item's depth+origin.
-            Some(rec) => {
-                if let Payload::Chained {
+            // Keeping an item that chains means its target must be present too,
+            // otherwise `get()` breaks on the next link. Nothing else pushes
+            // it: the item was due, so it was not pre-pushed during bucketing.
+            // The target inherits this item's depth+origin.
+            Some(Some((tp, tk))) => {
+                sink.worklist.push(WorkItem {
                     prefix: tp,
                     key: tk,
-                    ..
-                } = rec.payload
-                {
-                    sink.worklist.push(WorkItem {
-                        prefix: tp,
-                        key: tk,
-                        depth: meta.depth + 1,
-                        origin: meta.origin.clone(),
-                    });
-                }
+                    depth: meta.depth + 1,
+                    origin: meta.origin.clone(),
+                });
             }
+            Some(None) => {}
             None => sink.report.failures.push(CiteFailure::new(
                 prefix,
                 key,
@@ -969,7 +1001,7 @@ where
     /// whole 14-day window. The removed entry may be a chain target of some
     /// other citation; that citation's `get` then fails on the dead link, which
     /// is correct — the target really no longer resolves.
-    async fn note_missing(
+    fn note_missing(
         &self,
         prefix: &str,
         key: &str,
@@ -978,7 +1010,7 @@ where
         sink: &mut PassSink<'_>,
     ) -> Result<()> {
         let id = csl::cite_id(prefix, key);
-        self.store.remove(&id).await?;
+        self.store.remove(&id)?;
         // Never grace-served: `Missing` is authoritative.
         self.reporter.report(&Event::CiteFailed {
             prefix,
@@ -995,10 +1027,19 @@ where
         Ok(())
     }
 
-    /// Read a resolved CSL-JSON item, following chain pointers and merging
-    /// their `set_properties`. Accumulated `set_properties` **override** the
-    /// concrete target's fields (and among themselves the set closest to the
-    /// request wins).
+    /// Read a resolved CSL-JSON item, following chains and merging their
+    /// `set_properties`. Accumulated `set_properties` **override** the concrete
+    /// target's fields (and among themselves the set closest to the request
+    /// wins).
+    ///
+    /// Each link is read from the cache and interpreted with the source
+    /// registered for its prefix ([`Source::interpret`]) under its current
+    /// configuration; a link whose prefix has no source is taken as it is. At
+    /// the concrete item, the accumulated properties are merged over it, the
+    /// fields the cache's storage policy omits and the fields of
+    /// [`with_dropped_csl_fields`](Self::with_dropped_csl_fields) are removed —
+    /// after the merge, so a chain cannot bring one back — and the requested
+    /// `id` is set last.
     ///
     /// The returned item's `id` is the requested `"prefix:key"` with the key
     /// **normalized** by the routed source's [`Source::normalize_key`] — the
@@ -1007,20 +1048,23 @@ where
     /// `get("doi", "10.1103/PhysRevA.86.052329")` returns
     /// `"id": "doi:10.1103/physreva.86.052329"`. (Only the cache *id* is
     /// canonicalized; CSL fields — including `DOI` — keep their payload casing.)
-    pub async fn get(&self, prefix: &str, key: &str) -> Result<CslValue> {
+    ///
+    /// Synchronous: it reads the cache only, and makes no request.
+    pub fn get(&self, prefix: &str, key: &str) -> Result<CslValue> {
         // Normalize the key the same way `retrieve` did, so `get("arxiv",
         // "1211.1037 ")` finds the entry stored under the canonical id. An
         // unknown prefix has no policy to consult, so its key is left verbatim.
         let key = self.normalize_key(prefix, key.to_string());
         let requested_id = csl::cite_id(prefix, &key);
-        let mut current_id = requested_id.clone();
+        let mut current = (prefix.to_string(), key);
         // Properties accumulated along the chain; earlier (closer to the
         // request) ones take precedence.
         let mut accumulated = CslValue::Object(serde_json::Map::new());
 
         for _ in 0..self.max_chain_depth {
-            let rec = match self.store.get(&current_id).await? {
-                Some(rec) => rec,
+            let current_id = csl::cite_id(&current.0, &current.1);
+            let cached = match self.store.get(&current_id)? {
+                Some(cached) => cached,
                 // Name both ids: a missing *chain target* is not a citation the
                 // caller ever asked for, so reporting only its id is confusing.
                 None if current_id == requested_id => {
@@ -1032,18 +1076,27 @@ where
                     )));
                 }
             };
+            let interpreted = match self.sources.get(&current.0) {
+                Some(source) => self.interpret(source.as_ref(), &current.1, cached.item),
+                None => Interpreted::Concrete(cached.item),
+            };
 
-            match rec.payload {
-                Payload::Concrete(mut csl) => {
+            match interpreted {
+                Interpreted::Concrete(mut item) => {
                     // Accumulated `set_properties` override the concrete target
                     // (both reference impls do `{ ...target, ...set_properties }`).
-                    csl::merge_over(&mut csl, &accumulated);
+                    csl::merge_over(&mut item, &accumulated);
+                    // After the merge, so no `set_properties` can bring an
+                    // omitted or dropped field back.
+                    self.store.policy().strip(&mut item);
+                    csl::remove_fields(&mut item, &self.dropped_csl_fields);
                     // Forced last, so the requested id always wins even if a
-                    // `set_properties` carried an `id` of its own.
-                    csl::set_id(&mut csl, &requested_id);
-                    return Ok(csl);
+                    // `set_properties` carried an `id` of its own (or a 0.1.1
+                    // item its stored one), and dropping `"id"` cannot remove it.
+                    csl::set_id(&mut item, &requested_id);
+                    return Ok(item);
                 }
-                Payload::Chained {
+                Interpreted::Chained {
                     prefix: tp,
                     key: tk,
                     set_properties,
@@ -1053,18 +1106,12 @@ where
                     // in as defaults *under* it. The accumulated whole then
                     // overrides the concrete target at the `Concrete` arm above.
                     csl::merge_defaults(&mut accumulated, &set_properties);
-                    // Normalize the hop the same way it was normalized when
-                    // stored, so a pointer written before this policy existed (or
-                    // by a source that emitted the target's key in some other
-                    // spelling) still lands on the canonical target id.
-                    let tk = self.normalize_key(&tp, tk);
-                    let next_id = csl::cite_id(&tp, &tk);
-                    if next_id == current_id {
+                    if tp == current.0 && tk == current.1 {
                         return Err(Error::Chain(alloc::format!(
                             "`{current_id}` chains to itself"
                         )));
                     }
-                    current_id = next_id;
+                    current = (tp, tk);
                 }
             }
         }
@@ -1075,33 +1122,27 @@ where
         )))
     }
 
-    /// Convenience: read by full `"prefix:key"` id.
-    pub async fn get_by_id(&self, id: &str) -> Result<CslValue> {
+    /// Convenience: read by full `"prefix:key"` id. Synchronous, like
+    /// [`get`](Self::get).
+    pub fn get_by_id(&self, id: &str) -> Result<CslValue> {
         match id.split_once(':') {
-            Some((prefix, key)) => self.get(prefix, key).await,
+            Some((prefix, key)) => self.get(prefix, key),
             None => Err(Error::InvalidId(id.to_string())),
         }
     }
 
-    /// Drop hard-expired entries that are also past their grace window.
-    pub async fn prune(&self) -> Result<usize> {
+    /// Drop hard-expired entries that are also past their grace window
+    /// ([`CacheStore::prune`]), then flush the cache. Answers how many entries
+    /// were removed. Synchronous.
+    pub fn prune(&self) -> Result<usize> {
         let now = self.clock.now();
-        let mut removed = 0;
-        for (id, rec) in self.store.entries().await? {
-            // `grace` is non-negative, so being past `expires + grace` already
-            // implies `classify(..) == Expired`; testing both would be
-            // redundant.
-            if !self.policy.usable_within_grace(&rec, now) {
-                self.store.remove(&id).await?;
-                removed += 1;
-            }
-        }
+        let removed = self.store.prune(now)?;
         // Durably compact the removals before returning.
         self.reporter.report(&Event::WaitStarted {
             what: Wait::CacheFlush,
             expected: None,
         });
-        let flushed = self.store.flush().await;
+        let flushed = self.store.flush();
         self.reporter.report(&Event::WaitFinished {
             what: Wait::CacheFlush,
         });

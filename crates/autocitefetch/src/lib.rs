@@ -15,10 +15,19 @@
 //!
 //! 1. [`CitationManager::retrieve`] — async; routes each key to its source,
 //!    fetches (chunked + rate-limited), and writes results to the cache.
-//! 2. [`CitationManager::get`] — reads a resolved CSL-JSON item back out,
-//!    following any *chaining* pointers (e.g. arXiv → DOI).
+//! 2. [`CitationManager::get`] — synchronous; reads a resolved CSL-JSON item
+//!    back out, following any *chaining* (e.g. arXiv → DOI), which is derived
+//!    from the cached items at read time ([`Source::interpret`]).
 //!
 //! CSL-JSON items are represented as dynamic [`CslValue`]s (serde_json).
+//!
+//! # Storage
+//!
+//! The cache is a [`CacheStore`]. [`StoreCache`] implements it over any
+//! [`cachette::Store`] — a [`cachette::MemoryStore`], a
+//! [`cachette::JsonlStore`] (the single committable JSONL file), or a store of
+//! the host's own. The [`cachette`] crate is re-exported so that a host uses
+//! the version this crate was built against.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -32,7 +41,6 @@ pub mod driver;
 pub mod env;
 pub mod error;
 pub mod fetch;
-pub mod filecache;
 pub mod manager;
 pub mod report;
 pub mod retry;
@@ -45,12 +53,16 @@ pub use crate::csl::CslValue;
 pub use crate::env::{Clock, Timer, Timestamp};
 pub use crate::error::{Error, Result};
 pub use crate::fetch::{FetchError, Fetcher, Method, Request, Response};
-pub use crate::filecache::{CacheFs, CacheGuard, FileCacheStore, FsError};
 pub use crate::manager::{CitationManager, CiteFailure, RetrieveReport};
 pub use crate::report::{Event, NopReporter, Reporter, Resolved, ThrottledReporter, Wait};
 pub use crate::retry::{RetryPolicy, RetryingFetcher};
-pub use crate::source::{Outcome, Resolution, RetrieveCtx, Source};
-pub use crate::store::{CacheRecord, CacheStore, Payload, StoreError};
+pub use crate::source::{Interpreted, Outcome, Resolution, RetrieveCtx, Source};
+pub use crate::store::{CacheStore, CachedItem, StoragePolicy, StoreCache, StoreError};
+
+/// The storage crate this crate is built on. Re-exported so that a host names
+/// the same version: its stores, `cachette::Manager` (feature `std`),
+/// [`cachette::export`] and [`cachette::import`].
+pub use cachette;
 
 use alloc::boxed::Box;
 use core::future::Future;

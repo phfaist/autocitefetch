@@ -16,11 +16,13 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use autocitefetch::cachette::{Expiry, Fields, MemoryStore, NewValue, Store as _};
 use autocitefetch::report::{Event, Reporter, Resolved, Wait};
+use autocitefetch::store::encode_item;
 use autocitefetch::{
-    BoxFuture, CacheRecord, CacheStore, CitationManager, Clock, CslValue, Error, FetchError,
-    Fetcher, Payload, RefreshBatching, Request, Resolution, Response, RetrieveCtx, Source,
-    StoreError, Timer, Timestamp,
+    BoxFuture, CitationManager, Clock, CslValue, Error, Fetcher, FetchError, Interpreted,
+    RefreshBatching, Request, Resolution, Response, RetrieveCtx, Source, StoreCache, Timer,
+    Timestamp,
 };
 
 // --- a minimal, always-ready block_on (mocks never truly pend) -------------
@@ -205,40 +207,25 @@ impl Fetcher for FlakyFetcher {
     }
 }
 
-#[derive(Default)]
-struct MemStore {
-    map: RefCell<StdMap<String, CacheRecord>>,
+/// The in-memory cache: cachette's `MemoryStore` behind `StoreCache`, as a
+/// host would wire it.
+type MemStore = StoreCache<MemoryStore>;
+
+fn mem_store() -> MemStore {
+    StoreCache::new(MemoryStore::new())
 }
 
-impl MemStore {
-    fn seed(self, id: &str, rec: CacheRecord) -> Self {
-        self.map.borrow_mut().insert(id.into(), rec);
-        self
-    }
-}
-
-impl CacheStore for MemStore {
-    fn get(&self, id: &str) -> BoxFuture<'_, Result<Option<CacheRecord>, StoreError>> {
-        let v = self.map.borrow().get(id).cloned();
-        Box::pin(async move { Ok(v) })
-    }
-    fn put(&self, id: &str, record: CacheRecord) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().insert(id.into(), record);
-        Box::pin(async move { Ok(()) })
-    }
-    fn remove(&self, id: &str) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().remove(id);
-        Box::pin(async move { Ok(()) })
-    }
-    fn entries(&self) -> BoxFuture<'_, Result<Vec<(String, CacheRecord)>, StoreError>> {
-        let all: Vec<_> = self
-            .map
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        Box::pin(async move { Ok(all) })
-    }
+/// A cache holding `item` under `id` with the expiry times `expiry`, as an
+/// earlier run would have left it.
+fn seeded(id: &str, item: &CslValue, expiry: Expiry) -> MemStore {
+    let store = mem_store();
+    let fields = Fields {
+        expiry: Some(expiry),
+        ..Fields::default()
+    };
+    let value = NewValue::new(encode_item(item).unwrap(), fields);
+    store.with_store(|s| s.put(id, value)).unwrap();
+    store
 }
 
 struct FixedClock(i64);
@@ -292,7 +279,8 @@ impl Source for PlainSource {
     }
 }
 
-/// Chains every key to `doi:10.9999/<key>`, like the real arXiv source.
+/// Chains every key to `doi:10.9999/<key>`, like the real arXiv source: it
+/// caches a plain item and chains on read.
 struct ChainSource;
 
 impl Source for ChainSource {
@@ -306,12 +294,16 @@ impl Source for ChainSource {
     ) -> BoxFuture<'a, Vec<Resolution>> {
         Box::pin(async move {
             keys.into_iter()
-                .map(|k| {
-                    let target = format!("10.9999/{k}");
-                    Resolution::chained(k, "doi", target, CslValue::Null)
-                })
+                .map(|k| Resolution::concrete(k, serde_json::json!({})))
                 .collect()
         })
+    }
+    fn interpret(&self, key: &str, _item: CslValue) -> Interpreted {
+        Interpreted::Chained {
+            prefix: "doi".into(),
+            key: format!("10.9999/{key}"),
+            set_properties: CslValue::Null,
+        }
     }
 }
 
@@ -387,7 +379,7 @@ fn a_simple_retrieval_is_narrated_end_to_end() {
     let rep = RecordingReporter::default();
     let mgr = CitationManager::new(
         MockFetcher::default(),
-        MemStore::default(),
+        mem_store(),
         FixedClock(0),
         InstantTimer,
     )
@@ -435,7 +427,7 @@ fn source_progress_arrives_before_the_pass_applies_its_resolutions() {
     let rep = RecordingReporter::default();
     let mgr = CitationManager::new(
         MockFetcher::default(),
-        MemStore::default(),
+        mem_store(),
         FixedClock(0),
         InstantTimer,
     )
@@ -463,7 +455,7 @@ fn pacing_between_chunks_is_announced_with_its_duration() {
     let rep = RecordingReporter::default();
     let mgr = CitationManager::new(
         MockFetcher::default(),
-        MemStore::default(),
+        mem_store(),
         FixedClock(0),
         InstantTimer,
     )
@@ -491,7 +483,7 @@ fn a_chain_shows_two_passes_and_a_growing_denominator() {
     let rep = RecordingReporter::default();
     let mgr = CitationManager::new(
         MockFetcher::default(),
-        MemStore::default(),
+        mem_store(),
         FixedClock(0),
         InstantTimer,
     )
@@ -529,7 +521,7 @@ fn retry_backoff_is_announced_with_each_attempt() {
         fail_times: RefCell::new(2),
         body: item("doi:10.1/x"),
     };
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .with_reporter(Rc::new(rep.clone()))
         .register("doi", HttpSource)
         .unwrap();
@@ -556,8 +548,7 @@ fn a_grace_served_failure_is_reported_even_though_it_is_not_in_the_report() {
     // this — the one moment the grace window does its job — would be invisible.
     let now = 1_000_000_000i64;
     let csl: CslValue = serde_json::from_str(&item("doi:10.1/x")).unwrap();
-    let stale = CacheRecord {
-        payload: Payload::Concrete(csl),
+    let stale = Expiry {
         stale_after: Timestamp::from_millis(now - 20_000),
         // Hard-expired ten seconds ago, far inside the 14-day grace window.
         expires: Timestamp::from_millis(now - 10_000),
@@ -566,7 +557,7 @@ fn a_grace_served_failure_is_reported_even_though_it_is_not_in_the_report() {
     let rep = RecordingReporter::default();
     let mgr = CitationManager::new(
         MockFetcher::default(),
-        MemStore::default().seed("doi:10.1/x", stale),
+        seeded("doi:10.1/x", &csl, stale),
         FixedClock(now),
         InstantTimer,
     )
@@ -584,7 +575,7 @@ fn a_grace_served_failure_is_reported_even_though_it_is_not_in_the_report() {
     rep.assert_has("failed doi:10.1/x grace=true");
     rep.assert_has("retrieve:end considered=1 failed=0");
     // The cached copy is still what `get` returns.
-    let got = block_on(mgr.get("doi", "10.1/x")).unwrap();
+    let got = mgr.get("doi", "10.1/x").unwrap();
     assert_eq!(got.get("title").and_then(|v| v.as_str()), Some("t"));
 }
 
@@ -593,7 +584,7 @@ fn an_authoritative_miss_is_reported_as_a_real_failure() {
     let rep = RecordingReporter::default();
     let mgr = CitationManager::new(
         MockFetcher::default(),
-        MemStore::default(),
+        mem_store(),
         FixedClock(0),
         InstantTimer,
     )
@@ -636,8 +627,7 @@ impl Source for MissingSource {
 fn a_fully_cached_run_reports_cache_hits_and_drives_no_source() {
     let now = 1_000_000_000i64;
     let csl: CslValue = serde_json::from_str(&item("doi:10.1/x")).unwrap();
-    let fresh = CacheRecord {
-        payload: Payload::Concrete(csl),
+    let fresh = Expiry {
         stale_after: Timestamp::from_millis(now + 60_000),
         expires: Timestamp::from_millis(now + 120_000),
     };
@@ -645,7 +635,7 @@ fn a_fully_cached_run_reports_cache_hits_and_drives_no_source() {
     let rep = RecordingReporter::default();
     let mgr = CitationManager::new(
         MockFetcher::default(),
-        MemStore::default().seed("doi:10.1/x", fresh),
+        seeded("doi:10.1/x", &csl, fresh),
         FixedClock(now),
         InstantTimer,
     )
@@ -669,8 +659,7 @@ fn a_deferred_refresh_is_announced_and_drives_no_source() {
     // the one event saying so is all a display sees — no failure, no source.
     let now = 1_000_000_000i64;
     let csl: CslValue = serde_json::from_str(&item("doi:10.1/x")).unwrap();
-    let expired = CacheRecord {
-        payload: Payload::Concrete(csl),
+    let expired = Expiry {
         stale_after: Timestamp::from_millis(now - 20_000),
         expires: Timestamp::from_millis(now - 10_000),
     };
@@ -678,7 +667,7 @@ fn a_deferred_refresh_is_announced_and_drives_no_source() {
     let rep = RecordingReporter::default();
     let mgr = CitationManager::new(
         MockFetcher::default(),
-        MemStore::default().seed("doi:10.1/x", expired),
+        seeded("doi:10.1/x", &csl, expired),
         FixedClock(now),
         InstantTimer,
     )

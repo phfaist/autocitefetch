@@ -16,6 +16,7 @@ serde_json = { version = "1", default-features = false, features = ["alloc"] }
 hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 xmlparser = { version = "0.13", default-features = false }
+cachette = { version = "0.1", default-features = false }
 
 autocitefetch = { path = "crates/autocitefetch", version = "0.1.1" }
 autocitefetch-std = { path = "crates/autocitefetch-std", version = "0.1.1" }

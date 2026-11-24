@@ -4,7 +4,7 @@ use alloc::string::String;
 use core::fmt;
 
 use crate::fetch::FetchError;
-use crate::store::StoreError;
+use cachette::StoreError;
 
 /// Convenience alias for results in this crate.
 pub type Result<T> = core::result::Result<T, Error>;
@@ -27,7 +27,7 @@ pub enum Error {
     InvalidId(String),
     /// A key was requested but never resolved (and no cached copy exists).
     NotFound(String),
-    /// A chain of citation pointers could not be followed: the target is
+    /// A chain of citations could not be followed: the target is
     /// missing, it points at itself, or the chain is longer than
     /// `max_chain_depth`.
     Chain(String),

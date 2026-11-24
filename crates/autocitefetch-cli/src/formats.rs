@@ -12,7 +12,7 @@
 //! * arXiv DOI overrides are handed over as *data*
 //!   ([`ArxivSource::with_override_dois`]) rather than as a file path, so the
 //!   override file may be YAML even though the core's built-in
-//!   `with_override_dois_file` convenience only knows JSON.
+//!   `load_override_dois` convenience only knows JSON.
 //!
 //! [`BibliographyFileSource::with_parser`]: autocitefetch::source::BibliographyFileSource::with_parser
 //! [`ArxivSource::with_override_dois`]: autocitefetch::source::ArxivSource::with_override_dois

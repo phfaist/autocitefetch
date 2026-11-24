@@ -13,10 +13,11 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use autocitefetch::cachette::MemoryStore;
 use autocitefetch::source::DoiSource;
 use autocitefetch::{
-    BoxFuture, CacheRecord, CacheStore, CitationManager, Clock, FetchError, Fetcher, Request,
-    Response, RetryPolicy, RetryingFetcher, StoreError, Timer, Timestamp,
+    BoxFuture, CitationManager, Clock, Fetcher, FetchError, Request, Response, RetryingFetcher,
+    RetryPolicy, StoreCache, Timer, Timestamp,
 };
 
 // --- a minimal, always-ready block_on (mocks never truly pend) -------------
@@ -115,33 +116,12 @@ impl Fetcher for FlakyFetcher {
     }
 }
 
-#[derive(Default)]
-struct MemStore {
-    map: RefCell<StdMap<String, CacheRecord>>,
-}
+/// The in-memory cache: cachette's `MemoryStore` behind `StoreCache`, as a
+/// host would wire it.
+type MemStore = StoreCache<MemoryStore>;
 
-impl CacheStore for MemStore {
-    fn get(&self, id: &str) -> BoxFuture<'_, Result<Option<CacheRecord>, StoreError>> {
-        let v = self.map.borrow().get(id).cloned();
-        Box::pin(async move { Ok(v) })
-    }
-    fn put(&self, id: &str, record: CacheRecord) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().insert(id.into(), record);
-        Box::pin(async move { Ok(()) })
-    }
-    fn remove(&self, id: &str) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().remove(id);
-        Box::pin(async move { Ok(()) })
-    }
-    fn entries(&self) -> BoxFuture<'_, Result<Vec<(String, CacheRecord)>, StoreError>> {
-        let all: Vec<_> = self
-            .map
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        Box::pin(async move { Ok(all) })
-    }
+fn mem_store() -> MemStore {
+    StoreCache::new(MemoryStore::new())
 }
 
 struct FixedClock(i64);
@@ -242,7 +222,7 @@ fn retryable_503_is_retried_until_it_succeeds() {
     let timer = RecordingTimer::default();
     let sleeps = timer.clone();
     let fetcher = FlakyFetcher::new(DOI_URL, K, FailMode::Status(503), BODY);
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), timer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), timer)
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), DOI.to_string())];
@@ -250,7 +230,7 @@ fn retryable_503_is_retried_until_it_succeeds() {
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
     // Resolved despite the transient failures.
-    let item = block_on(mgr.get("doi", DOI)).unwrap();
+    let item = mgr.get("doi", DOI).unwrap();
     assert_eq!(item["id"], "doi:10.1234/retry");
     assert_eq!(item["title"], "Retry Worked");
 
@@ -275,14 +255,14 @@ fn retryable_transport_error_is_retried_until_it_succeeds() {
     let timer = RecordingTimer::default();
     let sleeps = timer.clone();
     let fetcher = FlakyFetcher::new(DOI_URL, K, FailMode::Transport, BODY);
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), timer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), timer)
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), DOI.to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    assert_eq!(block_on(mgr.get("doi", DOI)).unwrap()["title"], "Retry Worked");
+    assert_eq!(mgr.get("doi", DOI).unwrap()["title"], "Retry Worked");
     assert_eq!(sleeps.millis().len(), K as usize);
 }
 
@@ -294,7 +274,7 @@ fn non_retryable_404_is_not_retried() {
     let timer = RecordingTimer::default();
     let sleeps = timer.clone();
     let fetcher = FlakyFetcher::new(DOI_URL, 99, FailMode::Status(404), BODY);
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), timer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), timer)
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), DOI.to_string())];
@@ -303,7 +283,7 @@ fn non_retryable_404_is_not_retried() {
     // Reported as a failure, and never resolvable.
     assert_eq!(report.failures.len(), 1, "the 404 should surface as a failure");
     assert_eq!(report.failures[0].prefix, "doi");
-    assert!(block_on(mgr.get("doi", DOI)).is_err());
+    assert!(mgr.get("doi", DOI).is_err());
 
     // Zero backoff sleeps: a 404 is not retried.
     assert!(sleeps.millis().is_empty(), "a 404 must not be retried");
@@ -317,7 +297,7 @@ fn retry_after_reaches_the_wrapper_through_a_source() {
     let sleeps = timer.clone();
     let fetcher =
         FlakyFetcher::new(DOI_URL, 1, FailMode::Status(429), BODY).with_retry_after("3");
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), timer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), timer)
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), DOI.to_string())];

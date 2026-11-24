@@ -32,15 +32,17 @@
 //! Entries carry **TTL 0**, so they are re-resolved on every run and never
 //! served from cache — which is free, since resolving is just copying the key.
 //!
-//! TTL 0 makes an entry *ephemeral*: it is kept in the store's in-memory view
-//! for the duration of the run (so `get()` still returns it after `retrieve`),
-//! but is **never persisted** — a persistent [`FileCacheStore`] keeps it out of
-//! the committable `citations.jsonl` and its sidecar logs entirely, and it is
-//! gone the moment the store is reopened. So arbitrary manual citation text
-//! never lands in a git-tracked file. (This is enforced by the store, keyed on
-//! the record's timestamps, not by anything special about this prefix.)
+//! TTL 0 makes an entry *ephemeral* (see [`CacheStore::put`]): it is kept in
+//! memory for the life of the cache object (so `get()` still returns it after
+//! `retrieve`), but is **never persisted** — [`StoreCache`] keeps it in a
+//! [`cachette::WithEphemeral`] in front of the store, out of the committable
+//! `citations.jsonl` and its logs entirely, and it is gone the moment the
+//! cache is reopened. So arbitrary manual citation text never lands in a
+//! git-tracked file. (This is keyed on the lifetime, not on anything special
+//! about this prefix.)
 //!
-//! [`FileCacheStore`]: crate::filecache::FileCacheStore
+//! [`CacheStore::put`]: crate::store::CacheStore::put
+//! [`StoreCache`]: crate::store::StoreCache
 
 use alloc::boxed::Box;
 use alloc::string::String;

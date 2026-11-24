@@ -6,16 +6,17 @@
 //! elsewhere supplies more keys than `chunk_size` or has a clock that moves.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap as StdMap;
 use std::future::Future;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use autocitefetch::cachette::{Expiry, Fields, MemoryStore, NewValue, Store as _};
+use autocitefetch::store::encode_item;
 use autocitefetch::{
-    BoxFuture, CacheRecord, CacheStore, CitationManager, Clock, CslValue, Error, FetchError,
-    Fetcher, Outcome, Payload, Request, Resolution, Response, RetrieveCtx, Source, StoreError,
-    Timer, Timestamp,
+    BoxFuture, CachedItem, CacheStore, CitationManager, Clock, CslValue, Error, Fetcher, FetchError,
+    Interpreted, Request, Resolution, Response, RetrieveCtx, Source, StoragePolicy, StoreCache,
+    StoreError, Timer, Timestamp,
 };
 
 // --- a minimal, always-ready block_on (mocks never truly pend) -------------
@@ -41,50 +42,83 @@ impl Fetcher for NoopFetcher {
     }
 }
 
-/// A `MemStore` that also counts `put`s, so a source answering twice for one
-/// key can be caught double-writing.
-#[derive(Clone, Default)]
+/// The in-memory cache (cachette's `MemoryStore` behind `StoreCache`) that
+/// also counts `put`s, so a source answering twice for one key can be caught
+/// double-writing. `Clone` shares the one cache, so a test keeps a handle on
+/// it after handing it to the manager.
+#[derive(Clone)]
 struct MemStore {
-    map: Rc<RefCell<StdMap<String, CacheRecord>>>,
+    cache: Rc<StoreCache<MemoryStore>>,
     puts: Rc<Cell<u32>>,
 }
 
+fn mem_store() -> MemStore {
+    MemStore {
+        cache: Rc::new(StoreCache::new(MemoryStore::new())),
+        puts: Rc::new(Cell::new(0)),
+    }
+}
+
 impl MemStore {
-    fn seed(&self, id: &str, payload: Payload, stale_after: i64, expires: i64) {
-        self.map.borrow_mut().insert(
-            id.into(),
-            CacheRecord {
-                payload,
-                stale_after: Timestamp::from_millis(stale_after),
-                expires: Timestamp::from_millis(expires),
-            },
-        );
+    /// Store `item` under `id` with the given expiry times, as an earlier run
+    /// would have left it.
+    fn seed(&self, id: &str, item: CslValue, stale_after: i64, expires: i64) {
+        let expiry = Expiry {
+            stale_after: Timestamp::from_millis(stale_after),
+            expires: Timestamp::from_millis(expires),
+        };
+        let fields = Fields {
+            expiry: Some(expiry),
+            ..Fields::default()
+        };
+        let value = NewValue::new(encode_item(&item).unwrap(), fields);
+        self.cache.with_store(|s| s.put(id, value)).unwrap();
+    }
+
+    /// The stored item under `id`, as the cache holds it.
+    fn stored(&self, id: &str) -> Option<CslValue> {
+        self.cache.get(id).unwrap().map(|c| c.item)
+    }
+
+    /// How many values the cache holds (ephemeral items excluded).
+    fn len(&self) -> usize {
+        self.cache.with_store(|s| {
+            let mut n = 0;
+            s.list(&mut |_| n += 1).unwrap();
+            n
+        })
     }
 }
 
 impl CacheStore for MemStore {
-    fn get(&self, id: &str) -> BoxFuture<'_, Result<Option<CacheRecord>, StoreError>> {
-        let v = self.map.borrow().get(id).cloned();
-        Box::pin(async move { Ok(v) })
+    fn policy(&self) -> StoragePolicy {
+        self.cache.policy()
     }
-    fn put(&self, id: &str, record: CacheRecord) -> BoxFuture<'_, Result<(), StoreError>> {
+    fn get(&self, id: &str) -> Result<Option<CachedItem>, StoreError> {
+        self.cache.get(id)
+    }
+    fn put(&self, id: &str, item: &CslValue, ttl: Duration, now: Timestamp) -> Result<(), StoreError> {
         self.puts.set(self.puts.get() + 1);
-        self.map.borrow_mut().insert(id.into(), record);
-        Box::pin(async move { Ok(()) })
+        self.cache.put(id, item, ttl, now)
     }
-    fn remove(&self, id: &str) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().remove(id);
-        Box::pin(async move { Ok(()) })
+    fn remove(&self, id: &str) -> Result<(), StoreError> {
+        self.cache.remove(id)
     }
-    fn entries(&self) -> BoxFuture<'_, Result<Vec<(String, CacheRecord)>, StoreError>> {
-        let all: Vec<_> = self
-            .map
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        Box::pin(async move { Ok(all) })
+    fn flush(&self) -> Result<(), StoreError> {
+        self.cache.flush()
     }
+    fn prune(&self, now: Timestamp) -> Result<usize, StoreError> {
+        self.cache.prune(now)
+    }
+}
+
+/// An item that [`ScriptSource::interpret`] reads as a chain to
+/// `(prefix, key)` with `set_properties`: chaining is derived on read, so a
+/// chaining item is an ordinary cached item that says where it points.
+fn chain_item(prefix: &str, key: &str, set_properties: CslValue) -> CslValue {
+    serde_json::json!({
+        "_chain_to": {"prefix": prefix, "key": key, "set_properties": set_properties},
+    })
 }
 
 /// A clock the mocks move forward (request latency, timer sleeps).
@@ -223,33 +257,19 @@ impl Source for ScriptSource {
                     Answer::Concrete => {
                         out.push(Resolution::concrete(k.clone(), item(&format!("{}:{k}", self.prefix))))
                     }
-                    Answer::ChainTo(target) => out.push(Resolution {
-                        key: k.clone(),
-                        outcome: Outcome::Chained {
-                            prefix: target.into(),
-                            key: k,
-                            set_properties: CslValue::Object(serde_json::Map::new()),
-                        },
-                    }),
+                    Answer::ChainTo(target) => {
+                        let it = chain_item(target, &k, serde_json::json!({}));
+                        out.push(Resolution::concrete(k, it))
+                    }
                     Answer::ChainToSuccessor => {
                         let next = k.parse::<u32>().unwrap() + 1;
-                        out.push(Resolution {
-                            key: k,
-                            outcome: Outcome::Chained {
-                                prefix: self.prefix.into(),
-                                key: next.to_string(),
-                                set_properties: CslValue::Object(serde_json::Map::new()),
-                            },
-                        });
+                        let it = chain_item(self.prefix, &next.to_string(), serde_json::json!({}));
+                        out.push(Resolution::concrete(k, it));
                     }
-                    Answer::SelfChain => out.push(Resolution {
-                        key: k.clone(),
-                        outcome: Outcome::Chained {
-                            prefix: self.prefix.into(),
-                            key: k,
-                            set_properties: CslValue::Object(serde_json::Map::new()),
-                        },
-                    }),
+                    Answer::SelfChain => {
+                        let it = chain_item(self.prefix, &k, serde_json::json!({}));
+                        out.push(Resolution::concrete(k, it))
+                    }
                     Answer::Fail => {
                         out.push(Resolution::failed(k, Error::Source("source down".into())))
                     }
@@ -270,17 +290,13 @@ impl Source for ScriptSource {
                             "keep": {"reference": "nested, not top level"},
                         }),
                     )),
-                    Answer::ChainFatTo(target) => out.push(Resolution {
-                        key: k.clone(),
-                        outcome: Outcome::Chained {
-                            prefix: target.into(),
-                            key: k,
-                            set_properties: serde_json::json!({
-                                "reference": ["from the pointer"],
-                                "arxivid": "1211.1037",
-                            }),
-                        },
-                    }),
+                    Answer::ChainFatTo(target) => {
+                        let sp = serde_json::json!({
+                            "reference": ["from the pointer"],
+                            "arxivid": "1211.1037",
+                        });
+                        out.push(Resolution::concrete(k.clone(), chain_item(target, &k, sp)))
+                    }
                     Answer::OmitOthers => {
                         if k == "ok" {
                             out.push(Resolution::concrete(k, item("ok")));
@@ -294,6 +310,18 @@ impl Source for ScriptSource {
             }
             out
         })
+    }
+    /// An item with a `_chain_to` member chains there (see [`chain_item`]);
+    /// any other item is the answer.
+    fn interpret(&self, _key: &str, item: CslValue) -> Interpreted {
+        match item.get("_chain_to") {
+            Some(c) => Interpreted::Chained {
+                prefix: c["prefix"].as_str().unwrap().into(),
+                key: c["key"].as_str().unwrap().into(),
+                set_properties: c["set_properties"].clone(),
+            },
+            None => Interpreted::Concrete(item),
+        }
     }
 }
 
@@ -312,7 +340,7 @@ fn cites(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 #[test]
 fn a_key_the_source_omits_is_reported() {
     let clock = MovableClock::default();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), InstantTimer)
         .register("s", ScriptSource::new("s", Answer::OmitOthers, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "ok"), ("s", "ghost")]))).unwrap();
@@ -325,8 +353,8 @@ fn a_key_the_source_omits_is_reported() {
         report.failures[0].message
     );
     // The key that *was* answered still resolved.
-    assert!(block_on(mgr.get("s", "ok")).is_ok());
-    assert!(block_on(mgr.get("s", "ghost")).is_err());
+    assert!(mgr.get("s", "ok").is_ok());
+    assert!(mgr.get("s", "ghost").is_err());
 }
 
 /// A source answering twice for one key writes the store once (and, for
@@ -334,7 +362,7 @@ fn a_key_the_source_omits_is_reported() {
 #[test]
 fn duplicate_resolutions_for_one_key_are_collapsed() {
     let clock = MovableClock::default();
-    let store = MemStore::default();
+    let store = mem_store();
     let puts = store.puts.clone();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
         .register("s", ScriptSource::new("s", Answer::Duplicate, &clock)).unwrap();
@@ -342,7 +370,7 @@ fn duplicate_resolutions_for_one_key_are_collapsed() {
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
     assert_eq!(puts.get(), 1, "the duplicate must not double-write the store");
-    assert_eq!(block_on(mgr.get("s", "k")).unwrap()["title"], "first");
+    assert_eq!(mgr.get("s", "k").unwrap()["title"], "first");
 }
 
 /// A concrete payload that is not a JSON object is a source bug: it used to be
@@ -350,7 +378,7 @@ fn duplicate_resolutions_for_one_key_are_collapsed() {
 #[test]
 fn a_non_object_concrete_payload_is_reported_not_stubbed() {
     let clock = MovableClock::default();
-    let store = MemStore::default();
+    let store = mem_store();
     let entries = store.clone();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
         .register("s", ScriptSource::new("s", Answer::NonObject, &clock)).unwrap();
@@ -362,11 +390,7 @@ fn a_non_object_concrete_payload_is_reported_not_stubbed() {
         "unhelpful message: {}",
         report.failures[0].message
     );
-    assert_eq!(
-        block_on(entries.entries()).unwrap().len(),
-        0,
-        "nothing should have been cached"
-    );
+    assert_eq!(entries.len(), 0, "nothing should have been cached");
 }
 
 // --- chains ----------------------------------------------------------------
@@ -377,7 +401,7 @@ fn a_non_object_concrete_payload_is_reported_not_stubbed() {
 #[test]
 fn chain_discovery_is_bounded_by_max_chain_depth() {
     let clock = MovableClock::default();
-    let store = MemStore::default();
+    let store = mem_store();
     let entries = store.clone();
     let src = ScriptSource::new("c", Answer::ChainToSuccessor, &clock);
     let log = src.log();
@@ -389,7 +413,7 @@ fn chain_discovery_is_bounded_by_max_chain_depth() {
 
     // Links at depth 0..3 were fetched; depth 4 was refused and reported.
     assert_eq!(log.borrow().len(), 4, "fetched: {:?}", log.borrow());
-    assert_eq!(block_on(entries.entries()).unwrap().len(), 4);
+    assert_eq!(entries.len(), 4);
     assert_eq!(report.failures.len(), 1);
     assert_eq!(report.failures[0].key, "4");
     assert!(
@@ -399,16 +423,16 @@ fn chain_discovery_is_bounded_by_max_chain_depth() {
     );
 
     // And reading it fails cleanly rather than looping.
-    let err = block_on(mgr.get("c", "0")).unwrap_err();
+    let err = mgr.get("c", "0").unwrap_err();
     assert!(matches!(err, Error::Chain(_)), "got {err}");
 }
 
-/// A pointer at itself is caught at store time instead of surfacing as
-/// "chain too deep" `max_chain_depth` store reads later.
+/// An item that chains to itself is caught when it is stored (and removed)
+/// instead of surfacing as "chain too deep" `max_chain_depth` reads later.
 #[test]
 fn a_self_chain_is_rejected_at_store_time() {
     let clock = MovableClock::default();
-    let store = MemStore::default();
+    let store = mem_store();
     let entries = store.clone();
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
         .register("s", ScriptSource::new("s", Answer::SelfChain, &clock)).unwrap();
@@ -420,7 +444,7 @@ fn a_self_chain_is_rejected_at_store_time() {
         "unhelpful message: {}",
         report.failures[0].message
     );
-    assert_eq!(block_on(entries.entries()).unwrap().len(), 0);
+    assert_eq!(entries.len(), 0);
 }
 
 /// A chain target that is not in the cache names *both* ids: the target alone
@@ -428,48 +452,31 @@ fn a_self_chain_is_rejected_at_store_time() {
 #[test]
 fn a_missing_chain_target_names_both_ids() {
     let clock = MovableClock::default();
-    let store = MemStore::default();
-    store.seed(
-        "a:x",
-        Payload::Chained {
-            prefix: "b".into(),
-            key: "gone".into(),
-            set_properties: CslValue::Object(serde_json::Map::new()),
-        },
-        10_000,
-        10_000,
-    );
-    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer);
+    let store = mem_store();
+    store.seed("a:x", chain_item("b", "gone", serde_json::json!({})), 9_000, 10_000);
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
+        .register("a", ScriptSource::new("a", Answer::Concrete, &clock)).unwrap();
 
-    let err = block_on(mgr.get("a", "x")).unwrap_err();
+    let err = mgr.get("a", "x").unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("a:x") && msg.contains("b:gone"), "got: {msg}");
 
     // A miss on the *requested* id is still a plain NotFound.
-    let err = block_on(mgr.get("a", "absent")).unwrap_err();
+    let err = mgr.get("a", "absent").unwrap_err();
     assert!(matches!(err, Error::NotFound(_)), "got {err}");
 }
 
-/// A stale chained record must not drag its old target along: the refetch may
-/// well replace the pointer (retracted DOI, suppressed by an override), and the
-/// dead target's 404 would be reported as a failure for a citation nobody
+/// A stale cached item that chains must not drag its old target along: the
+/// refetch may well change where it points (a retracted DOI), and the dead
+/// target's 404 would be reported as a failure for a citation nobody
 /// requested — plus one wasted rate-limited request.
 #[test]
 fn a_stale_pointer_does_not_fetch_its_dead_target() {
     let clock = MovableClock::default();
     clock.advance(1_000_000);
-    let store = MemStore::default();
+    let store = mem_store();
     // `a:x` used to chain to `b:OLD`, and is now hard-expired.
-    store.seed(
-        "a:x",
-        Payload::Chained {
-            prefix: "b".into(),
-            key: "OLD".into(),
-            set_properties: CslValue::Object(serde_json::Map::new()),
-        },
-        0,
-        0,
-    );
+    store.seed("a:x", chain_item("b", "OLD", serde_json::json!({})), 0, 1);
 
     let a = ScriptSource::new("a", Answer::Concrete, &clock);
     let b = ScriptSource::new("b", Answer::Fail, &clock);
@@ -489,28 +496,19 @@ fn a_stale_pointer_does_not_fetch_its_dead_target() {
         "a citation nobody asked for was reported: {:?}",
         report.failures
     );
-    assert_eq!(block_on(mgr.get("a", "x")).unwrap()["title"], "a:x");
+    assert_eq!(mgr.get("a", "x").unwrap()["title"], "a:x");
 }
 
-/// …but a chained record kept alive by the grace window *does* still need its
+/// …but a chaining item kept alive by the grace window *does* still need its
 /// target, or `get()` breaks on the next link.
 #[test]
 fn a_grace_served_pointer_keeps_its_target() {
     let clock = MovableClock::default();
     clock.advance(1000);
-    let store = MemStore::default();
-    // Hard-expired (but well within the default 14-day grace) pointer whose
-    // target is not in the cache yet.
-    store.seed(
-        "a:x",
-        Payload::Chained {
-            prefix: "b".into(),
-            key: "t".into(),
-            set_properties: CslValue::Object(serde_json::Map::new()),
-        },
-        0,
-        0,
-    );
+    let store = mem_store();
+    // Hard-expired (but well within the default 14-day grace) chaining item
+    // whose target is not in the cache yet.
+    store.seed("a:x", chain_item("b", "t", serde_json::json!({})), 0, 1);
 
     let a = ScriptSource::new("a", Answer::Fail, &clock);
     let b = ScriptSource::new("b", Answer::Concrete, &clock);
@@ -524,10 +522,10 @@ fn a_grace_served_pointer_keeps_its_target() {
     assert_eq!(
         b_log.borrow().len(),
         1,
-        "the kept pointer's target must be fetched: {:?}",
+        "the kept item's target must be fetched: {:?}",
         b_log.borrow()
     );
-    assert_eq!(block_on(mgr.get("a", "x")).unwrap()["title"], "b:t");
+    assert_eq!(mgr.get("a", "x").unwrap()["title"], "b:t");
 }
 
 /// A chain's `set_properties` **override** the concrete target's colliding
@@ -537,26 +535,23 @@ fn a_grace_served_pointer_keeps_its_target() {
 #[test]
 fn chained_set_properties_override_the_target() {
     let clock = MovableClock::default();
-    let store = MemStore::default();
+    let store = mem_store();
     store.seed(
         "a:x",
-        Payload::Chained {
-            prefix: "b".into(),
-            key: "t".into(),
-            set_properties: serde_json::json!({"title": "FROM CHAIN", "extra": "kept"}),
-        },
-        10_000,
+        chain_item("b", "t", serde_json::json!({"title": "FROM CHAIN", "extra": "kept"})),
+        9_000,
         10_000,
     );
     store.seed(
         "b:t",
-        Payload::Concrete(serde_json::json!({"id": "b:t", "title": "FROM TARGET", "year": 1935})),
-        10_000,
+        serde_json::json!({"id": "b:t", "title": "FROM TARGET", "year": 1935}),
+        9_000,
         10_000,
     );
-    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer);
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
+        .register("a", ScriptSource::new("a", Answer::Concrete, &clock)).unwrap();
 
-    let item = block_on(mgr.get("a", "x")).unwrap();
+    let item = mgr.get("a", "x").unwrap();
     assert_eq!(item["title"], "FROM CHAIN", "the chain must override the target");
     assert_eq!(item["extra"], "kept", "chain-only field is attached");
     assert_eq!(item["year"], 1935, "target-only field is preserved");
@@ -568,26 +563,18 @@ fn chained_set_properties_override_the_target() {
 #[test]
 fn a_set_properties_id_cannot_override_the_requested_id() {
     let clock = MovableClock::default();
-    let store = MemStore::default();
+    let store = mem_store();
     store.seed(
         "a:y",
-        Payload::Chained {
-            prefix: "b".into(),
-            key: "u".into(),
-            set_properties: serde_json::json!({"id": "HACKED", "note": "n"}),
-        },
-        10_000,
+        chain_item("b", "u", serde_json::json!({"id": "HACKED", "note": "n"})),
+        9_000,
         10_000,
     );
-    store.seed(
-        "b:u",
-        Payload::Concrete(serde_json::json!({"id": "b:u", "title": "T"})),
-        10_000,
-        10_000,
-    );
-    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer);
+    store.seed("b:u", serde_json::json!({"id": "b:u", "title": "T"}), 9_000, 10_000);
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
+        .register("a", ScriptSource::new("a", Answer::Concrete, &clock)).unwrap();
 
-    let item = block_on(mgr.get("a", "y")).unwrap();
+    let item = mgr.get("a", "y").unwrap();
     assert_eq!(item["id"], "a:y", "the requested id must win over set_properties.id");
     assert_eq!(item["note"], "n", "other set_properties still apply");
     assert_eq!(item["title"], "T", "target field with no override is kept");
@@ -595,46 +582,50 @@ fn a_set_properties_id_cannot_override_the_requested_id() {
 
 // --- dropped CSL fields ----------------------------------------------------
 
-/// `with_dropped_csl_fields` strips the listed top-level fields *before* the
-/// item is stored, so they are absent from the cache record itself — not merely
-/// filtered on the way out — while nested occurrences and unlisted fields stay.
+/// `with_dropped_csl_fields` removes the listed top-level fields from the
+/// *output* only: the cache keeps what the source returned (minus what its
+/// storage policy omits), so a later run without the option answers the field
+/// again. Nested occurrences and unlisted fields stay.
 #[test]
-fn dropped_fields_never_reach_the_store() {
+fn dropped_fields_affect_the_output_not_the_store() {
     let clock = MovableClock::default();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .with_dropped_csl_fields(["reference", "abstract"])
+    let store = mem_store();
+    let handle = store.clone();
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
+        .with_dropped_csl_fields(["reference", "title"])
         .register("s", ScriptSource::new("s", Answer::Fat, &clock))
         .unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "x")]))).unwrap();
     assert!(report.is_complete(), "{:?}", report.failures);
 
-    let rec = block_on(mgr.store().get("s:x")).unwrap().expect("stored");
-    let Payload::Concrete(stored) = rec.payload else {
-        panic!("expected a concrete payload");
-    };
-    assert!(stored.get("reference").is_none(), "dropped before storage");
-    assert!(stored.get("abstract").is_none(), "dropped before storage");
-    assert_eq!(stored["title"], "s:x", "unlisted fields are untouched");
+    // The store holds the source's answer: `title` stays, although dropped;
+    // `reference` and `abstract` are omitted by the default storage policy.
+    let stored = handle.stored("s:x").expect("stored");
+    assert_eq!(stored["title"], "s:x", "a dropped field stays in the store");
+    assert!(stored.get("reference").is_none(), "omitted by the storage policy");
+    assert!(stored.get("abstract").is_none(), "omitted by the storage policy");
+    assert!(stored.get("id").is_none(), "no id is stamped into a stored item");
     assert_eq!(
         stored["keep"]["reference"], "nested, not top level",
-        "only top-level keys are dropped"
+        "only top-level keys are omitted"
     );
 
-    let item = block_on(mgr.get("s", "x")).unwrap();
+    let item = mgr.get("s", "x").unwrap();
+    assert!(item.get("title").is_none(), "dropped from the output");
     assert!(item.get("reference").is_none());
+    assert_eq!(item["keep"]["reference"], "nested, not top level", "only top-level keys are dropped");
     assert_eq!(item["id"], "s:x");
 }
 
-/// A chained pointer's `set_properties` are stripped too. They *override* the
-/// concrete target at read time, so a dropped field left in the pointer would
-/// walk straight back out of `get` — a field dropped from the arXiv side
-/// re-appearing on the DOI item it chains to.
+/// A chain's `set_properties` *override* the concrete target at read time, so
+/// dropped (and omitted) fields are removed after the merge: a field carried by
+/// the chain cannot walk back out of `get`.
 #[test]
-fn dropped_fields_are_stripped_from_chained_set_properties() {
+fn dropped_fields_cannot_come_back_through_chained_set_properties() {
     let clock = MovableClock::default();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
-        .with_dropped_csl_fields(["reference"])
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), InstantTimer)
+        .with_dropped_csl_fields(["note"])
         .register("a", ScriptSource::new("a", Answer::ChainFatTo("b"), &clock))
         .unwrap()
         .register("b", ScriptSource::new("b", Answer::Fat, &clock))
@@ -643,30 +634,33 @@ fn dropped_fields_are_stripped_from_chained_set_properties() {
     let report = block_on(mgr.retrieve(&cites(&[("a", "x")]))).unwrap();
     assert!(report.is_complete(), "{:?}", report.failures);
 
-    let rec = block_on(mgr.store().get("a:x")).unwrap().expect("stored");
-    let Payload::Chained { set_properties, .. } = rec.payload else {
-        panic!("expected a chained payload");
-    };
-    assert!(
-        set_properties.get("reference").is_none(),
-        "the pointer must not smuggle a dropped field back in"
-    );
-    assert_eq!(set_properties["arxivid"], "1211.1037", "other properties survive");
-
-    let item = block_on(mgr.get("a", "x")).unwrap();
+    // The chain carries `reference`, which the storage policy omits.
+    let item = mgr.get("a", "x").unwrap();
     assert!(item.get("reference").is_none(), "neither hop reintroduces it");
-    assert_eq!(item["arxivid"], "1211.1037");
+    assert_eq!(item["arxivid"], "1211.1037", "other properties survive");
     assert_eq!(item["title"], "b:x", "the chain still resolves to its target");
     assert_eq!(item["id"], "a:x");
+
+    // The same for a dropped field: here `note` comes from the chain.
+    let clock = MovableClock::default();
+    let store = mem_store();
+    store.seed("a:y", chain_item("b", "t", serde_json::json!({"note": "n", "extra": "e"})), 9_000, 10_000);
+    store.seed("b:t", serde_json::json!({"title": "T"}), 9_000, 10_000);
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
+        .with_dropped_csl_fields(["note"])
+        .register("a", ScriptSource::new("a", Answer::Concrete, &clock)).unwrap();
+    let item = mgr.get("a", "y").unwrap();
+    assert!(item.get("note").is_none(), "a dropped field cannot come back through a chain");
+    assert_eq!(item["extra"], "e");
 }
 
-/// Fields are dropped *before* the `id` is stamped on, so a host that lists
-/// `"id"` — deliberately or by copy-paste — cannot strip the id the entry is
-/// keyed on and echoed under.
+/// The requested `id` is set *after* fields are dropped, so a host that lists
+/// `"id"` — deliberately or by copy-paste — cannot strip the id an item is
+/// answered under.
 #[test]
 fn dropping_id_cannot_strip_the_entrys_id() {
     let clock = MovableClock::default();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), InstantTimer)
         .with_dropped_csl_fields(["id", "reference"])
         .register("s", ScriptSource::new("s", Answer::Fat, &clock))
         .unwrap();
@@ -674,13 +668,9 @@ fn dropping_id_cannot_strip_the_entrys_id() {
     let report = block_on(mgr.retrieve(&cites(&[("s", "x")]))).unwrap();
     assert!(report.is_complete(), "{:?}", report.failures);
 
-    let rec = block_on(mgr.store().get("s:x")).unwrap().expect("stored");
-    let Payload::Concrete(stored) = rec.payload else {
-        panic!("expected a concrete payload");
-    };
-    assert_eq!(stored["id"], "s:x", "the id survives being listed");
-    assert!(stored.get("reference").is_none());
-    assert_eq!(block_on(mgr.get("s", "x")).unwrap()["id"], "s:x");
+    let item = mgr.get("s", "x").unwrap();
+    assert_eq!(item["id"], "s:x", "the id survives being listed");
+    assert!(item.get("reference").is_none());
 }
 
 // --- failure provenance (origin) -------------------------------------------
@@ -691,7 +681,7 @@ fn dropping_id_cannot_strip_the_entrys_id() {
 #[test]
 fn a_direct_failure_has_no_origin() {
     let clock = MovableClock::default();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), InstantTimer)
         .register("s", ScriptSource::new("s", Answer::Fail, &clock)).unwrap();
 
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
@@ -712,7 +702,7 @@ fn a_chained_target_failure_is_attributed_to_the_request() {
     // `a:x` chains to `b:x`; the `b` fetch fails.
     let a = ScriptSource::new("a", Answer::ChainTo("b"), &clock);
     let b = ScriptSource::new("b", Answer::Fail, &clock);
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), InstantTimer)
         .register(a.prefix, a).unwrap()
         .register(b.prefix, b).unwrap();
 
@@ -729,7 +719,7 @@ fn a_chained_target_failure_is_attributed_to_the_request() {
         !report.failures.iter().any(|f| f.prefix == "a" && f.key == "x"),
         "the target failure, not the request, is reported directly"
     );
-    assert!(block_on(mgr.get("a", "x")).is_err());
+    assert!(mgr.get("a", "x").is_err());
 }
 
 /// A multi-hop chain attributes a deep failure to the *original* request, not
@@ -741,7 +731,7 @@ fn a_multi_hop_chain_attributes_back_to_the_original_request() {
     let a = ScriptSource::new("a", Answer::ChainTo("b"), &clock);
     let b = ScriptSource::new("b", Answer::ChainTo("c"), &clock);
     let c = ScriptSource::new("c", Answer::Fail, &clock);
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), InstantTimer)
         .register(a.prefix, a).unwrap()
         .register(b.prefix, b).unwrap()
         .register(c.prefix, c).unwrap();
@@ -767,7 +757,7 @@ fn every_failed_request_is_recoverable_from_the_report() {
     let a = ScriptSource::new("a", Answer::ChainTo("b"), &clock);
     let b = ScriptSource::new("b", Answer::Fail, &clock);
     let d = ScriptSource::new("d", Answer::Fail, &clock);
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), InstantTimer)
         .register(a.prefix, a).unwrap()
         .register(b.prefix, b).unwrap()
         .register(d.prefix, d).unwrap();
@@ -810,18 +800,13 @@ fn missing_is_reported_and_removes_stale_while_failed_is_grace_served() {
     // A cached concrete copy, hard-expired at t=1000 but well within the
     // default 14-day grace at the t=30_000 we read at.
     let seed = |store: &MemStore| {
-        store.seed(
-            "s:k",
-            Payload::Concrete(serde_json::json!({"id": "s:k", "title": "OLD"})),
-            0,
-            1000,
-        );
+        store.seed("s:k", serde_json::json!({"id": "s:k", "title": "OLD"}), 0, 1000);
     };
 
     // Failed → grace-served, not reported, old data still served.
     let clock = MovableClock::default();
     clock.advance(30_000);
-    let store = MemStore::default();
+    let store = mem_store();
     seed(&store);
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
         .register("s", ScriptSource::new("s", Answer::Fail, &clock)).unwrap();
@@ -832,7 +817,7 @@ fn missing_is_reported_and_removes_stale_while_failed_is_grace_served() {
         report.failures
     );
     assert_eq!(
-        block_on(mgr.get("s", "k")).unwrap()["title"],
+        mgr.get("s", "k").unwrap()["title"],
         "OLD",
         "the stale copy must still be served on a reachability failure"
     );
@@ -840,7 +825,7 @@ fn missing_is_reported_and_removes_stale_while_failed_is_grace_served() {
     // Missing → reported even within grace, and the stale copy is removed.
     let clock = MovableClock::default();
     clock.advance(30_000);
-    let store = MemStore::default();
+    let store = mem_store();
     seed(&store);
     let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
         .register("s", ScriptSource::new("s", Answer::Missing, &clock)).unwrap();
@@ -852,7 +837,7 @@ fn missing_is_reported_and_removes_stale_while_failed_is_grace_served() {
     );
     assert_eq!(report.failures[0].key, "k");
     assert!(
-        block_on(mgr.get("s", "k")).is_err(),
+        mgr.get("s", "k").is_err(),
         "the now-known-wrong stale copy must be removed, not served"
     );
 }
@@ -878,7 +863,7 @@ fn pacing_is_start_to_start_and_survives_passes() {
     let timer = AdvancingTimer {
         clock: clock.clone(),
     };
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), timer)
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), timer)
         .register(a.prefix, a).unwrap()
         .register(b.prefix, b).unwrap();
 
@@ -905,18 +890,18 @@ fn pacing_is_start_to_start_and_survives_passes() {
 #[test]
 fn get_by_id_round_trips_and_rejects_a_missing_colon() {
     let clock = MovableClock::default();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), InstantTimer)
         .register("s", ScriptSource::new("s", Answer::Concrete, &clock)).unwrap();
 
     // A key containing a colon still round-trips: ids split on the *first* one.
     block_on(mgr.retrieve(&cites(&[("s", "k"), ("s", "10.1/x:y")]))).unwrap();
-    assert_eq!(block_on(mgr.get_by_id("s:k")).unwrap()["id"], "s:k");
+    assert_eq!(mgr.get_by_id("s:k").unwrap()["id"], "s:k");
     assert_eq!(
-        block_on(mgr.get_by_id("s:10.1/x:y")).unwrap()["id"],
+        mgr.get_by_id("s:10.1/x:y").unwrap()["id"],
         "s:10.1/x:y"
     );
 
-    let err = block_on(mgr.get_by_id("no-colon-here")).unwrap_err();
+    let err = mgr.get_by_id("no-colon-here").unwrap_err();
     assert!(matches!(err, Error::InvalidId(_)), "got {err}");
     assert!(err.to_string().contains("malformed"), "got: {err}");
 }
@@ -927,7 +912,7 @@ fn get_by_id_round_trips_and_rejects_a_missing_colon() {
 #[test]
 fn registering_a_prefix_with_a_colon_errors() {
     let clock = MovableClock::default();
-    let err = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let err = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), InstantTimer)
         .register("bad:prefix", ScriptSource::new("bad:prefix", Answer::Concrete, &clock))
         .err()
         .expect("a colon-containing prefix must be rejected");
@@ -940,7 +925,7 @@ fn registering_a_prefix_with_a_colon_errors() {
 #[test]
 fn registering_an_empty_prefix_errors() {
     let clock = MovableClock::default();
-    let err = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let err = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), InstantTimer)
         .register("", ScriptSource::new("", Answer::Concrete, &clock))
         .err()
         .expect("an empty prefix must be rejected");
@@ -952,7 +937,7 @@ fn registering_an_empty_prefix_errors() {
 #[test]
 fn registering_a_normal_prefix_succeeds() {
     let clock = MovableClock::default();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), InstantTimer)
         .register("s", ScriptSource::new("s", Answer::Concrete, &clock))
         .expect("a colon-free, non-empty prefix must register");
     let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
@@ -1004,7 +989,7 @@ impl Source for EchoSource {
 #[test]
 fn one_source_type_serves_several_host_chosen_prefixes() {
     let clock = MovableClock::default();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), InstantTimer)
         .register("alpha", EchoSource { missing: false })
         .unwrap()
         .register("beta", EchoSource { missing: false })
@@ -1015,11 +1000,11 @@ fn one_source_type_serves_several_host_chosen_prefixes() {
 
     // Same key, two prefixes, two independent entries — and each source saw the
     // prefix it was bound to, not one baked into its type.
-    let a = block_on(mgr.get("alpha", "k")).unwrap();
+    let a = mgr.get("alpha", "k").unwrap();
     assert_eq!(a["id"], "alpha:k");
     assert_eq!(a["title"], "alpha:k", "the source must see its own prefix");
 
-    let b = block_on(mgr.get("beta", "k")).unwrap();
+    let b = mgr.get("beta", "k").unwrap();
     assert_eq!(b["id"], "beta:k");
     assert_eq!(b["title"], "beta:k", "the source must see its own prefix");
 }
@@ -1031,7 +1016,7 @@ fn one_source_type_serves_several_host_chosen_prefixes() {
 #[test]
 fn a_sources_error_message_uses_the_prefix_it_was_registered_under() {
     let clock = MovableClock::default();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), InstantTimer)
         .register("dx", EchoSource { missing: true })
         .unwrap();
 
@@ -1050,7 +1035,7 @@ fn a_sources_error_message_uses_the_prefix_it_was_registered_under() {
 #[test]
 fn re_registering_a_prefix_replaces_the_source() {
     let clock = MovableClock::default();
-    let mgr = CitationManager::new(NoopFetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let mgr = CitationManager::new(NoopFetcher, mem_store(), clock.clone(), InstantTimer)
         .register("s", ScriptSource::new("s", Answer::Fail, &clock))
         .unwrap()
         .register("s", EchoSource { missing: false })
@@ -1062,5 +1047,5 @@ fn re_registering_a_prefix_replaces_the_source() {
         "the replacement source should have answered, not the failing one: {:?}",
         report.failures
     );
-    assert_eq!(block_on(mgr.get("s", "k")).unwrap()["title"], "s:k");
+    assert_eq!(mgr.get("s", "k").unwrap()["title"], "s:k");
 }

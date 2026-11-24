@@ -6,10 +6,11 @@ use std::future::Future;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+use autocitefetch::cachette::{MemoryStore, Store as _};
 use autocitefetch::source::{DoiSource, ManualSource};
 use autocitefetch::{
-    BoxFuture, CacheRecord, CacheStore, CitationManager, Clock, CslValue, FetchError, Fetcher,
-    Outcome, Request, Resolution, Response, Source, StoreError, Timer, Timestamp,
+    BoxFuture, CitationManager, Clock, CslValue, Fetcher, FetchError, Interpreted, Request,
+    Resolution, Response, Source, StoreCache, Timer, Timestamp,
 };
 
 // --- a minimal, always-ready block_on (mocks never truly pend) -------------
@@ -85,33 +86,12 @@ impl Fetcher for MockFetcher {
     }
 }
 
-#[derive(Default)]
-struct MemStore {
-    map: RefCell<StdMap<String, CacheRecord>>,
-}
+/// The in-memory cache: cachette's `MemoryStore` behind `StoreCache`, as a
+/// host would wire it.
+type MemStore = StoreCache<MemoryStore>;
 
-impl CacheStore for MemStore {
-    fn get(&self, id: &str) -> BoxFuture<'_, Result<Option<CacheRecord>, StoreError>> {
-        let v = self.map.borrow().get(id).cloned();
-        Box::pin(async move { Ok(v) })
-    }
-    fn put(&self, id: &str, record: CacheRecord) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().insert(id.into(), record);
-        Box::pin(async move { Ok(()) })
-    }
-    fn remove(&self, id: &str) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().remove(id);
-        Box::pin(async move { Ok(()) })
-    }
-    fn entries(&self) -> BoxFuture<'_, Result<Vec<(String, CacheRecord)>, StoreError>> {
-        let all: Vec<_> = self
-            .map
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        Box::pin(async move { Ok(all) })
-    }
+fn mem_store() -> MemStore {
+    StoreCache::new(MemoryStore::new())
 }
 
 struct FixedClock(i64);
@@ -131,6 +111,8 @@ impl Timer for InstantTimer {
 /// A stand-in `arxiv` source that always chains to a DOI, attaching `arxivid`.
 /// The chain target prefix is configuration, as it is for the real
 /// [`ArxivSource`] — a source cannot assume what the host called its DOI source.
+/// It caches a plain item and chains on read ([`Source::interpret`]), as the
+/// real one does.
 struct ChainSource {
     doi_prefix: &'static str,
 }
@@ -146,34 +128,45 @@ impl Source for ChainSource {
         Box::pin(async move {
             keys.into_iter()
                 .map(|k| {
-                    let mut sp = serde_json::Map::new();
-                    sp.insert("arxivid".into(), CslValue::String(k.clone()));
-                    Resolution {
-                        key: k.clone(),
-                        outcome: Outcome::Chained {
-                            prefix: self.doi_prefix.into(),
-                            key: format!("10.9999/{k}"),
-                            set_properties: CslValue::Object(sp),
-                        },
-                    }
+                    let item = serde_json::json!({ "arxivid": k });
+                    Resolution::concrete(k, item)
                 })
                 .collect()
         })
     }
+    fn interpret(&self, key: &str, _item: CslValue) -> Interpreted {
+        let mut sp = serde_json::Map::new();
+        sp.insert("arxivid".into(), CslValue::String(key.to_string()));
+        Interpreted::Chained {
+            prefix: self.doi_prefix.into(),
+            key: format!("10.9999/{key}"),
+            set_properties: CslValue::Object(sp),
+        }
+    }
+}
+
+/// The ids the cache holds, sorted (ephemeral items excluded).
+fn stored_ids(cache: &MemStore) -> Vec<String> {
+    cache.with_store(|s| {
+        let mut ids = Vec::new();
+        s.list(&mut |info| ids.push(info.key)).unwrap();
+        ids.sort();
+        ids
+    })
 }
 
 // --- tests -----------------------------------------------------------------
 
 #[test]
 fn manual_source_stores_verbatim_text() {
-    let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(MockFetcher::new(), mem_store(), FixedClock(0), InstantTimer)
         .register("manual", ManualSource::new("flm")).unwrap();
 
     let cites = vec![("manual".to_string(), "Bohr, N. (1913)".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("manual", "Bohr, N. (1913)")).unwrap();
+    let item = mgr.get("manual", "Bohr, N. (1913)").unwrap();
     // `_ready_formatted` is a map from format name to text, and the format name
     // is the one the source was constructed with.
     assert_eq!(item["_ready_formatted"]["flm"], "Bohr, N. (1913)");
@@ -187,7 +180,7 @@ fn manual_source_preserves_key_case_and_whitespace() {
     // significant and must survive verbatim into storage and back out of `get`
     // — where every other source would have trimmed, and the default policy
     // would also have lowercased.
-    let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(MockFetcher::new(), mem_store(), FixedClock(0), InstantTimer)
         .register("manual", ManualSource::new("flm")).unwrap();
 
     let padded = "  Bohr, N. (1913). ON THE CONSTITUTION of Atoms  ".to_string();
@@ -196,7 +189,7 @@ fn manual_source_preserves_key_case_and_whitespace() {
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
     // Stored under (and retrievable by) the padded id, whitespace and case intact.
-    let item = block_on(mgr.get("manual", &padded)).unwrap();
+    let item = mgr.get("manual", &padded).unwrap();
     assert_eq!(
         item["_ready_formatted"]["flm"], padded,
         "text preserved verbatim"
@@ -213,7 +206,7 @@ fn manual_source_preserves_key_case_and_whitespace() {
         "  bohr, n. (1913). on the constitution of atoms  ",
     ] {
         assert!(
-            block_on(mgr.get("manual", other)).is_err(),
+            mgr.get("manual", other).is_err(),
             "a manual key must not collapse with {other:?}"
         );
     }
@@ -224,7 +217,7 @@ fn manual_format_name_is_configuration() {
     // The inner key under `_ready_formatted` is whatever the host said the text
     // is written in — nothing here assumes the JS reference's hard-coded `flm`.
     // Two prefixes, two formats, one manager.
-    let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(MockFetcher::new(), mem_store(), FixedClock(0), InstantTimer)
         .register("manual", ManualSource::new("latex")).unwrap()
         .register("html", ManualSource::new("html")).unwrap();
 
@@ -236,7 +229,7 @@ fn manual_format_name_is_configuration() {
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
     for (prefix, key) in &cites {
-        let item = block_on(mgr.get(prefix, key)).unwrap();
+        let item = mgr.get(prefix, key).unwrap();
         let formatted = item["_ready_formatted"].as_object().expect("a format map");
         assert_eq!(formatted.len(), 1, "exactly one format is emitted");
         let format = if prefix == "manual" { "latex" } else { "html" };
@@ -253,14 +246,14 @@ fn doi_source_parses_content_negotiated_csljson() {
         200,
         r#"{"type":"article-journal","title":"Can Quantum-Mechanical Description…","DOI":"10.1103/PhysRev.47.777"}"#,
     );
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), "10.1103/PhysRev.47.777".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("doi", "10.1103/PhysRev.47.777")).unwrap();
+    let item = mgr.get("doi", "10.1103/PhysRev.47.777").unwrap();
     assert_eq!(item["id"], "doi:10.1103/physrev.47.777", "the cache id is normalized");
     // doi.org already spells the key with the CSL-standard uppercase `DOI`, and
     // the value is stored verbatim — mixed case and all.
@@ -284,7 +277,7 @@ fn doi_key_surrounding_whitespace_is_trimmed_centrally() {
         r#"{"type":"article-journal","title":"Trimmed DOI","DOI":"10.1103/PhysRev.47.777"}"#,
     );
     let calls = fetcher.calls();
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![
@@ -297,7 +290,7 @@ fn doi_key_surrounding_whitespace_is_trimmed_centrally() {
     assert_eq!(calls.len(), 1, "padded + clean DOI must dedup to one fetch: {:?}", calls.urls());
 
     // Both forms read the one entry, stored under the trimmed id.
-    let item = block_on(mgr.get("doi", "  10.1103/physrev.47.777  ")).unwrap();
+    let item = mgr.get("doi", "  10.1103/physrev.47.777  ").unwrap();
     assert_eq!(item["id"], "doi:10.1103/physrev.47.777", "stored under the trimmed id");
     assert_eq!(item["title"], "Trimmed DOI");
     assert_eq!(item["DOI"], "10.1103/PhysRev.47.777", "the DOI *field* is verbatim");
@@ -317,7 +310,7 @@ fn mixed_case_doi_keys_dedup_to_one_fetch_and_one_entry() {
         r#"{"type":"article-journal","title":"Case Folded","DOI":"10.1103/PhysRevA.86.052329"}"#,
     );
     let calls = fetcher.calls();
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![
@@ -333,14 +326,13 @@ fn mixed_case_doi_keys_dedup_to_one_fetch_and_one_entry() {
     assert_eq!(calls.len(), 1, "case variants must dedup to one fetch: {:?}", calls.urls());
     assert_eq!(calls.urls(), vec!["https://doi.org/10.1103/physreva.86.052329".to_string()]);
 
-    let entries = block_on(mgr.store().entries()).unwrap();
-    assert_eq!(entries.len(), 1, "one cache entry expected: {entries:?}");
-    assert_eq!(entries[0].0, "doi:10.1103/physreva.86.052329");
+    let entries = stored_ids(mgr.store());
+    assert_eq!(entries, vec!["doi:10.1103/physreva.86.052329".to_string()], "one cache entry expected");
 
     // Either spelling reads that one entry; the echoed id is the normalized one,
     // while the CSL `DOI` field keeps the DOI's registered mixed case.
     for k in [MIXED, LOWER, "  10.1103/PHYSREVA.86.052329  "] {
-        let item = block_on(mgr.get("doi", k)).unwrap();
+        let item = mgr.get("doi", k).unwrap();
         assert_eq!(item["id"], "doi:10.1103/physreva.86.052329", "for {k:?}");
         assert_eq!(item["title"], "Case Folded");
         assert_eq!(item["DOI"], MIXED, "the CSL DOI field stays verbatim");
@@ -370,7 +362,7 @@ fn doi_source_canonicalizes_doi_key_to_uppercase_keeping_value_verbatim() {
             200,
             r#"{"type":"article-journal","title":"Lowercase Key","doi":"10.1103/PhysRevA.86.052329"}"#,
         );
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![
@@ -381,7 +373,7 @@ fn doi_source_canonicalizes_doi_key_to_uppercase_keeping_value_verbatim() {
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
     // Already-uppercase body: left as-is, value verbatim.
-    let item = block_on(mgr.get("doi", "10.1103/PhysRevLett.109.170502")).unwrap();
+    let item = mgr.get("doi", "10.1103/PhysRevLett.109.170502").unwrap();
     assert_eq!(item["DOI"], "10.1103/PhysRevLett.109.170502", "value verbatim");
     assert_eq!(item.get("doi"), None, "lowercase doi key must not survive");
     // Only the DOI *key* is canonicalized; other fields keep their casing.
@@ -389,7 +381,7 @@ fn doi_source_canonicalizes_doi_key_to_uppercase_keeping_value_verbatim() {
     assert_eq!(item["URL"], "https://doi.org/10.1103/PhysRevLett.109.170502");
 
     // Lowercase-key body: renamed to `DOI`, mixed-case value survives intact.
-    let item = block_on(mgr.get("doi", MIXED)).unwrap();
+    let item = mgr.get("doi", MIXED).unwrap();
     assert_eq!(item["DOI"], MIXED, "renamed to `DOI`, value untouched");
     assert_eq!(item.get("doi"), None, "lowercase doi key must not survive");
     assert_eq!(item["title"], "Lowercase Key");
@@ -402,7 +394,7 @@ fn arxiv_chains_to_doi_and_merges_set_properties() {
         200,
         r#"{"type":"article-journal","title":"Chained Title","DOI":"10.9999/1211.1037"}"#,
     );
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("arxiv", ChainSource { doi_prefix: "doi" }).unwrap()
         .register("doi", DoiSource::new()).unwrap();
 
@@ -412,7 +404,7 @@ fn arxiv_chains_to_doi_and_merges_set_properties() {
 
     // Reading the arXiv key follows the chain to the DOI entry, rewrites the
     // id back to the requested one, and merges the chained `arxivid`.
-    let item = block_on(mgr.get("arxiv", "1211.1037")).unwrap();
+    let item = mgr.get("arxiv", "1211.1037").unwrap();
     assert_eq!(item["id"], "arxiv:1211.1037");
     assert_eq!(item["title"], "Chained Title");
     assert_eq!(item["arxivid"], "1211.1037", "set_properties should be merged in");
@@ -454,7 +446,7 @@ fn doi_url_percent_encodes_the_key_but_keeps_slashes() {
 
     let fetcher = MockFetcher::new().route(URL, 200, r#"{"type":"article-journal","title":"Encoded"}"#);
     let calls = fetcher.calls();
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), KEY.to_string())];
@@ -478,7 +470,7 @@ fn doi_requests_carry_the_csl_json_accept_header() {
     let fetcher =
         MockFetcher::new().route("https://doi.org/10.1/x", 200, r#"{"title":"t"}"#);
     let calls = fetcher.calls();
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), "10.1/x".to_string())];
@@ -499,7 +491,7 @@ fn doi_non_success_status_is_one_reported_failure() {
     // retry) is a reachability `Failed`, reported with the status named. A 404
     // is handled separately — see `doi_404_is_an_authoritative_missing`.
     let fetcher = MockFetcher::new().route("https://doi.org/10.1/forbidden", 403, "Forbidden");
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), "10.1/forbidden".to_string())];
@@ -513,7 +505,7 @@ fn doi_non_success_status_is_one_reported_failure() {
         report.failures[0].message
     );
     // Nothing was cached, so reading it back fails too.
-    assert!(block_on(mgr.get("doi", "10.1/forbidden")).is_err());
+    assert!(mgr.get("doi", "10.1/forbidden").is_err());
 }
 
 /// A doi.org 404 is authoritative "no such DOI" (`Outcome::Missing`), so it is
@@ -523,7 +515,7 @@ fn doi_non_success_status_is_one_reported_failure() {
 #[test]
 fn doi_404_is_an_authoritative_missing() {
     let fetcher = MockFetcher::new().route("https://doi.org/10.1/gone", 404, "Not Found");
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
         .register("doi", DoiSource::new()).unwrap();
 
     let cites = vec![("doi".to_string(), "10.1/gone".to_string())];
@@ -537,7 +529,7 @@ fn doi_404_is_an_authoritative_missing() {
         report.failures[0].message
     );
     // Nothing was cached.
-    assert!(block_on(mgr.get("doi", "10.1/gone")).is_err());
+    assert!(mgr.get("doi", "10.1/gone").is_err());
 }
 
 #[test]
@@ -545,7 +537,7 @@ fn doi_body_that_is_not_json_is_a_parse_failure() {
     // A captive portal / landing page, and a truncated response.
     for body in ["<!DOCTYPE html><html><body>Landing</body></html>", ""] {
         let fetcher = MockFetcher::new().route("https://doi.org/10.1/x", 200, body);
-        let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
             .register("doi", DoiSource::new()).unwrap();
 
         let cites = vec![("doi".to_string(), "10.1/x".to_string())];
@@ -556,7 +548,7 @@ fn doi_body_that_is_not_json_is_a_parse_failure() {
             "body {body:?} should be a parse error, got {}",
             report.failures[0].message
         );
-        assert!(block_on(mgr.get("doi", "10.1/x")).is_err(), "body {body:?} must not be cached");
+        assert!(mgr.get("doi", "10.1/x").is_err(), "body {body:?} must not be cached");
     }
 }
 
@@ -566,14 +558,14 @@ fn doi_200_with_json_that_is_not_a_csl_object_is_a_failure() {
     // `{"id":"doi:…"}` shell for 360 days with an empty failure report.
     for body in ["null", "[]", "\"nope\"", "123", "{}"] {
         let fetcher = MockFetcher::new().route("https://doi.org/10.1/x", 200, body);
-        let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
             .register("doi", DoiSource::new()).unwrap();
 
         let cites = vec![("doi".to_string(), "10.1/x".to_string())];
         let report = block_on(mgr.retrieve(&cites)).unwrap();
         assert_eq!(report.failures.len(), 1, "body {body} was accepted: {:?}", report.failures);
         assert!(
-            block_on(mgr.get("doi", "10.1/x")).is_err(),
+            mgr.get("doi", "10.1/x").is_err(),
             "body {body} must not be cached"
         );
     }
@@ -586,7 +578,7 @@ fn a_malformed_doi_is_rejected_without_fetching_anything() {
     for key in ["10.1103/Phys Rev.47.777", "", "   "] {
         let fetcher = MockFetcher::new();
         let calls = fetcher.calls();
-        let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock(0), InstantTimer)
+        let mgr = CitationManager::new(fetcher, mem_store(), FixedClock(0), InstantTimer)
             .register("doi", DoiSource::new()).unwrap();
 
         let cites = vec![("doi".to_string(), key.to_string())];
@@ -598,7 +590,7 @@ fn a_malformed_doi_is_rejected_without_fetching_anything() {
 
 #[test]
 fn unknown_prefix_is_reported_not_fatal() {
-    let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock(0), InstantTimer)
+    let mgr = CitationManager::new(MockFetcher::new(), mem_store(), FixedClock(0), InstantTimer)
         .register("manual", ManualSource::new("flm")).unwrap();
 
     let cites = vec![
@@ -609,5 +601,5 @@ fn unknown_prefix_is_reported_not_fatal() {
     assert_eq!(report.failures.len(), 1);
     assert_eq!(report.failures[0].prefix, "nope");
     // The good one still resolved.
-    assert!(block_on(mgr.get("manual", "ok")).is_ok());
+    assert!(mgr.get("manual", "ok").is_ok());
 }

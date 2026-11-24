@@ -26,11 +26,10 @@ doc = false
 autocitefetch = { workspace = true }
 # Default features on: the CLI needs the `http` feature's `UreqFetcher`.
 autocitefetch-std = { workspace = true }
-# Deliberately the workspace (alloc-only, no-default-features) serde_json rather
-# than a std-enabled one: under resolver v2 features unify across the workspace
-# build, and turning on `serde_json/std` here would compile the `#![no_std]` core
-# against the exact configuration it promises never to use. The alloc API
-# (`from_slice`, `to_string_pretty`) is all this binary needs.
+# The workspace (alloc-only, no-default-features) serde_json: the alloc API
+# (`from_slice`, `to_string_pretty`) is all this binary needs. (`serde_json/std`
+# is on in this build anyway, through `autocitefetch-std`'s `cachette/std`; the
+# core's `no_std` build is checked per package, see its Cargo.toml.)
 serde_json = { workspace = true }
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
 # YAML for `--bib` files and `--arxiv-doi-overrides`. A maintained fork of the

@@ -144,14 +144,30 @@ pub struct Cli {
     #[arg(long, value_name = "NAME")]
     pub manual_format: Option<String>,
 
-    /// Drop this top-level CSL field from every entry. Repeatable.
+    /// Drop this top-level CSL field from every entry of the output.
+    /// Repeatable.
     ///
-    /// Applied before an entry is cached, so bulky fields nobody cites —
-    /// `reference` (doi.org returns the paper's entire bibliography) or
-    /// `abstract` — stay out of both the output and `.citations.jsonl`.
-    /// Entries already cached keep their fields until they are refetched.
+    /// It removes the field from the output only: `.citations.jsonl` is not
+    /// changed, and a later run without the option outputs the field again,
+    /// without a request. What the cache keeps is set by --keep-abstract and
+    /// --keep-references.
     #[arg(long = "drop-field", value_name = "FIELD")]
     pub drop_field: Vec<String>,
+
+    /// Keep the `abstract` field in the cache and the output.
+    ///
+    /// By default it is left out of both. Entries already cached gain it as
+    /// they are fetched again; delete the cache to get it at once.
+    #[arg(long)]
+    pub keep_abstract: bool,
+
+    /// Keep the `reference` field (doi.org's copy of a paper's entire
+    /// bibliography) in the cache and the output.
+    ///
+    /// By default it is left out of both. Entries already cached gain it as
+    /// they are fetched again; delete the cache to get it at once.
+    #[arg(long)]
+    pub keep_references: bool,
 
     /// Tune how a source batches cache refreshes. Repeatable.
     ///

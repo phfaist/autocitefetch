@@ -8,10 +8,11 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use autocitefetch::cachette::{MemoryStore, Store as _};
 use autocitefetch::source::BibliographyFileSource;
 use autocitefetch::{
-    BoxFuture, CacheRecord, CacheStore, CitationManager, Clock, CslValue, FetchError, Fetcher,
-    Request, Response, StoreError, Timer, Timestamp,
+    BoxFuture, CitationManager, Clock, CslValue, Fetcher, FetchError, Request, Response, StoreCache,
+    Timer, Timestamp,
 };
 
 fn block_on<F: Future>(fut: F) -> F::Output {
@@ -85,32 +86,12 @@ impl Fetcher for TogglingFetcher {
     }
 }
 
-#[derive(Default)]
-struct MemStore {
-    map: RefCell<StdMap<String, CacheRecord>>,
-}
-impl CacheStore for MemStore {
-    fn get(&self, id: &str) -> BoxFuture<'_, Result<Option<CacheRecord>, StoreError>> {
-        let v = self.map.borrow().get(id).cloned();
-        Box::pin(async move { Ok(v) })
-    }
-    fn put(&self, id: &str, record: CacheRecord) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().insert(id.into(), record);
-        Box::pin(async move { Ok(()) })
-    }
-    fn remove(&self, id: &str) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.map.borrow_mut().remove(id);
-        Box::pin(async move { Ok(()) })
-    }
-    fn entries(&self) -> BoxFuture<'_, Result<Vec<(String, CacheRecord)>, StoreError>> {
-        let all: Vec<_> = self
-            .map
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        Box::pin(async move { Ok(all) })
-    }
+/// The in-memory cache: cachette's `MemoryStore` behind `StoreCache`, as a
+/// host would wire it.
+type MemStore = StoreCache<MemoryStore>;
+
+fn mem_store() -> MemStore {
+    StoreCache::new(MemoryStore::new())
 }
 
 struct FixedClock;
@@ -147,14 +128,14 @@ fn from_entries_resolves_without_any_fetch() {
         "knuth1984".to_string(),
         serde_json::json!({"id":"knuth1984","type":"book","title":"The TeXbook"}),
     )]);
-    let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock, InstantTimer)
+    let mgr = CitationManager::new(MockFetcher::new(), mem_store(), FixedClock, InstantTimer)
         .register("bib", bib).unwrap();
 
     let cites = vec![("bib".to_string(), "knuth1984".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("bib", "knuth1984")).unwrap();
+    let item = mgr.get("bib", "knuth1984").unwrap();
     assert_eq!(item["title"], "The TeXbook");
     assert_eq!(item["id"], "bib:knuth1984");
 }
@@ -165,7 +146,7 @@ fn retrieve_bib(
     bib: BibliographyFileSource,
     keys: &[&str],
 ) -> Vec<autocitefetch::manager::CiteFailure> {
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock, InstantTimer)
         .register("bib", bib).unwrap();
     let cites: Vec<(String, String)> = keys
         .iter()
@@ -184,7 +165,7 @@ fn the_object_form_maps_id_to_item() {
              "k2": {"type":"article-journal","title":"Second"}}"#,
     );
     let bib = BibliographyFileSource::new([url.to_string()]);
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock, InstantTimer)
         .register("bib", bib).unwrap();
 
     let cites = vec![
@@ -194,8 +175,8 @@ fn the_object_form_maps_id_to_item() {
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    assert_eq!(block_on(mgr.get("bib", "k1")).unwrap()["title"], "First");
-    let second = block_on(mgr.get("bib", "k2")).unwrap();
+    assert_eq!(mgr.get("bib", "k1").unwrap()["title"], "First");
+    let second = mgr.get("bib", "k2").unwrap();
     assert_eq!(second["title"], "Second");
     // The id is rewritten to the requested citation, not the file's key.
     assert_eq!(second["id"], "bib:k2");
@@ -212,7 +193,7 @@ fn non_object_entries_in_the_object_form_are_reported_not_silently_emptied() {
         br#"{"k1": null, "k2": 42, "k3": "text", "k4": [1,2,3], "ok": {"title":"Fine"}}"#,
     );
     let bib = BibliographyFileSource::new([url.to_string()]);
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock, InstantTimer)
         .register("bib", bib).unwrap();
 
     let cites: Vec<(String, String)> = ["k1", "k2", "k3", "k4", "ok"]
@@ -230,8 +211,8 @@ fn non_object_entries_in_the_object_form_are_reported_not_silently_emptied() {
         );
     }
     // The healthy sibling in the same file still resolves.
-    assert_eq!(block_on(mgr.get("bib", "ok")).unwrap()["title"], "Fine");
-    assert!(block_on(mgr.get("bib", "k1")).is_err(), "k1 must not be cached");
+    assert_eq!(mgr.get("bib", "ok").unwrap()["title"], "Fine");
+    assert!(mgr.get("bib", "k1").is_err(), "k1 must not be cached");
 }
 
 #[test]
@@ -262,7 +243,7 @@ fn later_files_win_on_duplicate_ids() {
         .route(a, 200, br#"[{"id":"dup","title":"From A"},{"id":"only-a","title":"Only A"}]"#)
         .route(b, 200, br#"[{"id":"dup","title":"From B"}]"#);
     let bib = BibliographyFileSource::new([a.to_string(), b.to_string()]);
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock, InstantTimer)
         .register("bib", bib).unwrap();
 
     let cites = vec![
@@ -271,9 +252,9 @@ fn later_files_win_on_duplicate_ids() {
     ];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
-    assert_eq!(block_on(mgr.get("bib", "dup")).unwrap()["title"], "From B");
+    assert_eq!(mgr.get("bib", "dup").unwrap()["title"], "From B");
     // A key only the earlier file defines is not shadowed away.
-    assert_eq!(block_on(mgr.get("bib", "only-a")).unwrap()["title"], "Only A");
+    assert_eq!(mgr.get("bib", "only-a").unwrap()["title"], "Only A");
 }
 
 #[test]
@@ -302,7 +283,7 @@ fn bib_keys_are_case_sensitive_but_still_trimmed() {
                     {"id":"knuth1984","title":"A Different Entry"}]"#;
     let fetcher = MockFetcher::new().route(url, 200, body);
     let bib = BibliographyFileSource::new([url.to_string()]);
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock, InstantTimer)
         .register("bib", bib).unwrap();
 
     let cites = vec![
@@ -319,20 +300,24 @@ fn bib_keys_are_case_sensitive_but_still_trimmed() {
     assert_eq!(report.failures[0].key, "KNUTH1984", "only the unknown casing fails");
 
     // Each casing resolves to its OWN entry, under its own case-preserved id.
-    let upper = block_on(mgr.get("bib", "Knuth1984")).unwrap();
+    let upper = mgr.get("bib", "Knuth1984").unwrap();
     assert_eq!(upper["title"], "The TeXbook");
     assert_eq!(upper["id"], "bib:Knuth1984", "the key's case is preserved in the id");
 
-    let lower = block_on(mgr.get("bib", "knuth1984")).unwrap();
+    let lower = mgr.get("bib", "knuth1984").unwrap();
     assert_eq!(lower["title"], "A Different Entry");
     assert_eq!(lower["id"], "bib:knuth1984");
 
     // The padded form is the trimmed one, not a third entry.
-    let padded = block_on(mgr.get("bib", "  Knuth1984 ")).unwrap();
+    let padded = mgr.get("bib", "  Knuth1984 ").unwrap();
     assert_eq!(padded["title"], "The TeXbook");
     assert_eq!(padded["id"], "bib:Knuth1984");
 
-    let entries = block_on(mgr.store().entries()).unwrap();
+    let entries = mgr.store().with_store(|s| {
+        let mut ids = Vec::new();
+        s.list(&mut |info| ids.push(info.key)).unwrap();
+        ids
+    });
     assert_eq!(entries.len(), 2, "two entries, not one folded or three: {entries:?}");
 }
 
@@ -357,13 +342,13 @@ fn a_key_removed_from_a_reloaded_file_is_reported_and_stops_serving_old_data() {
     // grace still covers t = 100 s, so this exercises the *within-grace* path the
     // old code silently served.
     let bib = BibliographyFileSource::new([url.to_string()]).with_ttl(Duration::from_secs(10));
-    let mgr = CitationManager::new(fetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), clock.clone(), InstantTimer)
         .register("bib", bib).unwrap();
 
     let cites = vec![("bib".to_string(), "k1".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "first load resolves k1: {:?}", report.failures);
-    assert_eq!(block_on(mgr.get("bib", "k1")).unwrap()["title"], "First");
+    assert_eq!(mgr.get("bib", "k1").unwrap()["title"], "First");
 
     // Edit the file so k1 is gone, and wind the clock past the TTL (but well
     // within grace) so the entry is expired and the file is reloaded.
@@ -381,7 +366,7 @@ fn a_key_removed_from_a_reloaded_file_is_reported_and_stops_serving_old_data() {
     assert_eq!(report.failures[0].message, "citation `bib:k1` not found");
     // The now-known-absent key must stop serving its old cached copy.
     assert!(
-        block_on(mgr.get("bib", "k1")).is_err(),
+        mgr.get("bib", "k1").is_err(),
         "the removed key must not keep returning the old data"
     );
 }
@@ -454,7 +439,7 @@ fn a_file_is_refetched_once_its_entries_hard_expire() {
     // (In the stale window `[68 s, 115 s)` the reload is probabilistic, so it is
     // not asserted here — that ramp is covered in `cache_policy.rs`.)
     let bib = BibliographyFileSource::new([url.to_string()]).with_ttl(Duration::from_secs(100));
-    let mgr = CitationManager::new(fetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), clock.clone(), InstantTimer)
         .register("bib", bib).unwrap();
 
     let cites = vec![("bib".to_string(), "k1".to_string())];
@@ -481,7 +466,7 @@ fn with_ttl_shortens_the_fresh_window() {
     let clock = MovableClock::default();
     // Same instant as above, but a 1 s TTL: long stale by 60 s.
     let bib = BibliographyFileSource::new([url.to_string()]).with_ttl(Duration::from_secs(1));
-    let mgr = CitationManager::new(fetcher, MemStore::default(), clock.clone(), InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), clock.clone(), InstantTimer)
         .register("bib", bib).unwrap();
 
     let cites = vec![("bib".to_string(), "k1".to_string())];
@@ -497,7 +482,7 @@ fn from_entries_rejects_a_non_object_entry() {
         ("bad".to_string(), serde_json::json!("just text")),
         ("good".to_string(), serde_json::json!({"title":"Fine"})),
     ]);
-    let mgr = CitationManager::new(MockFetcher::new(), MemStore::default(), FixedClock, InstantTimer)
+    let mgr = CitationManager::new(MockFetcher::new(), mem_store(), FixedClock, InstantTimer)
         .register("bib", bib).unwrap();
 
     let cites = vec![
@@ -507,7 +492,7 @@ fn from_entries_rejects_a_non_object_entry() {
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
     assert_eq!(report.failures[0].key, "bad");
-    assert_eq!(block_on(mgr.get("bib", "good")).unwrap()["title"], "Fine");
+    assert_eq!(mgr.get("bib", "good").unwrap()["title"], "Fine");
 }
 
 #[test]
@@ -522,13 +507,13 @@ fn with_parser_uses_the_injected_parser() {
     };
 
     let bib = BibliographyFileSource::new([file_url.to_string()]).with_parser(parse_custom);
-    let mgr = CitationManager::new(fetcher, MemStore::default(), FixedClock, InstantTimer)
+    let mgr = CitationManager::new(fetcher, mem_store(), FixedClock, InstantTimer)
         .register("bib", bib).unwrap();
 
     let cites = vec![("bib".to_string(), "x1".to_string())];
     let report = block_on(mgr.retrieve(&cites)).unwrap();
     assert!(report.is_complete(), "failures: {:?}", report.failures);
 
-    let item = block_on(mgr.get("bib", "x1")).unwrap();
+    let item = mgr.get("bib", "x1").unwrap();
     assert_eq!(item["title"], "Custom Parsed");
 }

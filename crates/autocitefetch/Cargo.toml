@@ -18,13 +18,22 @@ serde_json = { workspace = true }
 hashbrown = { workspace = true }
 futures-util = { workspace = true }
 xmlparser = { workspace = true }
+cachette = { workspace = true }
 
 [features]
 default = []
 
-# No `[dev-dependencies]` on purpose. `serde_json = "1"` here would use default
-# features, pulling in `serde_json/std`; under resolver v2 that unifies with the
-# normal dependency for the test build, so `cargo test -p autocitefetch` would
-# compile this `#![no_std]` crate against a std-enabled serde_json — the exact
-# configuration it promises never to use. It is redundant anyway: the normal
-# dependency is already linkable from `tests/` and `examples/`.
+# No `[dev-dependencies]` on purpose. `serde_json = "1"` (or `cachette` with its
+# default features) here would pull in `serde_json/std`; under resolver v2 that
+# unifies with the normal dependency for the test build, so
+# `cargo test -p autocitefetch` would compile this `#![no_std]` crate against a
+# std-enabled serde_json — the configuration it promises never to need. It is
+# redundant anyway: the normal dependencies (`cachette::MemoryStore` included)
+# are already linkable from `tests/` and `examples/`.
+#
+# Note that a *workspace* build does not check this: `autocitefetch-std`
+# enables `cachette/std`, which enables `serde/std` and `serde_json/std`, and
+# feature unification turns them on for `cargo build --workspace` and
+# `cargo test --workspace`. The `no_std` promise is checked only by the
+# per-package commands, which CI runs: `cargo test -p autocitefetch` and
+# `cargo build -p autocitefetch --target wasm32-unknown-unknown`.
