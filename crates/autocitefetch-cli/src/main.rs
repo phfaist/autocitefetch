@@ -327,13 +327,6 @@ fn warn_about_unusable_options(cli: &Cli, cites: &[(String, String)], sources: &
         // without an `id`.
         warn("--drop-field id is ignored: every entry is keyed on its `id`");
     }
-    for (field, keep) in [("reference", cli.keep_references), ("abstract", cli.keep_abstract)] {
-        if keep && cli.drop_field.iter().any(|f| f == field) {
-            warn(&format!(
-                "--drop-field {field} hides the `{field}` field that the cache keeps"
-            ));
-        }
-    }
     for prefix in requested {
         if !sources.iter().any(|s| s.prefix() == prefix) {
             warn(&format!(

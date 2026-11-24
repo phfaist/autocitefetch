@@ -6,6 +6,11 @@
 //! single committable JSONL file plus per-writer append logs, from cachette's
 //! `JsonlStore`).
 //!
+//! A host that keeps its caches with a cachette
+//! [`Manager`](autocitefetch::cachette::Manager) uses [`SessionCache`]
+//! instead: the items then live in an instance of a values cache that the
+//! host's manager keeps, sizes and prunes.
+//!
 //! A blocking network [`Fetcher`](autocitefetch::Fetcher), [`UreqFetcher`], is
 //! provided behind the default-on `http` feature (backed by `ureq`). Disable
 //! default features to build with no HTTP/TLS dependency (the fetcher is then
@@ -27,6 +32,7 @@
 
 #[cfg(feature = "http")]
 pub mod fetcher;
+pub mod session;
 pub mod store;
 pub mod timer;
 
@@ -34,6 +40,7 @@ pub mod timer;
 /// clock, not monotonic, because the expiry times it feeds are persisted and
 /// must keep their meaning across restarts and machines.
 pub use autocitefetch::cachette::SystemClock;
+pub use session::SessionCache;
 pub use store::{DEFAULT_BASE, SingleFileCacheStore};
 pub use timer::BlockingTimer;
 

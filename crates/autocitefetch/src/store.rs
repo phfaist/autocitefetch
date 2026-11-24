@@ -198,6 +198,48 @@ pub fn decode_item(record: &Record) -> Option<CslValue> {
 /// # let _ = cache;
 /// ```
 ///
+/// **In a browser**, or wherever storage answers asynchronously, the host keeps
+/// a [`MemoryStore`](cachette::MemoryStore) for the run: it loads it with
+/// [`cachette::import`] before, and saves it with [`cachette::export`] after
+/// (through [`with_store`](Self::with_store), or on the store that
+/// [`into_inner`](Self::into_inner) answers). The lines are those of a JSONL
+/// cache file, so the host stores them as one text.
+///
+/// ```
+/// use core::time::Duration;
+///
+/// use autocitefetch::cachette::{self, ImportMode, MemoryStore};
+/// use autocitefetch::{CacheStore, StoreCache, StoreError, Timestamp};
+///
+/// // Before the run: load what the host saved last time.
+/// let saved = String::new(); // e.g. read from IndexedDB or localStorage
+/// let mut store = MemoryStore::new();
+/// cachette::import(&mut store, saved.lines().map(Ok::<_, StoreError>), ImportMode::Lenient)?;
+/// let cache = StoreCache::new(store);
+///
+/// // The run: `CitationManager::new(fetcher, cache, clock, timer)`, then
+/// // `retrieve` and `get`. Here, one item stored by hand.
+/// let now = Timestamp::from_millis(1_700_000_000_000);
+/// let item = serde_json::json!({"title": "T"});
+/// cache.put("doi:10.1/x", &item, Duration::from_secs(3600), now)?;
+///
+/// // After the run (`manager.store().with_store(…)`): save the store.
+/// let mut saved = String::new();
+/// cache.with_store(|s| {
+///     cachette::export(s, |line| {
+///         saved.push_str(line);
+///         Ok(())
+///     })
+/// })?;
+///
+/// // The next run loads it back.
+/// let mut store = MemoryStore::new();
+/// cachette::import(&mut store, saved.lines().map(Ok::<_, StoreError>), ImportMode::Lenient)?;
+/// let cache = StoreCache::new(store);
+/// assert_eq!(cache.get("doi:10.1/x")?.unwrap().item["title"], "T");
+/// # Ok::<(), StoreError>(())
+/// ```
+///
 /// Values are written with expiry times only: no time of write, use or cost,
 /// so the lines of a JSONL file keep the 0.1.1 shape, and a file under version
 /// control changes only when an entry is fetched again. For the same reason
@@ -360,6 +402,84 @@ mod tests {
         });
         assert!(cache.get("arxiv:1").unwrap().is_none());
         assert!(cache.get("doi:2").unwrap().is_none());
+    }
+
+    /// A [`MemoryStore`] whose `get` of a key in `damaged` fails with
+    /// [`StoreErrorKind::DamagedValue`], until a `put` replaces the value, and
+    /// whose every `get` fails with [`StoreErrorKind::Storage`] while
+    /// `failing` is set.
+    struct DamagedValues {
+        inner: MemoryStore,
+        damaged: alloc::vec::Vec<alloc::string::String>,
+        failing: bool,
+    }
+
+    impl Store for DamagedValues {
+        fn get(&mut self, key: &str) -> Result<Option<cachette::StoredValue>, StoreError> {
+            if self.failing {
+                return Err(StoreError::new(StoreErrorKind::Storage, "disk on fire"));
+            }
+            if self.damaged.iter().any(|k| k == key) {
+                return Err(StoreError::new(StoreErrorKind::DamagedValue, "unreadable value"));
+            }
+            self.inner.get(key)
+        }
+        fn read_blob(
+            &mut self,
+            key: &str,
+            blob: &cachette::StoredBlob,
+        ) -> Result<Option<alloc::vec::Vec<u8>>, StoreError> {
+            self.inner.read_blob(key, blob)
+        }
+        fn get_with_blobs(
+            &mut self,
+            key: &str,
+            blobs: cachette::BlobSelection<'_>,
+        ) -> Result<Option<cachette::ValueWithBlobs>, StoreError> {
+            self.inner.get_with_blobs(key, blobs)
+        }
+        fn put(&mut self, key: &str, value: NewValue) -> Result<(), StoreError> {
+            self.damaged.retain(|k| k != key);
+            self.inner.put(key, value)
+        }
+        fn remove(&mut self, key: &str) -> Result<(), StoreError> {
+            self.inner.remove(key)
+        }
+        fn clear(&mut self) -> Result<(), StoreError> {
+            self.inner.clear()
+        }
+        fn list(&mut self, visit: &mut dyn FnMut(cachette::ValueInfo)) -> Result<cachette::Listed, StoreError> {
+            self.inner.list(visit)
+        }
+        fn record_uses(&mut self, keys: &[&str], at: Timestamp) -> Result<(), StoreError> {
+            self.inner.record_uses(keys, at)
+        }
+        fn flush(&mut self) -> Result<(), StoreError> {
+            self.inner.flush()
+        }
+        fn holds_blobs(&self) -> bool {
+            self.inner.holds_blobs()
+        }
+    }
+
+    #[test]
+    fn a_damaged_value_reads_as_absent_and_a_put_replaces_it() {
+        let cache = StoreCache::new(DamagedValues {
+            inner: MemoryStore::new(),
+            damaged: alloc::vec!["doi:x".into()],
+            failing: false,
+        });
+        // Damaged: absent, not an error, so the manager fetches it again…
+        assert!(cache.get("doi:x").unwrap().is_none());
+        // …and the `put` of the fetched item replaces the value.
+        cache
+            .put("doi:x", &json!({"title": "T"}), Duration::from_secs(60), Timestamp::from_millis(0))
+            .unwrap();
+        assert_eq!(cache.get("doi:x").unwrap().unwrap().item, json!({"title": "T"}));
+        // Any other error kind is still an error.
+        cache.with_store(|s| s.failing = true);
+        let err = cache.get("doi:x").unwrap_err();
+        assert_eq!(err.kind(), StoreErrorKind::Storage);
     }
 
     #[test]

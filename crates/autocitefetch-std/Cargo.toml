@@ -15,6 +15,8 @@ exclude = ["tests/"]
 [dependencies]
 autocitefetch = { workspace = true }
 serde_json = { workspace = true }
+# The instance key of a `SessionCache` is any `Serialize` value of the host.
+serde = { workspace = true }
 # The storage engine (the JSONL store, locks and merges) and the manager layer
 # for host-managed caches. `std` gives the real filesystem (`StdFs`), the system
 # clock and `cachette::Manager`.

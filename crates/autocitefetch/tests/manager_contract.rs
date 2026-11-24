@@ -447,6 +447,61 @@ fn a_self_chain_is_rejected_at_store_time() {
     assert_eq!(entries.len(), 0);
 }
 
+/// A cached item that is *kept* (fresh, so not fetched again) and whose
+/// interpretation chains to its own id is reported as a failure at
+/// classification. It stays in the cache: the source's answer is not wrong in
+/// itself, only how it is read under the current configuration.
+#[test]
+fn a_kept_item_that_chains_to_itself_is_reported_and_kept() {
+    let clock = MovableClock::default();
+    let store = mem_store();
+    let entries = store.clone();
+    // Fresh until 9 000 ms; the clock reads 0.
+    store.seed("s:k", chain_item("s", "k", serde_json::json!({})), 9_000, 10_000);
+    let s = ScriptSource::new("s", Answer::Concrete, &clock);
+    let log = s.log();
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
+        .register("s", s).unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
+    assert!(log.borrow().is_empty(), "a fresh item was fetched: {:?}", log.borrow());
+    assert_eq!(report.failures.len(), 1, "failures: {:?}", report.failures);
+    let failure = &report.failures[0];
+    assert_eq!((failure.prefix.as_str(), failure.key.as_str()), ("s", "k"));
+    assert!(failure.origin.is_none(), "a direct failure: {failure:?}");
+    assert!(failure.message.contains("itself"), "unhelpful message: {}", failure.message);
+    assert_eq!(entries.len(), 1, "the item stays in the cache");
+    assert!(entries.stored("s:k").is_some());
+}
+
+/// A refresh that fails within the grace period keeps the cached item — but
+/// not when that item chains to itself: it is no usable copy, so the failure
+/// is reported (and the item, which the manager did not refetch, stays).
+#[test]
+fn a_failed_refresh_of_an_item_that_chains_to_itself_is_reported() {
+    let clock = MovableClock::default();
+    clock.advance(1000);
+    let store = mem_store();
+    let entries = store.clone();
+    // Hard-expired, well within the default 14-day grace.
+    store.seed("s:k", chain_item("s", "k", serde_json::json!({})), 0, 1);
+    let s = ScriptSource::new("s", Answer::Fail, &clock);
+    let log = s.log();
+    let mgr = CitationManager::new(NoopFetcher, store, clock.clone(), InstantTimer)
+        .register("s", s).unwrap();
+
+    let report = block_on(mgr.retrieve(&cites(&[("s", "k")]))).unwrap();
+    assert_eq!(log.borrow().len(), 1, "the expired item is refreshed: {:?}", log.borrow());
+    assert_eq!(report.failures.len(), 1, "failures: {:?}", report.failures);
+    let failure = &report.failures[0];
+    assert_eq!((failure.prefix.as_str(), failure.key.as_str()), ("s", "k"));
+    assert!(failure.message.contains("source down"), "message: {}", failure.message);
+    assert_eq!(entries.len(), 1, "the item stays in the cache");
+    // Reading it still fails on the self-chain.
+    let err = mgr.get("s", "k").unwrap_err();
+    assert!(err.to_string().contains("itself"), "got: {err}");
+}
+
 /// A chain target that is not in the cache names *both* ids: the target alone
 /// is a citation the caller never asked for.
 #[test]

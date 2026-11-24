@@ -14,33 +14,33 @@ crates/
       lib.rs              crate root, re-exports, BoxFuture
       manager.rs          CitationManager: routing, retrieval loop, chaining, get()
       source/             the Source trait + built-in sources
-        mod.rs            Source, Outcome, Resolution, RetrieveCtx
-        arxiv.rs          arXiv Atom API (xmlparser), version resolution, DOI overrides
+        mod.rs            Source (fetch step + read step), Outcome, Interpreted, RetrieveCtx
+        arxiv.rs          arXiv Atom API (xmlparser), version resolution, DOI overrides on read
         doi.rs            doi.org content negotiation
         manual.rs         key-is-the-text escape hatch
         bibfile.rs        bibliography files (pluggable parser; JSON default)
-      cache.rs            TTL policy: soft/hard expiry, jitter, freshness
+      cache.rs            TtlPolicy/Freshness: cachette's, re-exported
       batching.rs         refresh batching: defer small refreshes / top up requests
       driver.rs           per-source chunking + rate limiting
       retry.rs            RetryingFetcher: transparent retry/backoff wrapper
       report.rs           Reporter trait + Event vocabulary, NopReporter, throttle
       fetch.rs            Fetcher trait + Request/Response
-      store.rs            CacheStore trait (per-entry KV) + CacheRecord
-      filecache.rs        FileCacheStore: single-file JSONL cache over a CacheFs
-      env.rs              Clock + Timer traits, Timestamp
+      store.rs            CacheStore (synchronous seam), StoragePolicy, StoreCache<S: cachette::Store>
+      env.rs              Timer trait; Clock + Timestamp are cachette's, re-exported
       csl.rs              CSL-JSON helpers (id, merge, field lookup)
       error.rs            crate Error
     tests/                integration.rs, arxiv.rs, arxiv_dois.rs,
                           bibfile_data.rs, concurrency.rs, retry.rs,
-                          cache_policy.rs, manager_contract.rs, reporting.rs
+                          cache_policy.rs, manager_contract.rs, reporting.rs,
+                          read_time_options.rs
   autocitefetch-std/      std backends for non-WASM consumers
     src/
-      lib.rs              crate root, re-exports
-      clock.rs            SystemClock
+      lib.rs              crate root, re-exports (SystemClock is cachette's)
       timer.rs            BlockingTimer (thread::sleep)
-      store.rs            StdCacheFs + SingleFileCacheStore (citations.jsonl)
+      store.rs            SingleFileCacheStore: StoreCache over cachette's JsonlStore (citations.jsonl)
+      session.rs          SessionCache: the cache as a session of a host's cachette::Manager
       fetcher.rs          UreqFetcher (blocking HTTP + file:) — `http` feature
-    tests/                bibfile.rs, filecache_std.rs
+    tests/                bibfile.rs, single_file_cache.rs, session_cache.rs
     examples/resolve.rs   end-to-end demo (doi + manual + bib)
   autocitefetch-cli/      the `autocitefetch` command-line tool
     src/
@@ -99,27 +99,22 @@ short of the total.
 
 ### Cache files (std backend)
 
-`SingleFileCacheStore` keeps three kinds of file in a directory of your choosing:
+`SingleFileCacheStore` keeps its files in a directory of your choosing. The
+files, and the code that writes them, are cachette's
+[`JsonlStore`](https://docs.rs/cachette/0.1/cachette/struct.JsonlStore.html);
+they are the same files, in the same place, as autocitefetch 0.1.1 wrote:
 
 * `citations.jsonl` — the cache itself: a header line, then one sorted
   `{"id":…,"rec":…}` line per entry. One entry per line keeps git diffs minimal;
-  this is the only file worth committing.
-* `._citations.<writer>.log` — per-writer append logs. Writes go here lock-free
-  and are folded into the main file by `flush()` (called at the end of
-  `retrieve`/`prune`), which is the only operation that takes the lock or
-  rewrites the whole file. `flush()` folds *every* sidecar it finds but only
-  deletes **its own** and any left by a **crashed** peer — never a live peer's,
-  since that would race its lock-free appends and destroy acknowledged writes.
-* `._citations.<writer>.log.lock` — a per-writer **liveness lock**, held for
-  exactly as long as that writer's sidecar exists (taken just before the first
-  append, given back by the flush that folds the sidecar away). `flush()` reaps a
-  peer's sidecar only when it can take that peer's lock (the OS frees it when the
-  owner process crashes); a held lock means the owner is alive, so the sidecar is
-  folded read-only and left in place. The same probe sweeps up companions whose
-  `.log` is already gone, which is what a crash between the two unlinks strands.
-* `._citations.lock` — the compaction lockfile, held only for the duration of a
-  `flush()`.
-* `._citations.jsonl.tmp` — the staging file for the atomic replace.
+  this is the only file worth committing. A line holds the source's answer
+  (`{"concrete": <item>}`) and its two expiry times, nothing else, so a line
+  changes only when its entry is fetched again.
+* `._citations.<writer>.log`, `._citations.<writer>.log.lock`,
+  `._citations.lock`, `._citations.jsonl.tmp` — per-writer append logs, their
+  liveness locks, the merge lock and the staging file of the atomic
+  replacement. They exist only while a run is in flight: `flush()` (called at
+  the end of `retrieve`/`prune`) folds the logs into the main file and removes
+  them.
 
 Only the main file wears the bare base name; **every throwaway file carries the
 `._<base>` prefix**, so it is hidden and one rule ignores the lot:
@@ -128,19 +123,11 @@ Only the main file wears the bare base name; **every throwaway file carries the
 ._citations*
 ```
 
-Those throwaway files are also **transient**: each is unlinked by the writer that
-created it — the two lock files while their lock is still held, so a peer either
-finds the file locked or does not find it at all — so a run that finishes leaves
-`citations.jsonl` alone in the directory. (Lock files used to be kept forever,
-which littered one stray `._citations.<writer>.log.lock` per run plus a permanent
-`._citations.lock` in what, for the CLI, is the user's working directory.) Keep
-the ignore rule anyway: the files exist while a run is in flight, and a crash can
-strand one until the next run sweeps it up.
-
-The store *reads* every `._citations.*.log` in this directory, so don't park
-unrelated files there under that name. A main file it cannot parse — a corrupt
-line, an unresolved merge conflict, or a `{"schema":N}` newer than this build —
-makes `open()` fail rather than silently dropping the entries it can't read.
+Keep the ignore rule: the files exist while a run is in flight, and a crash can
+strand one until the next run sweeps it up. Why the locks and the merge work
+the way they do (live versus crashed writers, the fold order, a main file with
+an unreadable line) is documented with the engine, in the module documentation
+of cachette's `engine/jsonl.rs`.
 
 ## Design decisions
 
@@ -148,7 +135,8 @@ makes `open()` fail rather than silently dropping the entries it can't read.
 |---|---|
 | Execution model | **Async, executor-agnostic** (`core::future::Future`; boxed futures keep traits object-safe). |
 | CSL-JSON model | **Generic JSON value** (`serde_json::Value`) — lossless passthrough of doi.org / bib data; arXiv mapping done by hand. |
-| Cache interface | **Per-entry key-value** `CacheStore` — incremental writes, maps to IndexedDB / embedded KV. |
+| Cache interface | **Synchronous, per-entry** `CacheStore` keyed by citation id, holding one CSL-JSON item per id — the source's answer. Implemented over any `cachette::Store` (`StoreCache`), or on a session of a host's `cachette::Manager` (`SessionCache`). |
+| Run options | **Applied on read**: arXiv DOI overrides and chain target (`Source::interpret`) and dropped fields (`get`) never change the cache. Only the cache's `StoragePolicy` (TTL policy, `keep_reference`, `keep_abstract`) shapes its contents. |
 | Trait surface | **Separate composable traits** (`Fetcher`, `CacheStore`, `Clock`, `Timer`) assembled on the manager. |
 | Progress reporting | **One synchronous method + a borrowed `#[non_exhaustive]` event enum** (`Reporter`), optional and `Rc`-shared rather than a fifth generic parameter. Async would add yield points to the retrieval loop; named callbacks would make filtering and throttling a per-method chore. |
 
@@ -180,15 +168,19 @@ makes `open()` fail rather than silently dropping the entries it can't read.
   Python header-drop bugs are not reproduced).
 - **Incremental, committable persistence** — the `CacheStore` interface is
   per-entry, so nothing rewrites the whole cache on every store. The bundled file
-  backend goes further: lock-free per-writer append logs, compacted under a lock
-  into one sorted, git-committable `citations.jsonl` (see above).
+  backend (cachette's `JsonlStore`) goes further: lock-free per-writer append
+  logs, compacted under a lock into one sorted, git-committable
+  `citations.jsonl` (see above).
+- **Options that never touch the cache** — the cache holds what a source
+  returned; DOI overrides, the chain target and dropped fields apply when a
+  citation is read, so changing them takes effect at once, without a request.
 - **Careful arXiv version resolution** — groups returned entries by base id and
   prefers a versionless entry, else the highest version; explicitly-versioned
   requests stay concrete (fixes the Python reference, which silently drops them).
 - **arXiv DOI overrides** — supplied as *data* (`with_override_dois`): `Some(doi)`
   injects/replaces, `None` *suppresses* (keep arXiv metadata, don't chain) — a
-  capability the references lack. A JSON file convenience is also provided; other
-  formats are parsed host-side and passed as data.
+  capability the references lack. A JSON file is read at setup with
+  `load_override_dois`; other formats are parsed host-side and passed as data.
 - **Prefixes are not baked into source types** — both references tie a source
   class to one hard-coded prefix (and hard-code `'doi'` as arXiv's chain target).
   Here the host names every source at `register` time and tells arXiv which
@@ -218,6 +210,8 @@ colon so a `manual:` key can contain colons of its own.
 | `--no-arxiv-chaining` | keep arXiv metadata instead of chaining to doi.org |
 | `--manual-format <NAME>` | markup name a `manual:` text is emitted under — `{"_ready_formatted": {"<NAME>": …}}` (default `flm`) |
 | `--cache-dir`, `--cache-name` | where the cache lives (default: `.citations` in the working directory) |
+| `--keep-abstract`, `--keep-references` | keep the `abstract` / `reference` field in the cache and the output (both left out by default) |
+| `--drop-field <FIELD>` | remove a top-level field from the output only; the cache is not changed |
 | `-v`/`-vv` | progress on stderr: `-v` for passes, per-source counters and long waits; `-vv` adds every HTTP request and resolved citation, unthrottled |
 | `--output`, `--compact`, `--user-agent` | |
 
@@ -246,7 +240,8 @@ while it is in flight — no un-ignoring needed, since they sit under their own
 
 Implemented and tested end-to-end: the manager, routing, chaining, cache/TTL
 policy, the driver, transparent retry/backoff, progress reporting, the
-single-file JSONL cache, all four sources (`arxiv`, `doi`, `manual`, `bib`),
+cache seam over cachette (the single-file JSONL cache, any cachette store, and
+a session of a host's cachette manager), all four sources (`arxiv`, `doi`, `manual`, `bib`),
 concurrent within-pass source execution, the `std` backends including a
 `ureq`-based HTTP `Fetcher` (with `file:` support), and the `autocitefetch`
 command-line tool. The arXiv source parses the Atom feed with `xmlparser` (a
@@ -257,8 +252,10 @@ of these on stable and on the MSRV (1.86).
 
 **Not yet implemented:**
 
-- A dedicated **WASM backend crate** (browser `fetch()` + IndexedDB + `setTimeout`
-  impls of the four traits). The core already compiles for wasm32.
+- A dedicated **WASM backend crate** (browser `fetch()` + `setTimeout` impls of
+  the traits). The core already compiles for wasm32; for the cache, a browser
+  host loads a `cachette::MemoryStore` before the run (`cachette::import`) and
+  saves it after (`cachette::export`).
 - **YAML in the library** — the CLI reads YAML bibliographies and override maps,
   but it does so as a host, via `with_parser`. JSON stays the core's only
   built-in format (YAML/TOML/… work the same way for any other host).
@@ -284,20 +281,24 @@ Nothing else returns CSL data.
    directly (matching `(prefix,key)`) or via a failure whose `origin` is it — so a caller joining the
    report against its input `cites` never wrongly concludes a cite succeeded (only for `get()` to
    later break on the chain). `origin.unwrap_or((prefix,key))` recovers the failed request.
-2. `manager.get(prefix, key)` → `CslValue`. Walks chain pointers, merges `set_properties`, and
-   rewrites `id` back to the originally requested `"prefix:key"`.
+2. `manager.get(prefix, key)` → `CslValue`, **synchronous**. Interprets each cached item with its
+   source (`Source::interpret`), walks the chain this derives, merges `set_properties`, removes the
+   omitted and dropped fields, and sets `id` to the originally requested `"prefix:key"`.
 
 ### The four injected traits (plus one optional fifth)
 
-`Fetcher`, `CacheStore`, `Clock`, `Timer` (in `fetch.rs`, `store.rs`, `env.rs`) are the entire host
-surface, assembled via `CitationManager::new(fetcher, store, clock, timer).register(prefix, source)?`
+`Fetcher`, `CacheStore`, `Clock`, `Timer` (in `fetch.rs`, `store.rs`, `env.rs`; `Clock` and
+`Timestamp` are cachette's, re-exported) are the entire host surface, assembled via `CitationManager::new(fetcher, store, clock, timer).register(prefix, source)?`
 (`register` returns `Result` — it rejects an empty or `':'`-containing prefix rather than panicking).
 Every async trait method returns `BoxFuture<'a, T>` (`lib.rs`) — a **`!Send`** boxed future. This is
 deliberate: WASM futures are `!Send`, the core assumes a single cooperative task, and boxing keeps
 the traits object-safe (`&dyn Fetcher`, `Box<dyn Source>`). Do not add `Send`/`Sync` bounds.
 
-`CacheStore` methods take `&self`; implementations use interior mutability (`RefCell`). The manager
-holds only shared borrows while driving sources concurrently, so this is required, not incidental.
+`CacheStore` is **synchronous** (cachette's stores are) and its methods take `&self`;
+implementations use interior mutability (`RefCell`). The manager holds only shared borrows while
+driving sources concurrently, so this is required, not incidental; and since no cache call is
+async, no borrow is ever held across an `.await`. `CitationManager::get`, `get_by_id` and `prune`
+are synchronous for the same reason; only `retrieve` is async.
 
 The fifth is `Reporter` (`report.rs`), and it breaks every one of those rules on purpose — see
 "Progress reporting" below.
@@ -318,7 +319,7 @@ Two rules follow, and both are load-bearing:
   therefore built **per bucket** in `run_passes`, not once per pass — that is the only reason it is
   constructed inside the per-source future.
 - **A chain target prefix is configuration, not an assumption.** `ArxivSource::chain_dois_to(Some(p))`
-  names the prefix to emit in `Outcome::Chained` (`None` disables chaining); the CLI passes
+  names the prefix `interpret` answers in `Interpreted::Chained` (`None` disables chaining); the CLI passes
   `SourceKind::Doi.prefix()` so both ends of the chain are named in one place. Pointing at an
   unregistered prefix is not an error at build time — it surfaces as a failure on the chain target,
   attributed via `origin` to the citation that produced it.
@@ -341,10 +342,10 @@ A worklist loop, not a fixed pipeline:
   This happens at every point a `(prefix, key)` becomes a `cite_id` — the worklist loop head (so
   routing/`seen`-dedup/bucketing/storage all key on the canonical form, and `" 1211.1037 "` /
   `"1211.1037"` or `10.1103/PhysRevA.86.052329` / `10.1103/physreva.86.052329` collapse into one
-  fetch/entry), the `Outcome::Chained` store arm (normalized by the **target** source's policy, so a
-  chained pointer matches the id its target lands under — this is why `arxiv.rs` emits its DOI chain
-  key verbatim and needs no DOI case handling of its own), and both `get`/`get_by_id` and each `get`
-  chain hop. An unknown prefix has no source to consult, so its key is used verbatim. Sources thus
+  fetch/entry), every `Interpreted::Chained` answer (its key normalized by the **target** source's
+  policy, so a chain matches the id its target lands under — this is why `arxiv.rs` emits its DOI
+  chain key verbatim and needs no DOI case handling of its own), and both `get`/`get_by_id` and each
+  `get` chain hop. An unknown prefix has no source to consult, so its key is used verbatim. Sources thus
   only ever see already-normalized keys; **do not re-normalize inside a source**. Implementations
   must be idempotent — the manager applies the policy more than once along a chain.
 
@@ -354,21 +355,29 @@ A worklist loop, not a fixed pipeline:
   internal whitespace is deliberately *not* collapsed, so `doi.rs`'s validation can still reject a
   malformed key instead of it being silently repaired.
 - Per pass: dedup against `seen`, look each id up in the store, and classify it for refresh
-  batching (`RefreshBatching::classify`: misses and long-expired entries `Required`, anything else
-  `TtlPolicy::should_refetch` returns true for `Due` — hard-expired always; soft-stale
-  *probabilistically*, see Cache policy — and old-enough kept entries `Eligible`). Then, per
-  prefix, `batching::plan` decides which keys are bucketed (see Refresh batching). A cached
-  `Payload::Chained` entry we end up **keeping** (fresh, stale but the draw said serve-as-is, or
-  deferred by batching) pushes its target onto the worklist so the target is guaranteed present —
-  these are held until planning is done; one we are **refetching** (including one pulled forward) does *not*
-  (it is about to be replaced, and pre-pushing a superseded pointer would fetch — and report a
-  failure for — a citation nobody requested). When a refetch fails and the grace window keeps the
-  old chained record, the target is pushed from the failure path instead.
+  batching (`RefreshBatching::classify`, on the item's `Expiry`: misses and long-expired entries
+  `Required`, anything else `TtlPolicy::should_refresh` returns true for `Due` — hard-expired
+  always; soft-stale *probabilistically*, see Cache policy — and old-enough kept entries
+  `Eligible`). A record the cache cannot read (a 0.1.1 chain pointer, any other shape) is a miss.
+  Then, per prefix, `batching::plan` decides which keys are bucketed (see Refresh batching). A
+  cached item that is not `Required` is **interpreted** under the current configuration; if it
+  chains and we end up **keeping** it (fresh, stale but the draw said serve-as-is, or deferred by
+  batching), its target is pushed onto the worklist so the target is guaranteed present — these
+  are held until planning is done; one we are **refetching** (including one pulled forward) does
+  *not* (it is about to be replaced, and pre-pushing a superseded target would fetch — and report a
+  failure for — a citation nobody requested). A kept item that chains to its own id is reported as a
+  failure (and stays in the cache). When a refetch fails and the grace window keeps the old item, it
+  is interpreted again and its target is pushed from the failure path instead (unless it chains to
+  itself, which is then reported).
+- Storing a `Concrete` outcome: a non-object item is a failure and nothing is stored; otherwise the
+  fields the storage policy omits are removed, the item is `put` (with the outcome's TTL or the
+  source's default) **without an `id`**, and then interpreted: `Concrete` is resolved, `Chained`
+  pushes its normalized target (a chain to itself removes the item and is a failure).
 - Worklist items carry a **depth**; `max_chain_depth` (default 16, `with_max_chain_depth`) bounds
   `retrieve` as well as `get`, so retrieval never fetches links `get()` could not reach.
 - Worklist items also carry an **origin** — the originally-requested `(prefix, key)` the item
-  descends from (itself for a requested cite). Every push of a chain target (kept-pointer during
-  bucketing, `Outcome::Chained` store arm, grace-served pointer in `note_failure`) inherits the
+  descends from (itself for a requested cite). Every push of a chain target (kept item during
+  bucketing, a stored item that chains, a grace-served item in `note_failure`) inherits the
   current item's origin, so a multi-hop chain still points back to the root request. The dedup set
   (`seen`) records `(depth, origin)` per id; `store_resolutions` reads it back so any `CiteFailure`
   it builds is attributed correctly. First-writer-wins: a directly-requested cite is in the initial
@@ -377,13 +386,14 @@ A worklist loop, not a fixed pipeline:
   then applied to the store **serially** to keep writes/worklist/report updates simple.
 - New chained targets discovered during a pass feed the next pass; the loop runs until the worklist
   drains, then calls `store.flush()`.
-- `with_dropped_csl_fields(["reference", …])` (default: empty) removes those **top-level** CSL keys
-  on the way from a source's `Outcome` into `store.put` — doi.org's `reference` array (a paper's
-  whole bibliography) is the motivating case. Applied in `store_resolutions` to a `Concrete` item
-  *before* `set_id`, so listing `"id"` cannot strip the id the entry is keyed on, **and** to a
-  `Chained` pointer's `set_properties`, which would otherwise re-introduce a dropped field when it
-  overrides the target at read time. Store-time only: entries already cached keep their fields until
-  they are refetched.
+- `with_dropped_csl_fields([…])` (default: empty) affects the **output only**: `get` removes those
+  top-level keys after merging the chain's `set_properties` (so a chain cannot bring one back) and
+  before setting the requested `id` (so dropping `"id"` cannot remove it). The cache keeps the
+  fields. What the cache keeps is its `StoragePolicy`: `reference` (doi.org's copy of a paper's
+  whole bibliography) and `abstract` are omitted unless `keep_reference`/`keep_abstract` is set.
+  The omitted fields are removed before `put` **and** again in `get`, so turning a flag off hides
+  the field at once, also for items stored before; turning one on takes effect as entries are
+  fetched again.
 
 ### Retry is interposed, not implemented per source
 
@@ -429,11 +439,9 @@ Emission sites: `manager.rs` (retrieve/pass lifecycle, per-citation outcomes, th
 `Finished`, the `Backoff` wait). Sources reach it as `ctx.reporter` but rarely need to.
 
 **Cache-lock waits are bracketed around `store.flush()` in the manager, not emitted from inside
-`FileCacheStore`.** Giving the store an `Rc<dyn Reporter>` would make it `!Send`, and
-`autocitefetch-std/tests/filecache_std.rs` moves stores into `thread::spawn`. `flush` is the only
-operation that locks, so the call site loses nothing but the ability to distinguish "blocked on the
-lock" from "folding the sidecars". If that granularity is ever wanted, make it a generic `R: Reporter`
-parameter on `FileCacheStore` (`Send` when `R: Send`) — never an `Rc`.
+the store.** The store is any cachette store, which knows nothing of this crate's reporter. `flush`
+is what takes a JSONL store's merge lock, so the call site loses nothing but the ability to
+distinguish "blocked on the lock" from "folding the logs".
 
 `CiteFailed` carries `grace_served`: `true` means the failure was suppressed by stale-while-revalidate
 and is **not** in the `RetrieveReport`. That is the only way a host can observe the grace window
@@ -443,40 +451,47 @@ would double every failure line.
 
 ### Chaining
 
-arXiv doesn't duplicate DOI metadata: it stores `Outcome::Chained { prefix, key, set_properties }`,
-a pointer. `get()` walks up to `max_chain_depth` (16) links, accumulating `set_properties` with
-`csl::merge_defaults` — **properties closer to the request win** during accumulation — until it hits
-a `Payload::Concrete`. At the concrete node the accumulated `set_properties` are applied with
-`csl::merge_over`, so they **override** the concrete target's colliding fields (matching both
-reference implementations' `{ ...target, ...set_properties }`); the requested `id` is then forced
-last, so a `set_properties` carrying an `id` can never win. Note `Source::chains_to() -> Vec<&str>`
-exists but the manager does not consume it; chain discovery is dynamic via the worklist. It returns
-borrowed (not `'static`) prefixes because a chain target is *configuration* — see the prefix-binding
-section — so a host can still check up front that every prefix a source will point at is registered.
+No chain pointer is stored. A cached item is what its source returned; whether it *chains* is
+derived on read, by `Source::interpret(key, item)`, which answers `Interpreted::Concrete(item)` or
+`Interpreted::Chained { prefix, key, set_properties }` under the source's current configuration
+(the default implementation answers the item). arXiv answers `Chained` to its `chain_dois_to`
+prefix for a versionless key whose item has a DOI after the overrides (see Sources).
 
-**The chain key is lowercased; the CSL `DOI` field is not.** `arxiv.rs` emits
-`Outcome::Chained { key: doi, .. }` **verbatim** — the manager then runs the target key through the
-`doi` source's `normalize_key` (trim + lowercase) both when storing the pointer and when `get()`
-walks it, so two entries whose DOIs differ only in case dedup to one `doi:` cache id. That id is an
-*internal identifier*. The CSL field is a separate thing: it is the CSL-standard uppercase **`DOI`**
-key holding the DOI **verbatim** (DOIs display in their registered mixed case), written that way by
-`arxiv.rs`'s `build_csl` and by `doi.rs`'s `canonicalize_doi_key`. Don't "unify" the two —
-lowercasing the field breaks CSL compliance, and case-preserving the cache key breaks dedup.
+`get()` walks up to `max_chain_depth` (16) links: it reads each link, interprets it with the source
+registered for its prefix (a link with no such source is taken as concrete), and accumulates
+`set_properties` with `csl::merge_defaults` — **properties closer to the request win** during
+accumulation — until it hits a `Concrete` answer. There the accumulated `set_properties` are applied
+with `csl::merge_over`, so they **override** the concrete target's colliding fields (matching both
+reference implementations' `{ ...target, ...set_properties }`); then the omitted and dropped fields
+are removed, and the requested `id` is set last, so a `set_properties` (or a 0.1.1 item) carrying an
+`id` can never win. Note `Source::chains_to() -> Vec<&str>` exists but the manager does not consume
+it; chain discovery is dynamic via the worklist. It returns borrowed (not `'static`) prefixes
+because a chain target is *configuration* — see the prefix-binding section — so a host can still
+check up front that every prefix a source will point at is registered.
 
-### Cache policy (`cache.rs`)
+**The chain key is lowercased; the CSL `DOI` field is not.** `arxiv.rs` answers
+`Interpreted::Chained { key: doi, .. }` **verbatim** — the manager then runs the target key through
+the `doi` source's `normalize_key` (trim + lowercase), in `retrieve` and when `get()` walks it, so
+two entries whose DOIs differ only in case dedup to one `doi:` cache id. That id is an *internal
+identifier*. The CSL field is a separate thing: it is the CSL-standard uppercase **`DOI`** key
+holding the DOI **verbatim** (DOIs display in their registered mixed case), written that way by
+`arxiv.rs` and by `doi.rs`'s `canonicalize_doi_key`. Don't "unify" the two — lowercasing the field
+breaks CSL compliance, and case-preserving the cache key breaks dedup.
 
-Two-tier expiry per record: `stale_after` (soft, `stale_percent` = 80% of TTL) and `expires` (hard).
-The tiers are **not** a hard cutoff. `TtlPolicy::should_refetch` — the sole refetch decision the
-manager consumes — is: `Fresh` (now < `stale_after`) never refetch, `Expired` (now ≥ `expires`)
-always, and in the stale window `[stale_after, expires)` refetch only **probabilistically**, with a
+### Cache policy (`cache.rs`, cachette's `TtlPolicy`)
+
+The TTL policy is cachette's `TtlPolicy` (which began as a copy of this crate's), and the policy in
+force is the cache's: `StoragePolicy::ttl`. Two-tier expiry per record (cachette's `Expiry`):
+`stale_after` (soft, `stale_percent` = 80% of TTL) and `expires` (hard). The tiers are **not** a
+hard cutoff. `TtlPolicy::should_refresh` — the sole refetch decision the manager consumes — is:
+`Fresh` (now < `stale_after`) never refetch, `Expired` (now ≥ `expires`) always, and in the stale window `[stale_after, expires)` refetch only **probabilistically**, with a
 probability that ramps from ~0 at `stale_after` to ~1 as `now` nears `expires`. The draw is a
 deterministic FNV-1a hash of `(id, now)` (the same jitter family — no RNG, no ambient clock);
 mixing `now` in re-rolls each `retrieve`, so an entry left alone now grows likelier to refetch as it
 drifts toward `expires`. Consequence: an entry's **effective TTL is close to its full nominal TTL**
 (arXiv's 10 d now really refetches near 10 d, not ~8.9 d), and a batch fetched together revalidates
 spread out rather than all at once. `classify` (Fresh/Stale/Expired) is unchanged and still used by
-`usable_within_grace`, `prune`, and the chained-target freshness check; only the refetch decision
-went probabilistic. On top of that a `grace` window (14 days) during which a hard-expired entry is
+`usable_within_grace` and `prune`; only the refetch decision is probabilistic. On top of that a `grace` window (14 days) during which a hard-expired entry is
 still served **if the source is currently unreachable** (stale-while-revalidate — see `store_resolutions`'
 `Outcome::Failed` arm →
 `note_failure`). Grace applies **only to `Outcome::Failed`** (transport/5xx/unloadable-file — "try
@@ -486,18 +501,20 @@ id absent from a file that loaded fine or from a 200 API response, a doi.org 404
 `get()` stops serving now-known-wrong data (a removed entry may be some other citation's chain
 target, whose `get()` then fails on the dead link — correct, the target really no longer resolves).
 Hard TTL gets ±15% deterministic jitter seeded by FNV-1a over the entry id, so a batch fetched
-together doesn't expire together.
+together doesn't expire together. (cachette's module `lifetime.rs` documents two edge cases where
+its expiry times differ from 0.1.1's.) `CitationManager::prune` drops the entries past their grace
+window, through `CacheStore::prune`.
 
 ### Refresh batching (`batching.rs`)
 
-`should_refetch` decides per entry; on a large database that trickles — each run finds a few
+`should_refresh` decides per entry; on a large database that trickles — each run finds a few
 entries newly stale, and each few costs a rate-limited request (arXiv answers 100 ids for the price
 of 3). Between the per-entry decision and the driver, `batching::plan` decides **per prefix, per
 pass** what actually goes on the wire, from four classes (`RefreshBatching::classify`):
 
 - **Required** — a miss, or hard-expired for ≥ `max_defer` (capped at `TtlPolicy::grace`, so a
   deferred entry is never one `prune` may drop). Never deferred.
-- **Due** — `should_refetch` said yes, but deferrable (stale-window draw said refetch, or
+- **Due** — `should_refresh` said yes, but deferrable (stale-window draw said refetch, or
   hard-expired for < `max_defer`).
 - **Eligible** — kept, but with remaining life ≤ `(100 − min_age_percent)`% of the source's
   nominal `default_ttl` (only when `top_up` is set). Ranked by `expires`, then key.
@@ -539,17 +556,21 @@ across passes, so the second pass of an arXiv→DOI chain cannot hit doi.org wit
 
 | prefix | chunk / interval / TTL | notes |
 |---|---|---|
-| `arxiv` | 100 / 3100 ms / 10 d | Atom feed parsed with `xmlparser`; version resolution; chains to the prefix set by `chain_dois_to` (default `Some("doi")`) |
+| `arxiv` | 100 / 3100 ms / 10 d | Atom feed parsed with `xmlparser`; version resolution; caches the arXiv metadata with the feed's DOI; on read, applies the DOI overrides and chains to the prefix set by `chain_dois_to` (default `Some("doi")`) |
 | `doi` | 1 / 1100 ms / 360 d | doi.org content negotiation returns CSL-JSON stored verbatim, values included — the only touch is `canonicalize_doi_key`, which renames a nonstandard lowercase `doi` key up to the CSL-standard uppercase `DOI` (doi.org already sends `DOI`, so it is normally a no-op) |
-| `manual` | ∞ / 0 / **0** | key *is* the formatted text, stored under `_ready_formatted: {<format_name>: <text>}` — the format name is a required `ManualSource::new` argument (host config, like a chain prefix; the CLI's `--manual-format` defaults to `flm`, matching JS); TTL 0 ⇒ ephemeral (kept in the store's in-memory view for the run, **never persisted** to `citations.jsonl` or a sidecar, gone on restart — enforced by `FileCacheStore`, keyed on `stale_after == expires`, not on the prefix) |
+| `manual` | ∞ / 0 / **0** | key *is* the formatted text, stored under `_ready_formatted: {<format_name>: <text>}` — the format name is a required `ManualSource::new` argument (host config, like a chain prefix; the CLI's `--manual-format` defaults to `flm`, matching JS); TTL 0 ⇒ ephemeral (readable for the life of the cache object, **never persisted** to `citations.jsonl` or a log, gone on restart — enforced by cachette's `WithEphemeral`, which `StoreCache` wraps around its store, keyed on the expiry times, not on the prefix) |
 | `bib` | ∞ / 0 / 60 s | file(s) fetched through the `Fetcher` (`file:` URLs), indexed by `id` |
 
 arXiv version resolution: an explicitly-versioned key (`1211.1037v2`) resolves to that exact version
-and is emitted **concrete, never chained**; a versionless key picks the best returned entry (a
-versionless entry wins, else the highest `vN`) and chains to its DOI at the `chain_dois_to` prefix
-(`None` disables chaining entirely — the old `chaining(false)`). DOI overrides are data
-(`with_override_dois`): `Some(doi)` injects/replaces, `None` *suppresses* (keep arXiv metadata,
-don't chain).
+and is read **concrete, never chained**; a versionless key picks the best returned entry (a
+versionless entry wins, else the highest `vN`). `retrieve_chunk` caches that entry's arXiv
+metadata with the feed's DOI, and takes no other decision. `interpret` then computes the effective
+DOI from the overrides and the item's `DOI`, writes it back (or removes `DOI` when there is none),
+and for a versionless key with a DOI chains to it at the `chain_dois_to` prefix (`None` disables
+chaining entirely). DOI overrides are data (`with_override_dois`): `Some(doi)` injects/replaces,
+`None` *suppresses* (keep arXiv metadata, don't chain); `load_override_dois` reads a JSON file at
+setup, through a `Fetcher` the host gives (a failure is an error at setup). Changing an override or
+the chain target therefore needs no arXiv request.
 
 The CSL `issued` date is the entry's **`<updated>`** (last-revision date), falling back to
 `<published>` when `<updated>` is absent — matching feedparser's `.date` alias and the **JS**
@@ -558,88 +579,47 @@ date, so a paper's citation *year* may differ from Python's output. For a versio
 is that specific version's date, not v1's. Only the per-entry `<updated>` is read (the feed-level
 `<updated>` is ignored).
 
-### Single-file cache (`filecache.rs` + `autocitefetch-std/src/store.rs`)
+### The cache seam (`store.rs`) and its backends
 
-`FileCacheStore<Fs: CacheFs>` lives in the **core** crate (generic over an injected `CacheFs`); the
-std crate supplies only real filesystem ops (`StdCacheFs`) and the `SingleFileCacheStore` wrapper.
-Layout in one directory: `citations.jsonl` (header line 0 + one sorted entry per line — the only
-file worth committing), per-writer `._citations.<pid>-<nanos>.log` append logs (lock-free writes),
-and `._citations.lock`. **Only the main file wears the bare base name**; every throwaway file the
-store creates (sidecars, companions, the compaction lockfile, the std host's `.jsonl.tmp` staging
-file) is prefixed `._` by `filecache::temp_base`, so it is hidden and a single `._{base}*` ignore
-rule covers all of them without touching `{base}.jsonl`. `is_sidecar` therefore matches against the
-*temp* base — a log under the bare base is a foreign file and is not even read.
-`flush()` is the *only* operation that locks or rewrites the whole file: it folds
-main + all sidecars, atomically replaces the main file, then reaps its own sidecar **plus any
-crashed peer's**. It must never delete a *live* peer's: the compaction lock serializes compaction
-against *compaction*, never against the lock-free `append`, so unlinking a live peer's log destroys
-any write that landed after the fold read it (measured: ~300 of 400 acknowledged puts lost).
+`CacheStore` is synchronous and keyed by the canonical `"prefix:key"` id: `policy`, `get` (a
+`CachedItem`: the item and its `Expiry`), `put(id, item, ttl, now)`, `remove`, `flush`, `prune`. A
+`ttl` of zero stores an **ephemeral** item, readable for the life of the cache object and never
+written. The manager removes the fields the `StoragePolicy` omits, before `put` and after `get`; an
+implementation only stores what it is given.
 
-Live-vs-crashed is told apart by an **OS-advisory liveness lock**. A writer takes an exclusive
-`CacheFs::try_lock_exclusive` on a companion file `._citations.<writer>.log.lock` next to its
-sidecar and holds it for exactly as long as that sidecar exists — `ensure_lifelock` takes it just
-before the first append creates the log, `flush` gives it back once the log is unlinked (`lifelock`
-is a `RefCell<Option<Fs::Guard>>` for that reason, and a later append re-takes it). The kernel
-releases it if the process crashes. When `flush` folds a peer's sidecar it tries that peer's
-companion lock: **held** (`Ok(None)`) ⇒ owner alive ⇒ fold read-only, never delete; **acquired**
-(`Ok(Some)`) ⇒ owner gone ⇒ delete the log and its orphaned companion (the fold already captured its
-lines). The companion is a *separate* file from the `.log` so reaping our own sidecar never has to
-disturb the lock — a writer never `try_lock`s its own companion (self-deadlock) and deletes its own
-`.log` unconditionally. A foreign `._citations.*.log` with no companion is folded but never reaped,
-same as round 1. The stored guard is `CacheFs::Guard` (an associated type, not `Box<dyn CacheGuard>`)
-so `FileCacheStore<StdCacheFs>` stays `Send` — the concurrent regression test still moves stores
-across threads. A failed unlink never fails the flush.
+A record is the JSON text `{"concrete": <item>}` (`encode_item`/`decode_item`), exactly what 0.1.1
+wrote for a concrete entry, and no `id` is stamped into the item. So 0.1.1 files are reused without
+a conversion step: their DOI entries are read with their expiry times; their arXiv entries are 0.1.1
+chain pointers (`{"chained": …}`), which `decode_item` reads as absent, so they are fetched again
+(100 ids per request) and their lines replaced. 0.1.1 can still read a file written now.
 
-**No file outlives the run that made it.** Every throwaway file is unlinked by its creator — the
-sidecar and the companion by the owning `flush`, the compaction lockfile at the end of the `flush`
-that took it, the `.jsonl.tmp` by the rename — so a finished run leaves only `{base}.jsonl`. (Both
-lock files used to be kept forever: a CLI run littered one `._.citations.<writer>.log.lock` per
-invocation plus a permanent `._.citations.lock` in the user's working directory.) Two rules hold it
-together. **A lock file is unlinked while its lock is still held**, never after releasing — a peer
-then either sees the file and finds it held (owner alive, hands off) or does not see it at all, so
-there is no instant where the path exists unlocked while its owner is still using it. And because an
-unlinked-but-open file can still be locked by a peer that opened it a moment earlier,
-`CacheFs::lock_exclusive`/`try_lock_exclusive` are **specified to verify after acquiring** that they
-locked the file the path still names, and to retry (blocking) or report not-acquired (`try_`) if not;
-`StdCacheFs` does this with a `(dev, ino)` comparison on unix (`lock_the_file_at` /
-`locked_the_file_at_path`) and accepts the lock unverified elsewhere. Skipping the check would let a
-stale holder and a newcomer both believe they hold the compaction lock — which is a main-file
-data-loss window, not a cosmetic one. `own_sidecar_gone` in `flush` is the third piece: if our own
-log did *not* actually go away, we keep the companion, since an unvouched-for sidecar reads as a
-crashed writer's leftover.
+Three ways to get a cache:
 
-Merge rule (all exercised by unit tests): **last write wins over a deterministic total fold order** —
-the main file first (the baseline written at the last compaction), then each sidecar in sorted name
-order, and within a sidecar in line order (append order == that writer's time order). An entry line
-inserts, a tombstone removes. So `put;remove` removes, a re-fetch with a *smaller* `expires` wins
-(it is the newer write — the store does **not** keep the max-`expires` copy, which used to pin the
-entry `Expired` forever), and a sidecar always beats the committed main-file copy. The one thing this
-order cannot make exact is a **cross-writer** race — two live writers writing the same id
-concurrently are ordered only by sidecar name — an accepted known limitation; each writer's own
-sequence of ops is honored exactly. Torn-line tolerance applies to **sidecars only** — the main file
-is written via fsync+rename and so can never be legitimately torn, so an unparseable line or an
-unknown `{"schema":N}` header there is a hard `Err` rather than a silent skip (silently skipping then
-rewriting turned recoverable corruption into permanent loss).
+* **`SingleFileCacheStore`** (`autocitefetch-std`, the default): `StoreCache` over cachette's
+  `JsonlStore` on the real filesystem — the files of "Cache files" above. `with_base` exists so the
+  CLI can use the base `.citations`: the CLI's cache lands in the user's working directory, so the
+  committable file is the hidden `.citations.jsonl` and everything else hides under one
+  `._.citations*` ignore rule.
+* **`StoreCache<S: cachette::Store>`** (core, `no_std`): any cachette store, wrapped in cachette's
+  `WithEphemeral` (which keeps the zero-TTL items in memory). Values are written with their expiry
+  times only — no time of write, use or cost, and uses are never recorded — so JSONL lines keep the
+  0.1.1 shape and a committed file changes only when an entry is fetched again. A value without
+  expiry times, an unreadable record and a damaged value (`StoreErrorKind::DamagedValue`) read as
+  absent; the refetch's `put` replaces them. `prune` uses `PruneRule::Volatile` with the policy's
+  grace. A browser host wraps a `cachette::MemoryStore`, loads it with `cachette::import` before the
+  run and saves it with `cachette::export` (through `with_store`) after.
+* **`SessionCache`** (`autocitefetch-std`): a session of a host's `cachette::Manager`, on the values
+  cache `autocitefetch.items` (version 1, JSONL engine, volatile values with the policy's TTL
+  policy). The host picks the instance with any `Serialize` value; the instance key also holds the
+  two `keep_*` flags, so caches that keep different fields are never mixed. A session never fails
+  (failures go to the host's cachette `Reporter`) and may be without a cache (`Manager::none()`), so
+  `SessionCache` keeps every `put` and `remove` of its life in memory and answers `get` from there
+  first: `retrieve` then `get` always works. `flush` does nothing (the session makes its writes
+  durable when dropped) and `prune` answers `Ok(0)` (the host's `Manager::maintain` prunes).
 
-**Ephemeral (TTL-0) records are memory-only.** A record with no fresh window (`stale_after == expires`,
-what a zero TTL produces — `is_ephemeral`) is kept in `mem` so a same-run `get` works, but is never
-appended to a sidecar, never written into `citations.jsonl` (`serialize_main` skips it and `flush`
-carries the in-memory copies forward across its own disk reload), and dropped rather than resurrected
-when read back off an older on-disk file. This keeps `manual`-source citation text out of the
-committed file while preserving the two-phase `retrieve`→`get` flow within a run. Keyed on the
-timestamps, not the prefix.
-
-Two liveness-lock details that are easy to undo. `flush` sweeps **orphaned companions** — a
-`._{base}.{writer}.log.lock` whose `.log` is gone — using the same held/acquirable probe, because the
-peer-reaping loop iterates `.log` names and so can never reach one. That is now a *crash* state (a
-writer that died between the two unlinks, or before its first append), not the normal exit state, but
-without the sweep those files would never be collected. `companion_log_name` is what keeps the
-compaction lockfile out of that sweep: `._{base}.lock` is one `.lock` suffix away from a companion,
-and the remainder must itself be an `is_sidecar` name. A writer still skips **its own** companion by
-name rather than probing it. Also note `SingleFileCacheStore::with_base` exists so the
-CLI can use the base `.citations`: the CLI's cache lands in the user's working directory, so the
-committable file is the hidden `.citations.jsonl` and everything else hides under one `._.citations*`
-ignore rule.
+The storage engine — the logs, the locks, the merge and their rationale — is cachette's; see the
+module documentation of its `engine/jsonl.rs`, which also lists the fixes made to the code copied
+from autocitefetch 0.1.1.
 
 ### The CLI (`autocitefetch-cli`)
 
@@ -647,13 +627,16 @@ ignore rule.
 plus the same `Waker::noop()` `block_on` the tests and the `resolve` example use (**no async runtime
 anywhere**, still). Things worth keeping straight:
 
-- **`serde_json` is the workspace (alloc-only) dependency**, deliberately. Resolver v2 unifies
-  features across a workspace build, so `serde_json/std` here would compile the `no_std` core
-  against the configuration it promises never to use.
+- **`serde_json` is the workspace (alloc-only) dependency**: its alloc API is all this binary needs.
+  It does not keep a workspace build alloc-only, though: `autocitefetch-std` enables `cachette/std`,
+  which enables `serde/std` and `serde_json/std`, and resolver v2 unifies features across
+  `cargo build --workspace`/`cargo test --workspace`. The `no_std` promise of the core is checked by
+  the per-package commands CI runs: `cargo test -p autocitefetch --locked` and
+  `cargo build -p autocitefetch --target wasm32-unknown-unknown`.
 - **`clap`/`serde_yaml_ng` live only in this crate.** `formats.rs` is the whole YAML story:
   `--bib` files go through `BibliographyFileSource::with_parser` (so they still travel the one
   `Fetcher` choke point, URLs included) and `--arxiv-doi-overrides` is parsed host-side and passed
-  to `with_override_dois` as *data* — never `with_override_dois_file`, which is JSON-only.
+  to `with_override_dois` as *data* — never through `load_override_dois`, which is JSON-only.
 - `--bib-format auto` tries **JSON first, then YAML**: YAML is not exactly a JSON superset (a large
   integer literal is valid JSON and out of range for the YAML reader), and serde_json's errors on a
   broken JSON file are far better. Both errors are reported on failure.
@@ -661,9 +644,12 @@ anywhere**, still). Things worth keeping straight:
   citation text, so its interior is payload. Keys are *not* normalized here; the manager does that
   per-source.
 - `--drop-field` (repeatable) is passed straight through to `with_dropped_csl_fields`, so a dropped
-  field is absent from the output **and** from `.citations.jsonl`. `--drop-field id` is a no-op by
-  construction (the manager stamps the id on after dropping); `warn_about_unusable_options` says so
-  rather than letting it look like it worked.
+  field is absent from the output only; `.citations.jsonl` is not changed. `--keep-abstract` and
+  `--keep-references` set the cache's `StoragePolicy`; combining one with the matching
+  `--drop-field` is legitimate (keep the field in the cache, hide it in this output).
+  `--drop-field id` is a no-op by construction (the manager sets the id after dropping);
+  `warn_about_unusable_options` says so rather than letting it look like it worked.
+- The cache is built and `get` is called without `block_on`: both are synchronous.
 - Exit status is part of the contract: `0` all resolved, `1` some unresolved (the rest are still
   written), `2` fatal. A citation that will not fetch is never `2`.
 - `--verbose` is a **count** (`-v`/`-vv`), and `progress.rs` is the whole rendering story — presentation
@@ -675,8 +661,14 @@ anywhere**, still). Things worth keeping straight:
 
 ## Invariants when editing
 
-- **All I/O goes through `Fetcher`** — including local file reads (bib files, the arXiv DOI-override
-  JSON). Sources must never touch the filesystem or network directly.
+- **All I/O goes through `Fetcher`** — including local file reads (bib files, and the arXiv
+  DOI-override JSON that `load_override_dois` reads at setup). Sources must never touch the
+  filesystem or network directly. The cache is the one exception: it is the host's `CacheStore`.
+- **What is cached must not depend on the options of a run.** An `Outcome::Concrete` item is stored
+  as it is (minus the fields the storage policy omits); options belong in `Source::interpret`, which
+  is pure and synchronous (no I/O, no clock), must answer the same for the same key, item and
+  configuration, and must accept every item its source ever cached, including 0.1.1 items (which
+  may carry an `id`). The manager never stamps an `id` into a stored item; `get` sets it on read.
 - **`retrieve_chunk` must return exactly one `Resolution` per requested key**. Pick the miss outcome
   by *why*: `Outcome::Failed` when the source was unreachable/erroring (grace-served if cached),
   `Outcome::Missing` when it is reachable and authoritatively lacks the key (always reported, drops
@@ -699,8 +691,13 @@ There is **no async runtime anywhere** — not in tests, examples, or the std cr
 a local `block_on` that polls with `Waker::noop()` and panics after ~1M polls ("a mock unexpectedly
 pended"). All std backends are blocking-in-a-future (`UreqFetcher` blocks the thread, `BlockingTimer`
 sleeps it), so they resolve on first poll. Mocks (`MockFetcher` with a URL→response route table,
-`MemStore`, `FixedClock`, `InstantTimer`) are **deliberately duplicated per test file** rather than
-shared — follow that pattern; copy from `tests/integration.rs` or `tests/arxiv.rs`.
+`FixedClock`, `InstantTimer`) are **deliberately duplicated per test file** rather than shared —
+follow that pattern; copy from `tests/integration.rs` or `tests/arxiv.rs`. The in-memory cache is
+not a mock: it is `StoreCache::new(cachette::MemoryStore::new())`, and a test seeds or inspects it
+through `StoreCache::with_store`. A chaining test source returns ordinary items and implements
+`interpret` to chain them (see `chain_item` in `tests/manager_contract.rs`). The storage engine is
+tested in cachette; `autocitefetch-std`'s tests cover only autocitefetch's wrappers, in temporary
+folders.
 
 `tests/reporting.rs` adds a `RecordingReporter` that flattens each `Event` to a short stable string.
 It is worth knowing about beyond progress reporting: it is the only way to assert on things the

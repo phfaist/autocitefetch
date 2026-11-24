@@ -38,7 +38,7 @@ pub mod bibfile;
 pub mod doi;
 pub mod manual;
 
-pub use arxiv::ArxivSource;
+pub use arxiv::{ArxivSource, load_override_dois};
 pub use bibfile::{BibParser, BibliographyFileSource};
 pub use doi::DoiSource;
 pub use manual::ManualSource;

@@ -3,6 +3,12 @@
 //! [`CitationManager`], register the `doi` / `manual` / `bib` sources, resolve
 //! a few citations, and print the resulting CSL-JSON.
 //!
+//! The cache is the default one, a single JSONL file in a directory. A host
+//! that keeps its caches with a cachette `Manager` would pass a
+//! [`SessionCache`](autocitefetch_std::SessionCache) instead, and any
+//! `cachette::Store` works through [`autocitefetch::StoreCache`]; nothing else
+//! below changes.
+//!
 //! Run with:
 //!
 //! ```sh
@@ -20,15 +26,15 @@
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
-use autocitefetch::CitationManager;
+use autocitefetch::{CitationManager, StoragePolicy};
 use autocitefetch::source::{BibliographyFileSource, DoiSource, ManualSource};
 use autocitefetch_std::{BlockingTimer, SingleFileCacheStore, SystemClock, UreqFetcher};
 
 /// A minimal blocking driver for `retrieve`, the one async call. Every backend
 /// here (`UreqFetcher` blocks the thread, `BlockingTimer` sleeps it) resolves
 /// its future on the first poll, so a no-op waker suffices — no async runtime
-/// is pulled in. The cache and `get` are synchronous. On a real async runtime, use that runtime's `block_on`
-/// and async `Fetcher`/`Timer` instead.
+/// is pulled in. The cache and `get` are synchronous. On a real async runtime,
+/// use that runtime's `block_on` and async `Fetcher`/`Timer` instead.
 ///
 /// The poll budget matters: with a `Waker::noop()` there is nothing to wake
 /// this loop, so a future that genuinely pends (a backend that is *not*
@@ -71,12 +77,21 @@ fn main() {
     let bib_url = bib_path.display().to_string();
 
     let cache_dir = tmp.join("cache");
-    // The default storage policy leaves the bulky `reference` and `abstract`
-    // fields out of the cache (and so out of the output); pass a
-    // `StoragePolicy` to `with_policy` to keep them.
-    let store = SingleFileCacheStore::new(&cache_dir).expect("open cache dir");
+    // Opening the cache is synchronous, like every cache operation. The
+    // storage policy shapes what the cache keeps: by default the bulky
+    // `reference` and `abstract` fields are left out of the cache (and so of
+    // the output); here the abstract is kept.
+    let store = SingleFileCacheStore::new(&cache_dir)
+        .expect("open cache dir")
+        .with_policy(StoragePolicy {
+            keep_abstract: true,
+            ..StoragePolicy::default()
+        });
 
-    let manager = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
+    let manager = CitationManager::new(UreqFetcher::default(), store, SystemClock::new(), BlockingTimer)
+        // Output-only: the cache keeps the field, and a later run without
+        // this option answers it again, without a request.
+        .with_dropped_csl_fields(["note"])
         .register("doi", DoiSource::new())
         .expect("register doi source")
         .register("manual", ManualSource::new("flm"))
@@ -110,6 +125,7 @@ fn main() {
         }
     }
 
+    // `get` is synchronous: it reads the cache only, and makes no request.
     for (prefix, key) in &cites {
         println!("\n=== {prefix}:{key} ===");
         match manager.get(prefix, key) {

@@ -27,7 +27,9 @@
 //! [`cachette::Store`] — a [`cachette::MemoryStore`], a
 //! [`cachette::JsonlStore`] (the single committable JSONL file), or a store of
 //! the host's own. The [`cachette`] crate is re-exported so that a host uses
-//! the version this crate was built against.
+//! the version this crate was built against. `autocitefetch-std` adds
+//! `SingleFileCacheStore` (the JSONL file on the real filesystem, the
+//! default) and `SessionCache` (a session on a host's `cachette::Manager`).
 
 #![no_std]
 #![forbid(unsafe_code)]

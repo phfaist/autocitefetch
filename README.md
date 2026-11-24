@@ -24,8 +24,8 @@ that emits `\cite{arXiv:1211.1037}`-style commands (see
 
 - [`autocitefetch-std`](https://crates.io/crates/autocitefetch-std)
   ([docs](https://docs.rs/autocitefetch-std)) — simple trait implementations for
-  a standard `std` environment (clock, timer, filesystem cache, blocking HTTP
-  fetcher).
+  a standard `std` environment (clock, timer, filesystem cache, a cache on a
+  host's cachette manager, blocking HTTP fetcher).
 
 - [`autocitefetch-cli`](https://crates.io/crates/autocitefetch-cli) — a simple
   command-line interface to the library; convert a list of `prefix:key` citation
@@ -73,9 +73,14 @@ selects a `Source`. Retrieval is two-phase:
    (chunked + rate-limited), writes results to the cache. Returns a
    `RetrieveReport` of per-citation failures (one bad cite does **not** abort
    the batch).
-2. `manager.get(prefix, key).await` — reads a resolved CSL-JSON item back,
-   following any **chaining** pointers (e.g. arXiv → DOI) and merging their
-   `set_properties`, rewriting `id` back to the requested one.
+2. `manager.get(prefix, key)` — synchronous; reads a resolved CSL-JSON item
+   back from the cache, following any **chaining** (e.g. arXiv → DOI) and
+   merging its `set_properties`, and sets `id` to the requested one.
+
+The cache holds what each source returned. The options of a run — arXiv DOI
+overrides, the chain target, the fields dropped from the output — are applied
+when an item is read, so changing them never changes the cache and needs no
+request.
 
 
 ### Prefixes and sources
@@ -90,14 +95,61 @@ The prefix is a non-empty string that may not contain the character `':'`.
 ### Chaining
 
 Some arXiv entries have a corresponding "Related DOI", meaning that the paper
-preprint was published in some publication venue.  When *autocitefetch*
-retrieves such an entry from the arXiv with a related DOI, it stores a *pointer*
-to the `doi` prefix so that the DOI source resolver can download the full
-citation entry of the published version of the preprint (via
-`Payload::Chained`).  (This behavior is fully configurable, including a
-different prefix to use instead of `doi`.)
+preprint was published in some publication venue.  *autocitefetch* caches the
+arXiv metadata of such an entry, with its DOI; when the citation is read, the
+arXiv source *chains* it to the `doi` prefix, so that the citation resolves to
+the full entry of the published version, which the DOI source downloads
+(`Source::interpret` answers `Interpreted::Chained`).  This behavior is fully
+configurable — a different prefix instead of `doi`, no chaining at all, or
+per-paper DOI overrides — and since it applies on read, changing it takes
+effect at once for every cached entry.
 
 The manager's retrieval loop discovers chained targets and fetches them.
+
+
+### The cache
+
+The cache holds one CSL-JSON item per citation, with its expiry times. Its
+*storage policy* (`StoragePolicy`) decides what it keeps: the TTL policy, and
+whether the bulky fields `reference` (a work's own bibliography) and `abstract`
+are kept — both are left out by default.
+
+There are three ways to get a cache:
+
+1. **A single JSONL file** (the default): `autocitefetch_std::SingleFileCacheStore`
+   keeps one committable `citations.jsonl` file in a directory of your choosing,
+   plus throwaway files under the `._citations` prefix while a run is in flight
+   (ignore them with `._citations*`). Cache files written by autocitefetch 0.1.1
+   are reused as they are.
+2. **Any [cachette](https://crates.io/crates/cachette) store**:
+   `autocitefetch::StoreCache::new(store)` works over any `cachette::Store` — a
+   `MemoryStore`, a `JsonlStore` on a file system of your own, a store of your
+   own. autocitefetch re-exports `cachette`, so you name the version it was
+   built with.
+3. **A session on a host's `cachette::Manager`**: a program that keeps its
+   caches with cachette's manager passes
+   `autocitefetch_std::SessionCache::open(&manager, &instance, policy)`; the
+   items then live in an instance that the host's manager keeps, sizes and
+   prunes.
+
+**In a browser**, where storage answers asynchronously, keep a
+`cachette::MemoryStore` for the run: load it with `cachette::import` before,
+and save it with `cachette::export` after.
+
+```rust,ignore
+use autocitefetch::cachette::{self, ImportMode, MemoryStore};
+use autocitefetch::{CitationManager, StoreCache, StoreError};
+
+// Before the run: `saved` is the text the host stored last time.
+let mut store = MemoryStore::new();
+cachette::import(&mut store, saved.lines().map(Ok::<_, StoreError>), ImportMode::Lenient)?;
+let mgr = CitationManager::new(fetcher, StoreCache::new(store), clock, timer)
+    .register("arxiv", ArxivSource::new())?;
+mgr.retrieve(&cites).await?;
+// After the run: save the store, as the text of a JSONL file.
+let mut saved = String::new();
+mgr.store().with_store(|s| cachette::export(s, |line| { saved.push_str(line); Ok(()) }))?;
+```
 
 
 ### Refresh batching
@@ -122,15 +174,17 @@ Callers can be informed of progress of the citation fetching by registering a
 ### Library usage sketch (std)
 
 ```rust,ignore
-use autocitefetch::CitationManager;
+use autocitefetch::{CitationManager, StoragePolicy};
 use autocitefetch::source::{ArxivSource, DoiSource, ManualSource, BibliographyFileSource};
 use autocitefetch_std::{BlockingTimer, SingleFileCacheStore, SystemClock, UreqFetcher};
 
-let store = SingleFileCacheStore::new(".citecache").await?;
+// Synchronous, like every cache operation. Keep abstracts in the cache.
+let store = SingleFileCacheStore::new(".citecache")?
+    .with_policy(StoragePolicy { keep_abstract: true, ..StoragePolicy::default() });
 // The prefix is yours to choose — a source declares none. `register` returns
 // `Result` because it rejects an empty or ':'-containing prefix (which would
 // make `prefix:key` ids ambiguous), so chain with `?`.
-let mgr = CitationManager::new(UreqFetcher::default(), store, SystemClock, BlockingTimer)
+let mgr = CitationManager::new(UreqFetcher::default(), store, SystemClock::new(), BlockingTimer)
     .register("arxiv", ArxivSource::new())?
     .register("doi", DoiSource::new())?
     .register("manual", ManualSource::new("flm"))?
@@ -139,7 +193,18 @@ let mgr = CitationManager::new(UreqFetcher::default(), store, SystemClock, Block
     .register("theses", BibliographyFileSource::new(["file:theses.json".into()]))?;
 
 let report = mgr.retrieve(&[("doi".into(), "10.1103/PhysRev.47.777".into())]).await?;
-let item = mgr.get("doi", "10.1103/PhysRev.47.777").await?; // CSL-JSON Value
+let item = mgr.get("doi", "10.1103/PhysRev.47.777")?; // CSL-JSON Value
+```
+
+With a host's cachette manager, only the cache changes:
+
+```rust,ignore
+use autocitefetch::cachette::{DiscardReports, Manager, ManagerSettings, SystemClock};
+use autocitefetch_std::SessionCache;
+
+let manager = Manager::open_path(cache_root, ManagerSettings::default(), SystemClock::new(), DiscardReports)?;
+// One instance per project; caches with different `keep_*` flags never mix.
+let store = SessionCache::open(&manager, "my-project", StoragePolicy::default())?;
 ```
 
 The core crate bundles no `Fetcher`, so it carries no HTTP dependency at all.
